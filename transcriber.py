@@ -130,9 +130,13 @@ class NIMTranscriber:
         Returns:
             The chunk's transcript text.
         """
+        # Debug: confirm the exact gateway + model the request goes to.
+        print(f"  -> POST {NVIDIA_BASE_URL}  model={MODEL_NAME}")
         result = self.client.audio.transcriptions.create(
             model=MODEL_NAME,
-            file=audio_buffer,
+            # Explicit (filename, buffer, mime) tuple so the gateway always
+            # receives audio/mpeg regardless of BytesIO naming heuristics.
+            file=("chunk.mp3", audio_buffer, "audio/mpeg"),
         )
         return result.text
 

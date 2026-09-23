@@ -164,7 +164,12 @@ def test_api_retry_logic(mocker) -> None:
     assert client.audio.transcriptions.create.call_count == 3
     call_kwargs = client.audio.transcriptions.create.call_args.kwargs
     assert call_kwargs["model"] == MODEL_NAME
-    assert call_kwargs["file"] is audio_buffer
+    # The file is sent as an explicit (filename, buffer, mime) tuple so the
+    # gateway always sees audio/mpeg.
+    filename, buffer, mime = call_kwargs["file"]
+    assert filename == "chunk.mp3"
+    assert buffer is audio_buffer
+    assert mime == "audio/mpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -196,5 +201,9 @@ def test_transcribe_audio_integration(mocker, tmp_path) -> None:
     assert client.audio.transcriptions.create.call_count == 1
     call_kwargs = client.audio.transcriptions.create.call_args.kwargs
     assert call_kwargs["model"] == MODEL_NAME
-    # The in-memory buffer was named so the SDK can treat it as an upload.
-    assert call_kwargs["file"].name == "chunk.mp3"
+    # The upload is an explicit (filename, buffer, audio/mpeg) tuple.
+    filename, buffer, mime = call_kwargs["file"]
+    assert filename == "chunk.mp3"
+    assert mime == "audio/mpeg"
+    # The in-memory buffer is still named so the SDK can treat it as a file.
+    assert buffer.name == "chunk.mp3"
