@@ -111,20 +111,26 @@ def test_silence_stripping() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_chunking_splits_into_ten_minute_segments() -> None:
-    """Audio longer than 10 minutes is sliced into <=10-minute chunks."""
+def test_chunking_splits_into_capped_segments() -> None:
+    """Audio longer than the chunk cap is sliced into <=cap segments.
+
+    Expectations are derived from ``CHUNK_LENGTH_MS`` so the test tracks
+    whatever micro-chunking threshold the pipeline is configured with.
+    """
     # 25 minutes of audio at frame_rate=1000 -> only 3 MB of data (cheap).
-    audio = AudioSegment.silent(duration=25 * 60 * 1000, frame_rate=1000)
+    total_ms = 25 * 60 * 1000
+    audio = AudioSegment.silent(duration=total_ms, frame_rate=1000)
     transcriber = NIMTranscriber(api_key="test-key")
 
     chunks = transcriber._split_into_chunks(audio)
 
-    assert len(chunks) == 3
-    assert [len(chunk) for chunk in chunks] == [
-        CHUNK_LENGTH_MS,
-        CHUNK_LENGTH_MS,
-        5 * 60 * 1000,
-    ]
+    expected = [CHUNK_LENGTH_MS] * (total_ms // CHUNK_LENGTH_MS)
+    remainder = total_ms % CHUNK_LENGTH_MS
+    if remainder:
+        expected.append(remainder)
+
+    assert [len(chunk) for chunk in chunks] == expected
+    assert all(len(chunk) <= CHUNK_LENGTH_MS for chunk in chunks)
 
 
 # ---------------------------------------------------------------------------

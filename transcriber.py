@@ -4,7 +4,7 @@ Turns a recorded lecture WAV into plain text:
 
 1.  silence is stripped with :mod:`pydub.silence`, so we never pay to send
     dead air to the model;
-2.  the remaining audio is sliced into 10-minute chunks so each MP3 payload
+2.  the remaining audio is sliced into 2-minute chunks so each MP3 payload
     stays comfortably below the 25 MB request limit;
 3.  every chunk is encoded to MP3 **in memory** (``io.BytesIO`` — no temp
     files) and sent to ``openai/whisper-large-v3`` through the
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import openai
-from openai import APIConnectionError, APITimeoutError, RateLimitError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from tenacity import (
@@ -39,16 +39,15 @@ from tenacity import (
 
 MODEL_NAME = "openai/whisper-large-v3"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY_ENV = "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"
-
+NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 SILENCE_MIN_LEN_MS = 3000    # gaps shorter than this are kept as content
 SILENCE_THRESH_DB = -40       # dBFS below which a window counts as silence
 SILENCE_KEEP_MS = 500         # silence retained around each spoken chunk
-CHUNK_LENGTH_MS = 600_000     # 10 minutes of audio per request
+CHUNK_LENGTH_MS = 120_000     # 2 minutes of audio per request (micro-chunking)
 TRANSCRIPT_FILENAME = "raw_transcript.txt"
 
 # Transient errors we are willing to retry; 4xx auth/validation errors are not.
-_RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
+_RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError, APIStatusError)
 
 
 class NIMTranscriber:
@@ -71,6 +70,7 @@ class NIMTranscriber:
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=NVIDIA_BASE_URL,
+            timeout=120.0,
         )
 
     # -- pre-processing ----------------------------------------------------
@@ -99,7 +99,7 @@ class NIMTranscriber:
         return sum(spoken[1:], spoken[0])
 
     def _split_into_chunks(self, audio: AudioSegment) -> List[AudioSegment]:
-        """Slice audio into <=10-minute segments (600,000 ms each).
+        """Slice audio into <=2-minute segments (120,000 ms each).
 
         Args:
             audio: Silence-stripped audio.
@@ -156,7 +156,7 @@ class NIMTranscriber:
         stripped_ms = original_ms - len(audio)
         print(f"Stripped {stripped_ms / 1000:.1f} seconds of silence")
 
-        # 2. Chunking — cap each payload at 10 minutes of audio.
+        # 2. Chunking — cap each payload at 2 minutes of audio.
         chunks = self._split_into_chunks(audio)
         print(f"Transcribing {len(chunks)} chunk(s)...")
 
