@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test artifacts
+.pytest_cache/
+.pytest_cache/**/*
+
+# Phase 1 recording output — captured lecture audio must never be committed
+output/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
