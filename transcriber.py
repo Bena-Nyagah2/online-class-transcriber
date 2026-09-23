@@ -39,7 +39,7 @@ from tenacity import (
 
 MODEL_NAME = "openai/whisper-large-v3"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
+NVIDIA_API_KEY_ENV = "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"
 
 SILENCE_MIN_LEN_MS = 3000    # gaps shorter than this are kept as content
 SILENCE_THRESH_DB = -40       # dBFS below which a window counts as silence
