@@ -3,7 +3,7 @@
 The whole suite runs **offline** — no NVIDIA API calls, no network I/O, no
 audio hardware, no ffmpeg:
 
-* the ``openai`` client is always mocked out via ``mocker``,
+* the HTTP client (``httpx2``) is always mocked out via ``mocker``,
 * the MP3 export (the only step that would shell out to ffmpeg) is mocked,
 * synthetic audio is generated in pure Python (:mod:`pydub.generators` +
   the stdlib :mod:`wave` module),
@@ -20,11 +20,16 @@ from pathlib import Path
 from typing import Any, Tuple
 
 import pytest
-from openai import RateLimitError
+import httpx2
 from pydub import AudioSegment
 from pydub.generators import Sine
 
-from transcriber import NIMTranscriber, CHUNK_LENGTH_MS, MODEL_NAME
+from transcriber import (
+    NIMTranscriber,
+    AUDIO_TRANSCRIPTIONS_URL,
+    CHUNK_LENGTH_MS,
+    MODEL_NAME,
+)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -32,7 +37,7 @@ from transcriber import NIMTranscriber, CHUNK_LENGTH_MS, MODEL_NAME
 
 
 def _make_transcriber(mocker: Any) -> Tuple[NIMTranscriber, Any]:
-    """A transcriber whose OpenAI client is replaced by a mock."""
+    """A transcriber whose HTTP client is replaced by a mock."""
     transcriber = NIMTranscriber(api_key="test-key")
     client = mocker.MagicMock()
     transcriber.client = client
@@ -65,23 +70,6 @@ def _write_tone_wav(path: Path, duration_ms: int = 1000, sample_rate: int = 8000
             frames += struct.pack("<h", sample)
         wav_file.writeframes(bytes(frames))
     return path
-
-
-class _FakeResponse:
-    """Duck-typed stand-in for ``httpx.Response`` used by openai errors."""
-
-    status_code = 429
-    headers: dict = {}
-    request = None
-    text = "rate limited"
-    reason_phrase = "Too Many Requests"
-    http_version = "HTTP/1.1"
-    url = "https://ai.api.nvidia.com/v1/audio/transcriptions"
-
-
-def _fake_rate_limit_error() -> RateLimitError:
-    """A real :class:`RateLimitError` constructed without any HTTP I/O."""
-    return RateLimitError("NVIDIA rate limit exceeded", response=_FakeResponse(), body=None)
 
 
 # ---------------------------------------------------------------------------
@@ -139,15 +127,19 @@ def test_chunking_splits_into_capped_segments() -> None:
 
 
 def test_api_retry_logic(mocker) -> None:
-    """RateLimitError 429s are retried until a successful response arrives."""
+    """httpx transport failures are retried until a successful response."""
     transcriber, client = _make_transcriber(mocker)
 
-    ok_transcript = mocker.MagicMock()
-    ok_transcript.text = "mock lecture transcript"
-    client.audio.transcriptions.create.side_effect = [
-        _fake_rate_limit_error(),
-        _fake_rate_limit_error(),
-        ok_transcript,
+    ok_response = mocker.MagicMock()
+    ok_response.json.return_value = {"text": "mock lecture transcript"}
+
+    # Two transient transport failures (connection reset, read timeout),
+    # then a success. These are real httpx2 exceptions, so tenacity's
+    # retry_if_exception_type actually matches them.
+    client.post.side_effect = [
+        httpx2.ConnectError("mock connection reset"),
+        httpx2.ReadTimeout("mock read timeout"),
+        ok_response,
     ]
 
     # Neutralise the exponential backoff so this test runs in milliseconds.
@@ -161,12 +153,14 @@ def test_api_retry_logic(mocker) -> None:
     text = transcriber._transcribe_chunk(audio_buffer)
 
     assert text == "mock lecture transcript"
-    assert client.audio.transcriptions.create.call_count == 3
-    call_kwargs = client.audio.transcriptions.create.call_args.kwargs
-    assert call_kwargs["model"] == MODEL_NAME
+    assert client.post.call_count == 3
+    assert client.post.call_args.args[0] == AUDIO_TRANSCRIPTIONS_URL
+    call_kwargs = client.post.call_args.kwargs
+    assert call_kwargs["data"] == {"model": MODEL_NAME}
+    assert call_kwargs["headers"]["Authorization"] == "Bearer test-key"
     # The file is sent as an explicit (filename, buffer, mime) tuple so the
     # gateway always sees audio/mpeg.
-    filename, buffer, mime = call_kwargs["file"]
+    filename, buffer, mime = call_kwargs["files"]["file"]
     assert filename == "chunk.mp3"
     assert buffer is audio_buffer
     assert mime == "audio/mpeg"
@@ -183,9 +177,9 @@ def test_transcribe_audio_integration(mocker, tmp_path) -> None:
     transcriber, client = _make_transcriber(mocker)
 
     expected_text = "This lecture covers phase 2 transcription."
-    client.audio.transcriptions.create.return_value = mocker.MagicMock(
-        text=expected_text
-    )
+    ok_response = mocker.MagicMock()
+    ok_response.json.return_value = {"text": expected_text}
+    client.post.return_value = ok_response
 
     # The only step needing ffmpeg is the MP3 export — mock it away so the
     # test needs zero external programs.
@@ -198,11 +192,13 @@ def test_transcribe_audio_integration(mocker, tmp_path) -> None:
     assert transcript_path.exists()
     assert transcript_path.read_text(encoding="utf-8") == expected_text
 
-    assert client.audio.transcriptions.create.call_count == 1
-    call_kwargs = client.audio.transcriptions.create.call_args.kwargs
-    assert call_kwargs["model"] == MODEL_NAME
+    assert client.post.call_count == 1
+    assert client.post.call_args.args[0] == AUDIO_TRANSCRIPTIONS_URL
+    call_kwargs = client.post.call_args.kwargs
+    assert call_kwargs["data"] == {"model": MODEL_NAME}
+    assert call_kwargs["headers"]["Authorization"] == "Bearer test-key"
     # The upload is an explicit (filename, buffer, audio/mpeg) tuple.
-    filename, buffer, mime = call_kwargs["file"]
+    filename, buffer, mime = call_kwargs["files"]["file"]
     assert filename == "chunk.mp3"
     assert mime == "audio/mpeg"
     # The in-memory buffer is still named so the SDK can treat it as a file.
