@@ -1,8 +1,17 @@
-"""CLI entry point for the lecture recording pipeline (Phase 1).
+"""CLI entry point for the full lecture pipeline (Phase 4).
 
-Flow: print the loopback warning, collect the course unit code, create
-``./output/{course_code}_{YYYY-MM-DD}/``, list loopback devices for
-selection, record until Ctrl+C, then save ``raw_audio.wav``.
+Chains the Phase 1 recorder, Phase 2 transcriber, and Phase 3 synthesizer
+into a single automated workflow::
+
+    warn → course code → output dir → pick device → RECORD → [Ctrl+C]
+        → save raw_audio.wav → transcribe → raw_transcript.txt
+        → synthesize → {course_code}_{date}.md
+
+Ctrl+C handling:
+* 1st Ctrl+C during recording — clean stop, then hand off to AI.
+* Ctrl+C while the API is working — warned once ("let it finish"), the
+  interrupted phase is retried; a 2nd Ctrl+C exits safely, keeping every
+  file that was already written to disk intact.
 """
 
 from __future__ import annotations
@@ -13,8 +22,11 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 from recorder import AudioRecorder
+from transcriber import NIMTranscriber, TRANSCRIPT_FILENAME
+from summarizer import LectureSynthesizer
 
 
 def _configure_streams() -> None:
@@ -179,16 +191,53 @@ def run_status_loop(recorder: AudioRecorder) -> None:
         print()  # terminate the \r status line before further output
 
 
-def main() -> int:
-    """Run the Phase 1 CLI: warn → course code → devices → record → save.
+# ---------------------------------------------------------------------------
+# AI handoff (double Ctrl+C trap)
+# ---------------------------------------------------------------------------
+
+
+def _interrupt_protected(label: str, fn: Callable[[], Any]) -> Any:
+    """Run one pipeline phase, absorbing the first Ctrl+C into a warning.
+
+    A single Ctrl+C while the API is processing is treated as impatience,
+    not an abort request: we warn and retry the phase so the pipeline can
+    finish ("Let it finish"). A second Ctrl+C propagates so ``main()`` can
+    exit safely — everything already flushed to disk is left untouched.
+
+    Args:
+        label: Human-readable phase name (used in the retry message).
+        fn: Zero-argument callable performing the phase.
 
     Returns:
-        Process exit code: 0 success, 1 error, 130 cancelled.
+        Whatever ``fn`` returned.
+    """
+    try:
+        return fn()
+    except KeyboardInterrupt:
+        print(
+            f"\n⚠️ Pipeline processing in progress ({label}). "
+            "Aborting now may result in data loss. Let it finish.",
+            flush=True,
+        )
+        return fn()  # single press only: give the phase one clean retry
+
+
+# ---------------------------------------------------------------------------
+# main entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    """Run the Phase 4 pipeline: record → transcribe → synthesize.
+
+    Returns:
+        Process exit code: 0 success, 1 error, 130 cancelled/interrupted.
     """
     _configure_streams()
     _enable_windows_ansi()
     print_warning_banner()
 
+    # ---- setup: course code + output directory (Phase 1 logic) ------------
     course_code = prompt_course_code()
     output_dir = create_output_dir(course_code)
     wav_path = output_dir / "raw_audio.wav"
@@ -199,7 +248,10 @@ def main() -> int:
         print("Aborted — nothing was recorded.")
         return 1
 
+    # ---- instantiate the three components ----------------------------------
     recorder = AudioRecorder(emergency_backup_path=backup_path)
+    transcriber = NIMTranscriber()
+    synthesizer = LectureSynthesizer()
 
     device_id = select_device(recorder)
     # Same cached list as above, so the index still points at this device:
@@ -207,26 +259,68 @@ def main() -> int:
     print(f"\nRecording from  : {device_name}")
     print(f"Emergency backup: {backup_path}\n")
 
+    # ---- Phase A: recording (1st Ctrl+C = clean stop) ----------------------
     try:
         recorder.start_recording(device_id)
         run_status_loop(recorder)
     except KeyboardInterrupt:
-        print("\n■ Ctrl+C received — stopping recording...")
+        # First Ctrl+C — stop cleanly, then hand off to the AI pipeline.
+        # Suppress further interrupts during the WAV flush so a panicked
+        # double Ctrl+C cannot corrupt the file (Phase 1 behaviour).
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            recorder.stop_recording(wav_path)
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print("🛑 Recording stopped. Initiating AI Transcription...")
     except (RuntimeError, OSError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
-    finally:
-        # stop_recording() is safe in every state (idempotent, thread-safe),
-        # so it always runs — even if start failed or Ctrl+C raced the start.
-        # A second Ctrl+C during the flush would abort the WAV write:
+    else:
+        # Loop ended without Ctrl+C: the device dropped and the capture
+        # thread stopped itself — flush whatever audio was buffered.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-        saved = recorder.stop_recording(wav_path)
-        if saved.exists() and saved.stat().st_size > 0:
-            size_mb = saved.stat().st_size / 1_048_576
-            print(f"✅ Saved: {saved} ({size_mb:.1f} MB)")
-        else:
-            print(f"⚠️ No audio captured — nothing written to {saved}")
+        try:
+            recorder.stop_recording(wav_path)
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        print("⚠️ Recording ended on its own (possible device drop).")
 
+    # ---- Phase B: AI handoff (double-Ctrl+C protected) ---------------------
+    if not (wav_path.exists() and wav_path.stat().st_size > 0):
+        print("⚠️ No audio captured — skipping AI processing.")
+        return 1
+
+    transcript_path = output_dir / TRANSCRIPT_FILENAME
+    notes_path = output_dir / f"{course_code}_{date.today():%Y-%m-%d}.md"
+
+    try:
+        _interrupt_protected(
+            "transcription",
+            lambda: transcriber.transcribe_audio(wav_path),
+        )
+        print("🧠 Transcription complete. Synthesizing Study Notes...")
+
+        _interrupt_protected(
+            "synthesis",
+            lambda: synthesizer.generate_notes(transcript_path, notes_path),
+        )
+    except ValueError as exc:
+        print(f"\n⚠️ Synthesis skipped: {exc}")
+        print(f"   The raw transcript is still available at: {transcript_path}")
+        return 1
+    except KeyboardInterrupt:
+        print(f"\n⚠️ Pipeline interrupted — saved files kept in: {output_dir}")
+        return 130
+
+    print(
+        f"\n{'=' * 60}\n"
+        "✅ PIPELINE COMPLETE\n"
+        f"   Audio      : {wav_path}\n"
+        f"   Transcript : {transcript_path}\n"
+        f"   Study Notes: {notes_path}\n"
+        f"{'=' * 60}"
+    )
     return 0
 
 
