@@ -76,7 +76,7 @@ class _FakeResponse:
     text = "rate limited"
     reason_phrase = "Too Many Requests"
     http_version = "HTTP/1.1"
-    url = "https://integrate.api.nvidia.com/v1/audio/transcriptions"
+    url = "https://ai.api.nvidia.com/v1/audio/transcriptions"
 
 
 def _fake_rate_limit_error() -> RateLimitError:
