@@ -11,6 +11,9 @@ venv/
 
 # Phase 1 recording output — captured lecture audio must never be committed
 output/
+*.wav
+*.mp3
+*.jpg
 
 # Local secrets — .env holds the NVIDIA_API_KEY and must never be committed
 .env

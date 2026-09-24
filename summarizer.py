@@ -1,8 +1,9 @@
 """Phase 3 — Lecture transcript synthesis into structured study notes via NVIDIA NIM (Llama).
 
 Reads a raw transcript, guards against hallucination on short inputs, and produces
-exam-focused Markdown notes using the NVIDIA-hosted Llama-3.1-70B-Instruct model
-through the OpenAI-compatible endpoint.
+exam-focused Markdown notes using the NVIDIA-hosted
+Llama-3.1-Nemotron-70B-Instruct model through the OpenAI-compatible
+endpoint.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from tenacity import (
 # the environment. Explicit shell exports still take precedence.
 load_dotenv()
 
-MODEL_NAME = "meta/llama-3.1-70b-instruct"
+MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 
@@ -102,7 +103,8 @@ class LectureSynthesizer:
         reraise=True,
     )
     def _call_llm(self, transcript: str) -> str:
-        """Send transcript to Llama-3.1-70B-Instruct and return raw markdown.
+        """Send transcript to Llama-3.1-Nemotron-70B-Instruct and return raw
+        markdown.
 
         Args:
             transcript: The lecture transcript text.

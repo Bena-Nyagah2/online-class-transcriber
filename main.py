@@ -1,7 +1,7 @@
 """CLI entry point for the full lecture pipeline (Phase 4).
 
-Chains the Phase 1 recorder, Phase 2 transcriber, and Phase 3 synthesizer
-into a single automated workflow::
+Chains the Phase 1 recorder, Phase 2 transcriber, Phase 3 synthesizer, and
+Phase 5 visual slide catcher into a single automated workflow::
 
     warn → course code → output dir → pick device → RECORD → [Ctrl+C]
         → save raw_audio.wav → transcribe → raw_transcript.txt
@@ -22,11 +22,12 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from recorder import AudioRecorder
-from transcriber import NIMTranscriber, TRANSCRIPT_FILENAME
+from transcriber import LocalTranscriber, TRANSCRIPT_FILENAME
 from summarizer import LectureSynthesizer
+from vision import SlideCatcher
 
 
 def _configure_streams() -> None:
@@ -250,7 +251,7 @@ def main() -> int:
 
     # ---- instantiate the three components ----------------------------------
     recorder = AudioRecorder(emergency_backup_path=backup_path)
-    transcriber = NIMTranscriber()
+    transcriber = LocalTranscriber()
     synthesizer = LectureSynthesizer()
 
     device_id = select_device(recorder)
@@ -260,6 +261,10 @@ def main() -> int:
     print(f"Emergency backup: {backup_path}\n")
 
     # ---- Phase A: recording (1st Ctrl+C = clean stop) ----------------------
+    # Phase 5: visual capture runs alongside the audio recording loop.
+    slide_catcher = SlideCatcher(output_dir=output_dir, interval_seconds=10.0)
+    slide_catcher.start()
+
     try:
         recorder.start_recording(device_id)
         run_status_loop(recorder)
@@ -273,7 +278,13 @@ def main() -> int:
         finally:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         print("🛑 Recording stopped. Initiating AI Transcription...")
+        captured_slides = slide_catcher.stop()
+        print(
+            f"🛑 Slide capture stopped. "
+            f"Captured {len(captured_slides)} unique slide(s)."
+        )
     except (RuntimeError, OSError) as exc:
+        slide_catcher.stop()
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
     else:
@@ -285,6 +296,11 @@ def main() -> int:
         finally:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         print("⚠️ Recording ended on its own (possible device drop).")
+        captured_slides = slide_catcher.stop()
+        print(
+            f"🛑 Slide capture stopped. "
+            f"Captured {len(captured_slides)} unique slide(s)."
+        )
 
     # ---- Phase B: AI handoff (double-Ctrl+C protected) ---------------------
     if not (wav_path.exists() and wav_path.stat().st_size > 0):
@@ -318,6 +334,7 @@ def main() -> int:
         "✅ PIPELINE COMPLETE\n"
         f"   Audio      : {wav_path}\n"
         f"   Transcript : {transcript_path}\n"
+        f"   Slides     : {len(captured_slides)} saved in {slide_catcher.slides_dir}\n"
         f"   Study Notes: {notes_path}\n"
         f"{'=' * 60}"
     )
