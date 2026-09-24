@@ -159,6 +159,9 @@ class NIMTranscriber:
                 f"Bearer {self.api_key or os.environ.get(NVIDIA_API_KEY_ENV)}"
             )
         }
+        # pydub's export leaves the BytesIO cursor at EOF; rewind first or the
+        # multipart encoder reads 0 bytes and the backend answers 500.
+        audio_buffer.seek(0)
         response = self.client.post(
             NVCF_TRANSCRIPTION_URL,
             headers=headers,
@@ -197,6 +200,7 @@ class NIMTranscriber:
         for index, chunk in enumerate(chunks, start=1):
             buffer = io.BytesIO()
             chunk.export(buffer, format="mp3")
+            buffer.seek(0)  # export leaves the cursor at EOF — rewind before upload
             buffer.name = "chunk.mp3"
 
             print(

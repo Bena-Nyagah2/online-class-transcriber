@@ -147,12 +147,18 @@ def test_api_retry_logic(mocker) -> None:
         NIMTranscriber._transcribe_chunk.retry, "sleep", lambda seconds: None
     )
 
-    audio_buffer = io.BytesIO(b"fake-mp3-audio-bytes")
+    audio_buffer = io.BytesIO()
+    audio_buffer.write(b"fake-mp3-audio-bytes")
     audio_buffer.name = "chunk.mp3"
+
+    # Reproduce the real-world bug: pydub's export leaves the cursor at EOF,
+    # so without rewinding the backend would receive a 0-byte payload.
+    assert audio_buffer.tell() > 0
 
     text = transcriber._transcribe_chunk(audio_buffer)
 
     assert text == "mock lecture transcript"
+    assert audio_buffer.tell() == 0  # rewound before building the POST
     assert client.post.call_count == 3
     assert client.post.call_args.args[0] == NVCF_TRANSCRIPTION_URL
     call_kwargs = client.post.call_args.kwargs
