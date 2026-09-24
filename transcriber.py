@@ -7,17 +7,18 @@ Turns a recorded lecture WAV into plain text:
 2.  the remaining audio is sliced into 2-minute chunks so each MP3 payload
     stays comfortably below the 25 MB request limit;
 3.  every chunk is encoded to MP3 **in memory** (``io.BytesIO`` — no temp
-    files) and POSTed as a raw multipart form to
-    ``https://ai.api.nvidia.com/v1/audio/transcriptions`` with
-    ``openai/whisper-large-v3`` and exponential-backoff retries;
+    files) and POSTed as a raw multipart form to the Whisper container's
+    direct NVCF invocation URL with ``openai/whisper-large-v3`` and
+    exponential-backoff retries;
 4.  the concatenated transcript is written next to the WAV as
     ``raw_transcript.txt`` and also returned to the caller.
 
-Transport note: the OpenAI SDK's ``audio.transcriptions`` helper builds a
-path structure NVIDIA's Audio gateway rejects (404), so the request is sent
-directly with a plain HTTP client. The available one in this environment is
-``httpx2`` — the HTTP client ``openai>=3`` already depends on — which speaks
-the exact ``httpx`` multipart API.
+Transport note: the generic NVIDIA gateways 404 on audio traffic (both the
+OpenAI SDK's path construction and the load-balanced ``ai.api.nvidia.com``
+gateway), so the request goes straight to the Whisper container's direct
+NVCF invocation URL with a plain HTTP client. The available one in this
+environment is ``httpx2`` — the HTTP client ``openai>=3`` already depends
+on — which speaks the exact ``httpx`` multipart API.
 
 Production note: :mod:`pydub` shells out to ``ffmpeg`` for the MP3 export,
 so the transcriber expects ``ffmpeg`` on ``PATH`` when run for real. The
@@ -48,8 +49,13 @@ from tenacity import (
 load_dotenv()
 
 MODEL_NAME = "openai/whisper-large-v3"
-NVIDIA_BASE_URL = "https://ai.api.nvidia.com/v1"  # NVIDIA Audio gateway
-AUDIO_TRANSCRIPTIONS_URL = f"{NVIDIA_BASE_URL}/audio/transcriptions"
+# Direct NVCF invocation URL for the whisper-large-v3 backend container.
+# The public ai.api.nvidia.com gateway load-balances audio traffic and 404s
+# on this path, so we bypass it and POST straight to the container.
+NVCF_TRANSCRIPTION_URL = (
+    "https://b702f636-f60c-4a3d-a6f4-f3568c13bd7d.invocation.api.nvcf.nvidia.com"
+    "/v1/audio/transcriptions"
+)
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 SILENCE_MIN_LEN_MS = 3000    # gaps shorter than this are kept as content
 SILENCE_THRESH_DB = -40       # dBFS below which a window counts as silence
@@ -67,7 +73,7 @@ class NIMTranscriber:
     """Transcribes lecture WAV files through NVIDIA's NIM Whisper API."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
-        """Prepare the HTTP client for the NVIDIA Audio gateway.
+        """Prepare the HTTP client for the direct NVCF invocation endpoint.
 
         Args:
             api_key: NVIDIA API key. Defaults to ``NVIDIA_API_KEY`` env var.
@@ -80,7 +86,7 @@ class NIMTranscriber:
                 f"{NVIDIA_API_KEY_ENV} is not set — pass api_key=... or "
                 "export the variable."
             )
-        # 120s timeout so slow gateway replies are not cut short mid-upload
+        # 120s timeout so slow container replies are not cut short mid-upload
         # (server timeouts manifest as Errno 10053 socket aborts otherwise).
         self.client = httpx2.Client(timeout=120.0)
 
@@ -132,12 +138,12 @@ class NIMTranscriber:
         reraise=True,
     )
     def _transcribe_chunk(self, audio_buffer: io.BytesIO) -> str:
-        """POST one in-memory MP3 buffer to the NVIDIA Audio gateway.
+        """POST one in-memory MP3 buffer to the Whisper backend container.
 
-        Uses a plain multipart POST instead of the OpenAI SDK's audio helper,
-        whose path construction NVIDIA's gateway rejects with a 404.
-        Tenacity retries transport errors (resets, timeouts) and non-2xx
-        replies with exponential backoff.
+        Uses a plain multipart POST to the container's direct NVCF invocation
+        URL, bypassing the public gateway load balancer (which 404s on audio
+        traffic). Tenacity retries transport errors (resets, timeouts) and
+        non-2xx replies with exponential backoff.
 
         Args:
             audio_buffer: A ``BytesIO`` holding MP3 audio, named e.g.
@@ -146,18 +152,18 @@ class NIMTranscriber:
         Returns:
             The chunk's transcript text.
         """
-        # Debug: confirm the exact gateway + model the request goes to.
-        print(f"  -> POST {AUDIO_TRANSCRIPTIONS_URL}  model={MODEL_NAME}")
+        # Debug: confirm the exact endpoint + model the request goes to.
+        print(f"  -> POST {NVCF_TRANSCRIPTION_URL}  model={MODEL_NAME}")
         headers = {
             "Authorization": (
                 f"Bearer {self.api_key or os.environ.get(NVIDIA_API_KEY_ENV)}"
             )
         }
         response = self.client.post(
-            AUDIO_TRANSCRIPTIONS_URL,
+            NVCF_TRANSCRIPTION_URL,
             headers=headers,
             files={"file": ("chunk.mp3", audio_buffer, "audio/mpeg")},
-            data={"model": MODEL_NAME},
+            data={"model": MODEL_NAME, "response_format": "json"},
         )
         response.raise_for_status()
         return response.json().get("text", "")

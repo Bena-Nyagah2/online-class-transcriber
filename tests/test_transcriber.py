@@ -26,7 +26,7 @@ from pydub.generators import Sine
 
 from transcriber import (
     NIMTranscriber,
-    AUDIO_TRANSCRIPTIONS_URL,
+    NVCF_TRANSCRIPTION_URL,
     CHUNK_LENGTH_MS,
     MODEL_NAME,
 )
@@ -154,9 +154,9 @@ def test_api_retry_logic(mocker) -> None:
 
     assert text == "mock lecture transcript"
     assert client.post.call_count == 3
-    assert client.post.call_args.args[0] == AUDIO_TRANSCRIPTIONS_URL
+    assert client.post.call_args.args[0] == NVCF_TRANSCRIPTION_URL
     call_kwargs = client.post.call_args.kwargs
-    assert call_kwargs["data"] == {"model": MODEL_NAME}
+    assert call_kwargs["data"] == {"model": MODEL_NAME, "response_format": "json"}
     assert call_kwargs["headers"]["Authorization"] == "Bearer test-key"
     # The file is sent as an explicit (filename, buffer, mime) tuple so the
     # gateway always sees audio/mpeg.
@@ -193,9 +193,9 @@ def test_transcribe_audio_integration(mocker, tmp_path) -> None:
     assert transcript_path.read_text(encoding="utf-8") == expected_text
 
     assert client.post.call_count == 1
-    assert client.post.call_args.args[0] == AUDIO_TRANSCRIPTIONS_URL
+    assert client.post.call_args.args[0] == NVCF_TRANSCRIPTION_URL
     call_kwargs = client.post.call_args.kwargs
-    assert call_kwargs["data"] == {"model": MODEL_NAME}
+    assert call_kwargs["data"] == {"model": MODEL_NAME, "response_format": "json"}
     assert call_kwargs["headers"]["Authorization"] == "Bearer test-key"
     # The upload is an explicit (filename, buffer, audio/mpeg) tuple.
     filename, buffer, mime = call_kwargs["files"]["file"]
