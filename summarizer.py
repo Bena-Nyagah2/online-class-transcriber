@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import openai
+from dotenv import load_dotenv
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from tenacity import (
     retry,
@@ -20,6 +21,10 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+# Load NVIDIA_API_KEY from a local .env (if present) before any client reads
+# the environment. Explicit shell exports still take precedence.
+load_dotenv()
 
 MODEL_NAME = "meta/llama-3.1-70b-instruct"
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"

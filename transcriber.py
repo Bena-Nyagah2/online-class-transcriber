@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import httpx2
+from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from tenacity import (
@@ -41,6 +42,10 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+# Load NVIDIA_API_KEY from a local .env (if present) before any client reads
+# the environment. Explicit shell exports still take precedence.
+load_dotenv()
 
 MODEL_NAME = "openai/whisper-large-v3"
 NVIDIA_BASE_URL = "https://ai.api.nvidia.com/v1"  # NVIDIA Audio gateway

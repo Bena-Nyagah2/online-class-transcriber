@@ -5,6 +5,7 @@ pytest>=8.0.0
 pytest-mock>=3.12.0
 openai>=1.35.0
 httpx2>=2.13.1       # HTTP client openai>=3 bundles; transcriber POSTs raw multipart
+python-dotenv>=1.0.0 # loads NVIDIA_API_KEY from a local .env (never committed)
 pydub>=0.25.1
 tenacity>=8.2.3
 audioop-lts; python_version >= "3.13"   # pydub needs stdlib audioop, removed in 3.13
