@@ -1,11 +1,26 @@
-"""Phase 3 — Multimodal lecture synthesis into structured study notes via NVIDIA NIM (Llama).
+"""Phase 3 — Two-stage MapReduce lecture synthesis via NVIDIA NIM (Llama).
 
-Reads the raw transcript **and** the deduplicated JPEG slides captured for
-the lecture, then produces exam-focused Markdown notes through the
-OpenAI-compatible NVIDIA endpoint. Slides are Base64-encoded into
-``data:image/jpeg`` URLs in a multimodal chat payload so the model can fuse
-visual content (case citations, diagrams, bullet points) with the
-lecturer's spoken explanation.
+NVIDIA's endpoint caps multimodal requests at **one image per call**, so the
+old "all slides in one payload" approach cannot scale to a full lecture deck.
+This module runs a MapReduce pipeline and also works **offline** on any
+already-captured session directory::
+
+    python summarizer.py output/OCHIENG-FRIDAY_2026-09-25
+
+Stage 1 — *Map*  ``_extract_slide_data``: each JPEG slide is sent to the
+vision model alone ("Extract all headings, bullet points, statutory
+references, and diagrams...") and reduced to a compact Markdown block.
+NVIDIA rate limits are absorbed by tenacity retries (2-5s jitter).
+
+Stage 2 — *Accumulate*  ``_build_slide_manifest``: the per-slide extracts are
+combined chronologically into ``slides_manifest.txt`` next to the raw
+transcript. The manifest doubles as a **resume cache** — any slide filename
+already present is skipped on re-runs, so an interrupted extraction continues
+where it stopped and completed sessions never re-pay for API calls.
+
+Stage 3 — *Reduce*  ``generate_notes``: a single **text-only** call merges the
+raw transcript with the accumulated slide text into one cohesive academic
+study guide, written to the session's ``<session-name>.md`` file.
 """
 
 from __future__ import annotations
@@ -13,6 +28,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -23,8 +39,10 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_random,
 )
+
+from transcriber import TRANSCRIPT_FILENAME
 
 # Load NVIDIA_API_KEY from a local .env (if present) before any client reads
 # the environment. Explicit shell exports still take precedence.
@@ -35,8 +53,10 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 
 MIN_TRANSCRIPT_WORDS = 50
-MAX_TOKENS = 4000
+MAX_TOKENS = 4000  # Stage 3: final synthesis over the full transcript + deck
 TEMPERATURE = 0.2
+
+MANIFEST_FILENAME = "slides_manifest.txt"
 
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
 
@@ -49,17 +69,22 @@ SYSTEM_PROMPT = (
     "Lecturer Emphasis (Exam Hints), and Action Items. Do not invent facts."
 )
 
-# Engineered instruction fusing the visual and spoken channels. Placed as the
-# leading text element of every multimodal user payload.
-VISION_PROMPT = (
-    "Integrate the provided slide images with the spoken transcript. "
-    "Extract case citations, diagrams, and bullet points from the visual "
-    "slides and place them in context with the lecturer's spoken explanation."
+# Stage 1: sent alongside exactly one slide image.
+SLIDE_EXTRACT_PROMPT = (
+    "Extract all headings, bullet points, statutory references, and diagrams "
+    "from this slide. Be concise and format as Markdown."
+)
+
+# Stage 3: leading instruction that fuses the two channels.
+SYNTHESIS_INSTRUCTION = (
+    "Here is the chronological transcript of the lecture, followed by the "
+    "text extracted from the slides. Integrate them into a single, cohesive "
+    "academic study guide."
 )
 
 
 class LectureSynthesizer:
-    """Synthesizes lecture transcripts + slides into structured Markdown notes."""
+    """Two-stage MapReduce synthesizer: per-slide vision map, then text merge."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         """Prepare the OpenAI-compatible client for the NVIDIA endpoint.
@@ -120,42 +145,112 @@ class LectureSynthesizer:
             return match_bare.group(1).strip()
         return text.strip()
 
-    # -- LLM call ----------------------------------------------------------
+    # -- Stage 1 (Map): one-image vision extraction -------------------------
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        wait=wait_random(min=2, max=5),
         stop=stop_after_attempt(3),
         retry=retry_if_exception_type(_RETRYABLE_ERRORS),
         reraise=True,
     )
-    def _call_llm(self, transcript_text: str, slide_paths: list[Path]) -> str:
-        """Send the transcript + slide images to the multimodal LLM.
+    def _extract_slide_data(self, image_path: Path) -> str:
+        """Extract the content of a single slide via a one-image vision call.
+
+        NVIDIA's endpoint accepts one image per request, so each slide is
+        mapped independently. ``max_tokens=800`` is a deliberate cap — a
+        single slide's extract is short, and keeping Stage 1 cheap leaves
+        room for the big Stage 3 synthesis.
 
         Args:
-            transcript_text: The lecture transcript text.
-            slide_paths: Captured slide JPEGs, already sorted chronologically.
+            image_path: Path to one captured slide JPEG.
+
+        Returns:
+            The extracted content as concise, fence-free Markdown.
+        """
+        content = [
+            {"type": "text", "text": SLIDE_EXTRACT_PROMPT},
+            {
+                "type": "image_url",
+                "image_url": {"url": self._encode_image(image_path)},
+            },
+        ]
+        response = self.client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": content}],
+            temperature=TEMPERATURE,
+            max_tokens=800,
+        )
+        return self._clean_markdown(response.choices[0].message.content or "")
+
+    # -- Stage 2 (Accumulate): chronological manifest with resume -----------
+
+    def _build_slide_manifest(self, slides_dir: Path, session_dir: Path) -> str:
+        """Combine per-slide extracts into a resumable ``slides_manifest.txt``.
+
+        Slides are processed in chronological order (``slide_001.jpg``
+        naming sorts lexicographically). Any slide whose ``### Slide:`` header
+        already exists in the manifest is skipped — this is the resume
+        checkpoint, so interrupted runs continue and re-runs are free.
+
+        Args:
+            slides_dir: Directory of deduplicated JPEG slides.
+            session_dir: Session root where ``slides_manifest.txt`` is written
+                (alongside ``raw_transcript.txt``).
+
+        Returns:
+            The full accumulated manifest text (all slide sections).
+        """
+        session_dir = Path(session_dir)
+        slides_dir = Path(slides_dir)
+        manifest_path = session_dir / MANIFEST_FILENAME
+
+        slide_paths = sorted(slides_dir.glob("*.jpg"))
+        existing = ""
+        if manifest_path.exists():
+            existing = manifest_path.read_text(encoding="utf-8")
+
+        # Filenames already extracted — treat as processed even if a rerun.
+        already_have = {
+            match.group(1).strip()
+            for match in re.finditer(
+                r"^### Slide: (.+)$", existing, flags=re.MULTILINE
+            )
+        }
+        pending = [slide for slide in slide_paths if slide.name not in already_have]
+
+        total = len(slide_paths)
+        for slide in pending:
+            position = slide_paths.index(slide) + 1
+            print(f"Extracting slide {position}/{total} ({slide.name})...")
+            entry = self._extract_slide_data(slide)
+            existing += f"### Slide: {slide.name}\n{entry}\n\n"
+            # Persist after every slide so a crash mid-deck resumes cleanly.
+            manifest_path.write_text(existing, encoding="utf-8")
+
+        return existing.strip()
+
+    # -- Stage 3 (Reduce): text-only final synthesis ------------------------
+
+    @retry(
+        wait=wait_random(min=2, max=5),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type(_RETRYABLE_ERRORS),
+        reraise=True,
+    )
+    def _call_synthesis(self, prompt: str) -> str:
+        """Send the merged transcript + slide text to the LLM (no images).
+
+        Args:
+            prompt: Fully assembled Stage 3 prompt.
 
         Returns:
             Raw markdown response from the model.
         """
-        # Multimodal payload: leading text element (engineered prompt +
-        # transcript) followed by one image element per slide.
-        content: list[dict] = [
-            {"type": "text", "text": f"{VISION_PROMPT}\n\n{transcript_text}"}
-        ]
-        content.extend(
-            {
-                "type": "image_url",
-                "image_url": {"url": self._encode_image(path)},
-            }
-            for path in slide_paths
-        )
-
         response = self.client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content},
+                {"role": "user", "content": prompt},
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
@@ -169,12 +264,15 @@ class LectureSynthesizer:
     ) -> bool:
         """Generate study notes from a transcript and its captured slides.
 
+        Stage 2 (``_build_slide_manifest``) accumulates the per-slide vision
+        extracts into ``slides_manifest.txt`` beside the transcript, then
+        Stage 3 merges that manifest with the raw transcript in a single
+        text-only LLM call and writes the result to ``notes_path``.
+
         Args:
             transcript_path: Path to the raw transcript text file.
             notes_path: Path where the cleaned Markdown notes will be written.
-            slides_dir: Directory of deduplicated JPEG slides. Lexicographic
-                ordering equals chronological order (``slide_001`` naming),
-                so ``sorted()`` reproduces presentation order.
+            slides_dir: Directory of deduplicated JPEG slides.
 
         Returns:
             True on success.
@@ -182,6 +280,10 @@ class LectureSynthesizer:
         Raises:
             ValueError: If transcript word count is below the minimum threshold.
         """
+        transcript_path = Path(transcript_path)
+        notes_path = Path(notes_path)
+        session_dir = transcript_path.parent
+
         transcript_text = transcript_path.read_text(encoding="utf-8")
         word_count = len(transcript_text.split())
 
@@ -190,12 +292,72 @@ class LectureSynthesizer:
                 "Transcript too short. Aborting synthesis to prevent hallucination."
             )
 
-        # slide_001.jpg .. slide_0NN.jpg sort lexicographically; a missing or
-        # empty slides dir yields an empty list and a text-only payload.
-        slide_paths = sorted(slides_dir.glob("*.jpg"))
+        slide_manifest = self._build_slide_manifest(slides_dir, session_dir)
+        print(f"  -> slide manifest ready: {session_dir / MANIFEST_FILENAME}")
 
-        raw_markdown = self._call_llm(transcript_text, slide_paths)
+        prompt = (
+            f"{SYNTHESIS_INSTRUCTION}\n\n"
+            f"--- Transcript ---\n{transcript_text}\n\n"
+            f"--- Slide content (chronological) ---\n{slide_manifest}"
+        )
+
+        print("Synthesizing study notes from transcript + slide manifest...")
+        raw_markdown = self._call_synthesis(prompt)
         cleaned_markdown = self._clean_markdown(raw_markdown)
 
         notes_path.write_text(cleaned_markdown, encoding="utf-8")
         return True
+
+
+# -- CLI ----------------------------------------------------------------------
+
+
+def _run_cli(argv: list[str]) -> int:
+    """Synthesize notes for an existing session directory from the command line.
+
+    Args:
+        argv: ``sys.argv`` (``argv[1]`` is the session directory).
+
+    Returns:
+        Process exit code (0 = success, 1 = error, 2 = usage error).
+    """
+    if len(argv) < 2:
+        print("Usage: python summarizer.py <session_directory>")
+        print("Example: python summarizer.py output/OCHIENG-FRIDAY_2026-09-25")
+        return 2
+
+    session_dir = Path(argv[1])
+    transcript_path = session_dir / TRANSCRIPT_FILENAME
+    slides_dir = session_dir / "slides"
+    notes_path = session_dir / f"{session_dir.name}.md"
+
+    if not session_dir.is_dir():
+        print(f"Error: session directory not found: {session_dir}")
+        return 1
+    if not transcript_path.exists():
+        print(f"Error: transcript not found: {transcript_path}")
+        return 1
+    if not slides_dir.is_dir():
+        print(
+            f"Warning: slides directory not found at {slides_dir} — "
+            "synthesis will be text-only."
+        )
+
+    print(f"Session   : {session_dir}")
+    print(f"Transcript: {transcript_path}")
+    print(f"Slides    : {slides_dir}")
+    print(f"Notes out : {notes_path}")
+
+    try:
+        synthesizer = LectureSynthesizer()
+        synthesizer.generate_notes(transcript_path, notes_path, slides_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"Done. Notes saved to {notes_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_cli(sys.argv))
