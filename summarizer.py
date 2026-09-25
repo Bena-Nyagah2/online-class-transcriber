@@ -1,13 +1,16 @@
-"""Phase 3 — Lecture transcript synthesis into structured study notes via NVIDIA NIM (Llama).
+"""Phase 3 — Multimodal lecture synthesis into structured study notes via NVIDIA NIM (Llama).
 
-Reads a raw transcript, guards against hallucination on short inputs, and produces
-exam-focused Markdown notes using the NVIDIA-hosted
-Llama-3.1-Nemotron-70B-Instruct model through the OpenAI-compatible
-endpoint.
+Reads the raw transcript **and** the deduplicated JPEG slides captured for
+the lecture, then produces exam-focused Markdown notes through the
+OpenAI-compatible NVIDIA endpoint. Slides are Base64-encoded into
+``data:image/jpeg`` URLs in a multimodal chat payload so the model can fuse
+visual content (case citations, diagrams, bullet points) with the
+lecturer's spoken explanation.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 from pathlib import Path
@@ -46,9 +49,17 @@ SYSTEM_PROMPT = (
     "Lecturer Emphasis (Exam Hints), and Action Items. Do not invent facts."
 )
 
+# Engineered instruction fusing the visual and spoken channels. Placed as the
+# leading text element of every multimodal user payload.
+VISION_PROMPT = (
+    "Integrate the provided slide images with the spoken transcript. "
+    "Extract case citations, diagrams, and bullet points from the visual "
+    "slides and place them in context with the lecturer's spoken explanation."
+)
+
 
 class LectureSynthesizer:
-    """Synthesizes lecture transcripts into structured Markdown study notes."""
+    """Synthesizes lecture transcripts + slides into structured Markdown notes."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         """Prepare the OpenAI-compatible client for the NVIDIA endpoint.
@@ -68,6 +79,21 @@ class LectureSynthesizer:
             api_key=self.api_key,
             base_url=NVIDIA_BASE_URL,
         )
+
+    # -- image encoding ----------------------------------------------------
+
+    def _encode_image(self, image_path: Path) -> str:
+        """Base64-encode a JPEG slide into a ``data:`` URL for the vision model.
+
+        Args:
+            image_path: Path to a captured slide JPEG.
+
+        Returns:
+            ``data:image/jpeg;base64,...`` data URL.
+        """
+        with image_path.open("rb") as image_file:
+            base64_str = base64.b64encode(image_file.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{base64_str}"
 
     # -- markdown cleanup --------------------------------------------------
 
@@ -102,21 +128,34 @@ class LectureSynthesizer:
         retry=retry_if_exception_type(_RETRYABLE_ERRORS),
         reraise=True,
     )
-    def _call_llm(self, transcript: str) -> str:
-        """Send transcript to Llama-3.1-Nemotron-70B-Instruct and return raw
-        markdown.
+    def _call_llm(self, transcript_text: str, slide_paths: list[Path]) -> str:
+        """Send the transcript + slide images to the multimodal LLM.
 
         Args:
-            transcript: The lecture transcript text.
+            transcript_text: The lecture transcript text.
+            slide_paths: Captured slide JPEGs, already sorted chronologically.
 
         Returns:
             Raw markdown response from the model.
         """
+        # Multimodal payload: leading text element (engineered prompt +
+        # transcript) followed by one image element per slide.
+        content: list[dict] = [
+            {"type": "text", "text": f"{VISION_PROMPT}\n\n{transcript_text}"}
+        ]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": self._encode_image(path)},
+            }
+            for path in slide_paths
+        )
+
         response = self.client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
+                {"role": "user", "content": content},
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
@@ -126,13 +165,16 @@ class LectureSynthesizer:
     # -- public entry point ------------------------------------------------
 
     def generate_notes(
-        self, transcript_filepath: str | Path, output_filepath: str | Path
+        self, transcript_path: Path, notes_path: Path, slides_dir: Path
     ) -> bool:
-        """Generate study notes from a transcript file.
+        """Generate study notes from a transcript and its captured slides.
 
         Args:
-            transcript_filepath: Path to the raw transcript text file.
-            output_filepath: Path where the cleaned Markdown notes will be written.
+            transcript_path: Path to the raw transcript text file.
+            notes_path: Path where the cleaned Markdown notes will be written.
+            slides_dir: Directory of deduplicated JPEG slides. Lexicographic
+                ordering equals chronological order (``slide_001`` naming),
+                so ``sorted()`` reproduces presentation order.
 
         Returns:
             True on success.
@@ -140,9 +182,6 @@ class LectureSynthesizer:
         Raises:
             ValueError: If transcript word count is below the minimum threshold.
         """
-        transcript_path = Path(transcript_filepath)
-        output_path = Path(output_filepath)
-
         transcript_text = transcript_path.read_text(encoding="utf-8")
         word_count = len(transcript_text.split())
 
@@ -151,8 +190,12 @@ class LectureSynthesizer:
                 "Transcript too short. Aborting synthesis to prevent hallucination."
             )
 
-        raw_markdown = self._call_llm(transcript_text)
+        # slide_001.jpg .. slide_0NN.jpg sort lexicographically; a missing or
+        # empty slides dir yields an empty list and a text-only payload.
+        slide_paths = sorted(slides_dir.glob("*.jpg"))
+
+        raw_markdown = self._call_llm(transcript_text, slide_paths)
         cleaned_markdown = self._clean_markdown(raw_markdown)
 
-        output_path.write_text(cleaned_markdown, encoding="utf-8")
+        notes_path.write_text(cleaned_markdown, encoding="utf-8")
         return True

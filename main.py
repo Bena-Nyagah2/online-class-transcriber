@@ -262,7 +262,7 @@ def main() -> int:
 
     # ---- Phase A: recording (1st Ctrl+C = clean stop) ----------------------
     # Phase 5: visual capture runs alongside the audio recording loop.
-    slide_catcher = SlideCatcher(output_dir=output_dir, interval_seconds=10.0)
+    slide_catcher = SlideCatcher(output_dir=output_dir)
     slide_catcher.start()
 
     try:
@@ -309,6 +309,7 @@ def main() -> int:
 
     transcript_path = output_dir / TRANSCRIPT_FILENAME
     notes_path = output_dir / f"{course_code}_{date.today():%Y-%m-%d}.md"
+    slides_dir = output_dir / "slides"
 
     try:
         _interrupt_protected(
@@ -319,7 +320,9 @@ def main() -> int:
 
         _interrupt_protected(
             "synthesis",
-            lambda: synthesizer.generate_notes(transcript_path, notes_path),
+            lambda: synthesizer.generate_notes(
+                transcript_path, notes_path, slides_dir
+            ),
         )
     except ValueError as exc:
         print(f"\n⚠️ Synthesis skipped: {exc}")

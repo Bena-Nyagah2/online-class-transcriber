@@ -7,10 +7,13 @@ The whole suite runs **offline** — no NVIDIA API calls, no network I/O:
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 from openai import RateLimitError
+from PIL import Image
 
-from summarizer import LectureSynthesizer
+from summarizer import LectureSynthesizer, MODEL_NAME
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -55,9 +58,12 @@ def test_null_transcript_guard(tmp_path) -> None:
     transcript_path.write_text("This is a very short transcript only ten words long.")
 
     synthesizer = LectureSynthesizer(api_key="test-key")
+    slides_dir = tmp_path / "slides"  # may be missing/empty — guard fires first
 
     with pytest.raises(ValueError, match="Transcript too short"):
-        synthesizer.generate_notes(transcript_path, tmp_path / "output.md")
+        synthesizer.generate_notes(
+            transcript_path, tmp_path / "output.md", slides_dir
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +113,14 @@ def test_generate_notes_success(mocker, tmp_path) -> None:
     )
     transcript_path.write_text(transcript_text, encoding="utf-8")
 
+    # Two deduplicated slides, sorted chronologically by the 001 naming.
+    slides_dir = tmp_path / "slides"
+    slides_dir.mkdir()
+    for index in (1, 2):
+        Image.new("RGB", (16, 16), color=(200, index * 40, 100)).save(
+            slides_dir / f"slide_{index:03d}.jpg", "JPEG"
+        )
+
     synthesizer = _make_synthesizer(mocker)
 
     # Mock LLM response with markdown fences
@@ -126,7 +140,7 @@ def test_generate_notes_success(mocker, tmp_path) -> None:
     )
 
     output_path = tmp_path / "study_notes.md"
-    result = synthesizer.generate_notes(transcript_path, output_path)
+    result = synthesizer.generate_notes(transcript_path, output_path, slides_dir)
 
     assert result is True
     assert output_path.exists()
@@ -135,13 +149,32 @@ def test_generate_notes_success(mocker, tmp_path) -> None:
     content = output_path.read_text(encoding="utf-8")
     assert content == "# Criminal Law Lecture\n\n## Core Concepts\n- Actus Reus\n- Mens Rea"
 
-    # Verify the LLM was called with correct parameters
+    # Verify the LLM was called with the decoupled model + multimodal payload
     call_kwargs = synthesizer.client.chat.completions.create.call_args.kwargs
-    assert call_kwargs["model"] == "meta/llama-3.1-70b-instruct"
+    assert call_kwargs["model"] == MODEL_NAME
     assert call_kwargs["temperature"] == 0.2
     assert call_kwargs["max_tokens"] == 4000
     assert len(call_kwargs["messages"]) == 2
     assert call_kwargs["messages"][0]["role"] == "system"
     assert "Law and Criminology" in call_kwargs["messages"][0]["content"]
-    assert call_kwargs["messages"][1]["role"] == "user"
-    assert call_kwargs["messages"][1]["content"] == transcript_text
+
+    user_content = call_kwargs["messages"][1]["content"]
+    assert isinstance(user_content, list)
+    assert len(user_content) == 3  # 1 text element + 2 image elements
+
+    # Text element: engineered vision prompt leading the transcript.
+    text_part = user_content[0]
+    assert text_part["type"] == "text"
+    assert (
+        "Integrate the provided slide images with the spoken transcript"
+        in text_part["text"]
+    )
+    assert transcript_text in text_part["text"]
+
+    # Image elements: data-URLs that round-trip to the original JPEG bytes.
+    for image_part, name in zip(user_content[1:], ["slide_001.jpg", "slide_002.jpg"]):
+        assert image_part["type"] == "image_url"
+        url = image_part["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+        payload = url.split(",", 1)[1]
+        assert base64.b64decode(payload) == (slides_dir / name).read_bytes()
