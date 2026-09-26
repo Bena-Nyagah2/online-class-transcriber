@@ -8,9 +8,10 @@ already-captured session directory::
     python summarizer.py output/OCHIENG-FRIDAY_2026-09-25
 
 Stage 1 — *Map*  ``_extract_slide_data``: each JPEG slide is sent to the
-vision model alone ("Extract all headings, bullet points, statutory
-references, and diagrams...") and reduced to a compact Markdown block.
-NVIDIA rate limits are absorbed by tenacity retries (2-5s jitter).
+vision model alone (instructed to act as an "expert academic visual analyst"
+and to narrate any infographics, charts, or diagrams) and reduced to a
+compact Markdown block. NVIDIA rate limits are absorbed by tenacity retries
+(2-5s jitter).
 
 Stage 2 — *Accumulate*  ``_build_slide_manifest``: the per-slide extracts are
 combined chronologically into ``slides_manifest.txt`` next to the raw
@@ -29,6 +30,7 @@ import base64
 import os
 import re
 import sys
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -60,19 +62,32 @@ MANIFEST_FILENAME = "slides_manifest.txt"
 
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
 
-SYSTEM_PROMPT = (
-    "You are an expert academic assistant for a university Law and Criminology "
-    "student. Convert the following lecture transcript into highly structured, "
-    "exam-focused Markdown notes. You must include these sections: "
-    "Metadata (Topic/Date), Core Concepts & Definitions, "
-    "Criminological/Legal Theories Discussed, Statutes & Case Law Cited, "
-    "Lecturer Emphasis (Exam Hints), and Action Items. Do not invent facts."
+SYSTEM_PROMPT = textwrap.dedent(
+    """\
+    You are an elite, highly engaging academic study assistant. You are receiving a chronological lecture transcript and a manifest of described visual slides.
+
+    Your mandate is to fuse these into a comprehensive, deeply analytical, and fun-to-read study guide.
+
+    CRITICAL RULES:
+    1. **Read the Tone:** Look for semantic emphasis. If the lecturer repeats a concept, says "this is important", or if there are structural pauses (indicated by line breaks), highlight these as 🚨 **Core Concepts**.
+    2. **Visual Fusion:** When the transcript aligns with a described infographic or diagram from the slides, explain the visual relationship in context.
+    3. **Rich Formatting:** DO NOT output boring walls of text. You MUST use:
+       - **Markdown Tables** for any comparisons, pros/cons, or chronological events.
+       - **Blockquotes (>)** for major definitions or lecturer quotes.
+       - **Bold text** for key terminology.
+    4. **References:** Create a dedicated "📚 References, Statutes & Citations" appendix at the bottom containing every case, law, book, or paper mentioned.
+
+    Make the formatting highly scannable, intellectually stimulating, and academically rigorous.
+    """
 )
 
 # Stage 1: sent alongside exactly one slide image.
 SLIDE_EXTRACT_PROMPT = (
-    "Extract all headings, bullet points, statutory references, and diagrams "
-    "from this slide. Be concise and format as Markdown."
+    "You are an expert academic visual analyst. Extract all text, bullet points, "
+    "and statutory/case references. IF the image contains infographics, charts, "
+    "diagrams, or visual metaphors, you MUST explicitly describe the data, "
+    "structural relationships, and meaning of the visual elements. Be highly "
+    "detailed but format concisely in Markdown."
 )
 
 # Stage 3: leading instruction that fuses the two channels.
