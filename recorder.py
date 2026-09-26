@@ -1,7 +1,11 @@
 """Audio capture for the lecture transcription pipeline (Phase 1).
 
-Captures system-audio loopback (WASAPI on Windows) on a daemon thread and
-saves 16 kHz, mono, 16-bit PCM WAV files.
+Records **two audio sources simultaneously** — the system-audio loopback
+(WASAPI on Windows) and the room microphone — mixes them down to a single
+16 kHz, mono, 16-bit PCM WAV. Both streams are required for WhisperX speaker
+diarization: the loopback carries the lecturer's Zoom/Teams/YouTube audio
+while the microphone carries the students in the physical room, and
+pyannote can only tell those voices apart if both are present in the file.
 
 Architectural notes
 -------------------
@@ -10,7 +14,13 @@ Architectural notes
 * The soundcard WASAPI backend is documented to record garbage when asked
   for a single channel, so capture happens at the device's native channel
   count and is downmixed to mono in NumPy.
-* The capture thread is a daemon and is always joined by
+* **One capture thread per device.** Polling both recorders from a single
+  loop would block on each ``record()`` call in turn, so the loop would run
+  at half wall-clock speed and the finished WAV would play back at double
+  speed with the two sources drifting apart. Independent threads let each
+  backend block at its own real-time pace; the streams are only merged once
+  at flush time, after the take is over.
+* The capture threads are daemons and are always joined by
   :meth:`AudioRecorder.stop_recording`, so no zombie threads survive the CLI.
 """
 
@@ -44,6 +54,14 @@ STOP_JOIN_TIMEOUT_SECONDS: float = 5.0
 
 EMERGENCY_BACKUP_FILENAME: str = "emergency_backup.wav"
 """Default filename for the mid-lecture device-failure dump."""
+
+AUTO_MICROPHONE: Any = object()
+"""Sentinel: "use :meth:`AudioRecorder.get_default_microphone`".
+
+A distinct object is required because ``None`` is a meaningful value here —
+it explicitly disables microphone capture — so the default argument cannot
+double as the "not supplied" marker.
+"""
 
 
 class LoopbackDevice(Protocol):
@@ -108,35 +126,89 @@ def _stack_chunks(chunks: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(chunks, axis=0)
 
 
-class AudioRecorder:
-    """Records system-audio loopback to WAV on a background daemon thread.
+def _combine_streams(*streams: np.ndarray) -> np.ndarray:
+    """Average any number of mono capture buffers into one mono array.
 
-    Usage::
+    The two capture threads start together and both run at
+    :data:`SAMPLE_RATE`, so their buffers should stay within a chunk of each
+    other in length. Any residual difference is absorbed by zero-padding the
+    shorter stream, which preserves the total duration of the longer one
+    instead of truncating real audio.
+
+    Averaging (rather than summing) keeps the result inside [-1, 1] so a loud
+    passage on the loopback cannot clip the lecturer's microphone. Each of the
+    two sources therefore sits ~6 dB lower whenever both are active, which is
+    the right trade for a lecture hall where the microphone is the channel
+    that must never distort.
+
+    Args:
+        *streams: Mono arrays produced by :func:`_to_mono` (or empty arrays
+            for a source that never captured anything).
+
+    Returns:
+        A 1-D float32 array holding the average of the inputs, clipped to
+        [-1, 1]. Empty inputs are ignored; if every input is empty the result
+        is an empty float32 array.
+    """
+    usable = [s for s in streams if s is not None and s.size > 0]
+    if not usable:
+        return np.empty(0, dtype=np.float32)
+
+    # Absorb length drift by padding the shorter streams with trailing zeros.
+    target = max(s.size for s in usable)
+    padded = [
+        s if s.size == target
+        else np.concatenate([s, np.zeros(target - s.size, dtype=np.float32)])
+        for s in usable
+    ]
+
+    mixed = np.mean(np.stack(padded, axis=0), axis=0, dtype=np.float32)
+    # np.clip guards against any float32 rounding that pushes a sample past
+    # full scale once the two streams are averaged.
+    return np.ascontiguousarray(np.clip(mixed, -1.0, 1.0), dtype=np.float32)
+
+
+class AudioRecorder:
+    """Records system-audio loopback **and** the microphone to one WAV.
+
+    Each source gets its own capture thread so neither can starve the other;
+    they are averaged into a single mono track when the take is flushed::
 
         recorder = AudioRecorder()
         devices = recorder.get_loopback_devices()
-        recorder.start_recording(0)          # non-blocking
+        recorder.start_recording(0)          # non-blocking, mic auto-detected
         ...
-        recorder.stop_recording("talk.wav")  # flushes the buffer and saves
+        recorder.stop_recording("talk.wav")  # mixes both streams and saves
     """
 
     def __init__(self, emergency_backup_path: Optional[Path] = None) -> None:
         """Create a recorder in the stopped state.
 
         Args:
-            emergency_backup_path: Where to dump the buffer if the audio
+            emergency_backup_path: Where to dump the buffer if an audio
                 device fails mid-recording. Defaults to
                 ``./emergency_backup.wav`` in the current directory.
         """
         self.is_recording: threading.Event = threading.Event()
-        # Set while the capture loop should run; ``stop_recording`` clears it.
+        # Set while the capture loops should run; ``stop_recording`` clears it.
 
-        self._buffer: list[np.ndarray] = []
         self._buffer_lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
         self._devices: Optional[list[LoopbackDevice]] = None
 
-        # Handshake between start_recording() and the capture thread:
+        # Separate per-source chunk buffers, plus the threads draining them.
+        self._system_buffer: list[np.ndarray] = []
+        self._mic_buffer: list[np.ndarray] = []
+        self._system_thread: Optional[threading.Thread] = None
+        self._mic_thread: Optional[threading.Thread] = None
+        self._mic_device: Optional[LoopbackDevice] = None
+        self._mic_active: bool = False
+        self._mic_failed: bool = False
+
+        # Handshake between start_recording() and the capture threads. Both
+        # threads must report in before the caller's wait() is released.
+        self._open_lock = threading.Lock()
+        self._streams_expected: int = 0
+        self._streams_opened: int = 0
         self._open_complete = threading.Event()
         self._open_error: Optional[Exception] = None
 
@@ -178,22 +250,46 @@ class AudioRecorder:
                 self._devices = list(sc.all_microphones())
         return list(self._devices)
 
-    def start_recording(self, device_id: int) -> None:
-        """Start capturing on a daemon thread (non-blocking).
+    def get_default_microphone(self) -> LoopbackDevice:
+        """Return the OS default input device for the room microphone.
 
-        The WASAPI stream is opened *inside* the capture thread, but this
-        method waits for a handshake, so device-open failures surface here,
-        on the caller's thread, instead of dying silently in the background.
+        Kept as a method (rather than calling ``sc.default_microphone()``
+        inline) so tests can inject a fake device without touching hardware.
+
+        Returns:
+            The default ``soundcard`` microphone device.
+        """
+        return sc.default_microphone()
+
+    def start_recording(
+        self,
+        device_id: int,
+        microphone: Optional[LoopbackDevice] = AUTO_MICROPHONE,
+    ) -> None:
+        """Start capturing loopback **and** microphone on daemon threads.
+
+        The loopback stream is authoritative: if it cannot be opened the call
+        fails loudly, preserving the original single-source contract. The
+        microphone is best-effort — a machine with no usable input (or a
+        denied permission prompt) degrades to system-audio-only capture with a
+        warning instead of losing the whole lecture.
+
+        The streams are opened *inside* their capture threads, but this method
+        waits for a handshake, so device-open failures surface here, on the
+        caller's thread, instead of dying silently in the background.
 
         Args:
             device_id: Index into :meth:`get_loopback_devices`.
+            microphone: Microphone device to record alongside the loopback.
+                Defaults to :data:`AUTO_MICROPHONE`, which resolves the OS
+                default input. Pass ``None`` to record system audio only.
 
         Raises:
             IndexError: ``device_id`` is out of range.
-            RuntimeError: A recording is already running, the device failed
-                to open, or opening it timed out.
+            RuntimeError: A recording is already running, the loopback
+                device failed to open, or opening it timed out.
         """
-        if self._thread is not None and self._thread.is_alive():
+        if self._is_capturing():
             raise RuntimeError("a recording is already in progress")
 
         devices = self.get_loopback_devices()
@@ -203,25 +299,66 @@ class AudioRecorder:
             )
 
         with self._buffer_lock:
-            self._buffer = []
+            self._system_buffer = []
+            self._mic_buffer = []
         self._finalized = False
         self._last_path = None
         self._open_error = None
+        self._mic_active = False
+        self._mic_failed = False
+        # Drop references to any previous take's threads so a reused recorder
+        # cannot report a dead thread as the live microphone stream.
+        self._system_thread = None
+        self._mic_thread = None
+        self._mic_device = None
+
+        # The loopback is mandatory; the microphone only joins if a device
+        # was resolved. ``None`` disables it outright; the sentinel triggers a
+        # default-device lookup, done here so a raising lookup is reported on
+        # the caller's thread rather than inside a daemon.
+        if microphone is AUTO_MICROPHONE:
+            try:
+                self._mic_device = self.get_default_microphone()
+            except Exception as exc:  # no input device / backend unavailable
+                self._mic_device = None
+                print(
+                    f"\n⚠️ No default microphone found ({exc!r}) — "
+                    "recording system audio only. Diarization will not be "
+                    "able to separate room voices.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            self._mic_device = microphone
+
+        self._streams_expected = 2 if self._mic_device is not None else 1
+        with self._open_lock:
+            self._streams_opened = 0
         self._open_complete.clear()
         self.is_recording.set()
 
-        self._thread = threading.Thread(
-            target=self._capture_loop,
-            args=(devices[device_id],),
-            name="AudioRecorder.capture",
+        # System audio first: its thread is the one whose failure is fatal.
+        self._system_thread = threading.Thread(
+            target=self._capture_stream,
+            args=(devices[device_id], self._system_buffer, "system audio"),
+            name="AudioRecorder.system",
             daemon=True,  # dies with the interpreter — never a zombie
         )
-        self._thread.start()
+        self._system_thread.start()
+
+        if self._mic_device is not None:
+            self._mic_thread = threading.Thread(
+                target=self._capture_stream,
+                args=(self._mic_device, self._mic_buffer, "microphone"),
+                name="AudioRecorder.microphone",
+                daemon=True,
+            )
+            self._mic_thread.start()
 
         try:
             opened = self._open_complete.wait(timeout=OPEN_TIMEOUT_SECONDS)
         except KeyboardInterrupt:
-            self.is_recording.clear()  # don't leave the thread capturing
+            self.is_recording.clear()  # don't leave the threads capturing
             raise
 
         if not opened:
@@ -235,11 +372,25 @@ class AudioRecorder:
                 f"{self._open_error!r}"
             ) from self._open_error
 
+        self._mic_active = self._mic_thread is not None and not self._mic_failed
+        print(
+            f"🎙️  Capturing: {devices[device_id].name} + "
+            f"{getattr(self._mic_device, 'name', 'microphone') if self._mic_active else 'no microphone'}",
+            flush=True,
+        )
+
+    def _is_capturing(self) -> bool:
+        """Return True if either capture thread is still running."""
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._system_thread, self._mic_thread)
+        )
+
     def stop_recording(self, output_filepath: Path | str) -> Path:
-        """Stop recording, flush the buffer, and write a 16 kHz mono WAV.
+        """Stop recording, mix both streams, and write a 16 kHz mono WAV.
 
         Safe to call when capture already stopped on its own (device drop):
-        the thread join returns immediately and everything captured before
+        the thread joins return immediately and everything captured before
         the failure is still written. Calling it twice returns the path of
         the first write instead of overwriting it with an empty file.
 
@@ -256,25 +407,23 @@ class AudioRecorder:
         """
         self.is_recording.clear()
 
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
-            if thread.is_alive():  # pathological backend — daemon will die anyway
-                print(
-                    "warning: capture thread did not stop within "
-                    f"{STOP_JOIN_TIMEOUT_SECONDS:.0f}s; the audio backend "
-                    "may be wedged.",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        for thread in (self._system_thread, self._mic_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
+                if thread.is_alive():  # pathological backend — daemon will die
+                    print(
+                        "warning: capture thread did not stop within "
+                        f"{STOP_JOIN_TIMEOUT_SECONDS:.0f}s; the audio backend "
+                        "may be wedged.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
         if self._finalized and self._last_path is not None:
             return self._last_path
 
-        with self._buffer_lock:
-            chunks = list(self._buffer)
-            self._buffer = []  # release memory now that it is flushed
-        audio = _stack_chunks(chunks)
+        audio = self._mix_buffers()
+        self._release_buffers()
 
         path = Path(output_filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -285,30 +434,80 @@ class AudioRecorder:
         self._last_path = path
         return path
 
+    def _mix_buffers(self) -> np.ndarray:
+        """Average the per-source chunk buffers into one mono array.
+
+        Only sources that actually captured audio are mixed in, so a
+        microphone that never opened does not drag the take to silence.
+
+        Returns:
+            The mixed 1-D float32 recording.
+        """
+        with self._buffer_lock:
+            system = _stack_chunks(list(self._system_buffer))
+            mic = _stack_chunks(list(self._mic_buffer))
+        return _combine_streams(system, mic)
+
+    def _release_buffers(self) -> None:
+        """Drop the per-source chunk lists once they have been mixed."""
+        with self._buffer_lock:
+            self._system_buffer = []
+            self._mic_buffer = []
+
     # ------------------------------------------------------------------
     # capture thread
     # ------------------------------------------------------------------
 
-    def _capture_loop(self, device: LoopbackDevice) -> None:
-        """Daemon-thread body: capture until stopped or the device fails.
+    def _capture_stream(
+        self,
+        device: LoopbackDevice,
+        buffer: list[np.ndarray],
+        label: str,
+    ) -> None:
+        """Daemon-thread body: capture one device until stopped or it fails.
 
         Args:
-            device: The loopback device to record from.
+            device: The capture device (loopback or microphone).
+            buffer: The per-source list this thread appends mono chunks to.
+            label: Human-readable source name used in log/alert messages.
         """
+        is_mic = label == "microphone"
         try:
             # ``blocksize`` is left unset so WASAPI chooses its default
             # engine period, which is always valid in shared mode.
-            with device.recorder(samplerate=SAMPLE_RATE) as microphone:
-                self._open_complete.set()  # release start_recording()
+            with device.recorder(samplerate=SAMPLE_RATE) as recorder:
+                # Report in; release start_recording() once BOTH streams are
+                # open so the caller never starts timing against a half-open
+                # pair of devices.
+                with self._open_lock:
+                    self._streams_opened += 1
+                    if self._streams_opened >= self._streams_expected:
+                        self._open_complete.set()
                 while self.is_recording.is_set():
-                    chunk = microphone.record(numframes=CHUNK_FRAMES)
+                    chunk = recorder.record(numframes=CHUNK_FRAMES)
                     with self._buffer_lock:
-                        self._buffer.append(_to_mono(chunk))
+                        buffer.append(_to_mono(chunk))
         except Exception as exc:
+            if is_mic:
+                # Best-effort source: degrade to system-audio-only rather
+                # than throwing away the lecture.
+                self._mic_failed = True
+                self._open_complete.set()  # never hang start_recording()
+                if self.is_recording.is_set():
+                    print(
+                        f"\n⚠️ Microphone capture failed ({exc!r}) — "
+                        "continuing with system audio only. Diarization will "
+                        "not be able to separate room voices.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return
+
             if not self._open_complete.is_set():
                 # Failed before the stream ever opened: report it on the
                 # caller's thread via start_recording()'s handshake.
                 self._open_error = exc
+                self._open_complete.set()
                 return
             # Defense (device drop): the device disconnected mid-lecture —
             # salvage the buffer to disk immediately and alert the user.
@@ -329,15 +528,14 @@ class AudioRecorder:
             self._open_complete.set()  # never leave start_recording() hanging
 
     def _try_emergency_backup(self) -> Optional[Path]:
-        """Best-effort dump of the buffer to the emergency backup WAV.
+        """Best-effort dump of the mixed buffer to the emergency backup WAV.
 
         Returns:
             The backup path on success, or ``None`` if the dump failed.
         """
         try:
-            with self._buffer_lock:
-                chunks = list(self._buffer)  # keep buffer: stop_recording
-            audio = _stack_chunks(chunks)    # still flushes it later
+            audio = self._mix_buffers()  # buffers are kept: stop_recording
+                                         # still flushes them afterwards
             self._emergency_backup_path.parent.mkdir(parents=True, exist_ok=True)
             sf.write(
                 str(self._emergency_backup_path),

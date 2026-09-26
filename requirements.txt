@@ -12,3 +12,6 @@ audioop-lts; python_version >= "3.13"   # pydub needs stdlib audioop, removed in
 mss>=9.0.1                  # Phase 5: primary-display screen grabbing
 Pillow>=10.0.0              # PIL frame conversion + JPEG slide encoding
 ImageHash>=4.3.1            # perceptual hash for slide deduplication
+whisperx>=3.1               # Phase 2: ASR + wav2vec2 alignment + pyannote diarization
+torch>=2.1                  # WhisperX inference backend (pinned for reproducibility)
+torchaudio>=2.1             # wav2vec2 forced-alignment pipelines used by WhisperX
