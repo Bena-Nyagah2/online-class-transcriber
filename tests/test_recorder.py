@@ -11,6 +11,7 @@ input:
 
 from __future__ import annotations
 
+import threading
 from datetime import date
 
 import numpy as np
@@ -22,6 +23,7 @@ from recorder import (
     AudioRecorder,
     CHUNK_FRAMES,
     SAMPLE_RATE,
+    _combine_streams,
     _stack_chunks,
     _to_mono,
 )
@@ -64,6 +66,136 @@ def test_buffer_stacks_to_single_mono_record() -> None:
     assert joined.ndim == 1
     assert joined.shape == (5,)
     assert joined.dtype == np.float32
+
+
+# ---------------------------------------------------------------------------
+# recorder.py — two-way stream mixing
+# ---------------------------------------------------------------------------
+
+
+def test_combine_streams_averages_without_clipping() -> None:
+    """Loopback and mic are averaged, and loud input stays inside [-1, 1]."""
+    loopback = np.array([1.0, -1.0, 0.8], dtype=np.float32)
+    mic = np.array([0.5, 0.5, 0.2], dtype=np.float32)
+
+    mixed = _combine_streams(loopback, mic)
+
+    assert mixed.ndim == 1
+    assert mixed.dtype == np.float32
+    # Averaged, not summed: summing would clip the first sample to 1.5.
+    np.testing.assert_allclose(mixed, [0.75, -0.25, 0.5], rtol=1e-6)
+    assert mixed.max() <= 1.0 and mixed.min() >= -1.0
+
+
+def test_combine_streams_pads_shorter_and_ignores_empty() -> None:
+    """Length drift is zero-padded; an empty source cannot mute the mix."""
+    loopback = np.array([0.4, 0.4, 0.4, 0.4], dtype=np.float32)
+    mic = np.array([0.2, 0.2], dtype=np.float32)  # two frames behind
+
+    mixed = _combine_streams(loopback, mic)
+
+    # Duration follows the LONGER stream; the short one is zero-padded.
+    assert mixed.shape == (4,)
+    np.testing.assert_allclose(mixed, [0.3, 0.3, 0.2, 0.2], rtol=1e-6)
+
+    # A microphone that never opened contributes nothing (system-only take).
+    solo = _combine_streams(loopback, np.empty(0, dtype=np.float32))
+    np.testing.assert_allclose(solo, loopback, rtol=1e-6)
+
+    # Both sources empty -> empty result, not a crash.
+    assert _combine_streams(
+        np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32)
+    ).shape == (0,)
+
+
+def test_two_way_capture_opens_both_devices_at_same_rate(mocker, tmp_path) -> None:
+    """Both sources are polled in parallel at 16 kHz and yield one mono WAV.
+
+    ``record()`` blocks on a gate that the test opens only after
+    ``start_recording`` has returned, so each thread is guaranteed to have
+    captured at least one chunk and the leading chunk is a true two-source
+    overlap. Beyond that chunk the per-thread chunk counts are
+    scheduler-dependent, so only bounds are asserted — the exact mixing maths
+    is covered deterministically by the ``_combine_streams`` tests above.
+    """
+    recorder = AudioRecorder(emergency_backup_path=tmp_path / "backup.wav")
+    gate = threading.Event()
+
+    def _fake_device(name: str) -> mocker.MagicMock:
+        """A device whose recorder yields constant mono chunks after ``gate``."""
+        chunk = np.full((CHUNK_FRAMES, 2), 0.5, dtype=np.float32)
+
+        def _record(numframes=None):  # noqa: ARG001 - soundcard's signature
+            gate.wait(timeout=5.0)
+            return chunk
+
+        stream = mocker.MagicMock()
+        stream.record.side_effect = _record
+        context = mocker.MagicMock()
+        context.__enter__.return_value = stream
+        device = mocker.MagicMock()
+        device.name = name
+        device.recorder.return_value = context
+        return device
+
+    system_device = _fake_device("Speakers (Loopback)")
+    mic_device = _fake_device("Built-in Microphone")
+
+    mocker.patch.object(
+        recorder, "get_loopback_devices", return_value=[system_device]
+    )
+
+    recorder.start_recording(0, microphone=mic_device)
+
+    # Both devices opened, at the identical sample rate, before we let them run.
+    system_device.recorder.assert_called_once_with(samplerate=SAMPLE_RATE)
+    mic_device.recorder.assert_called_once_with(samplerate=SAMPLE_RATE)
+    assert recorder._system_thread is not None
+    assert recorder._mic_thread is not None
+
+    gate.set()  # release both capture loops
+
+    wav_path = tmp_path / "two_way.wav"
+    recorder.stop_recording(wav_path)
+
+    info = sf.info(str(wav_path))
+    assert info.samplerate == SAMPLE_RATE
+    assert info.channels == 1            # downmixed to a single mono track
+    assert info.frames >= CHUNK_FRAMES   # both threads contributed audio
+
+    data, _ = sf.read(str(wav_path))
+    # First chunk: both sources present, so mean(0.5, 0.5) == 0.5.
+    np.testing.assert_allclose(data[:CHUNK_FRAMES], 0.5, atol=1e-3)
+    # The tail is a partial overlap (or zero-padding), so it is bounded by the
+    # louder source and never clips.
+    assert data.min() >= 0.0 and data.max() <= 0.5 + 1e-3
+
+
+def test_start_recording_none_microphone_skips_mic_thread(mocker, tmp_path) -> None:
+    """``microphone=None`` records system audio only — no input device opened."""
+    recorder = AudioRecorder(emergency_backup_path=tmp_path / "backup.wav")
+
+    stream = mocker.MagicMock()
+    stream.record.return_value = np.zeros((CHUNK_FRAMES, 2), dtype=np.float32)
+    context = mocker.MagicMock()
+    context.__enter__.return_value = stream
+    system_device = mocker.MagicMock()
+    system_device.name = "Speakers"
+    system_device.recorder.return_value = context
+
+    mocker.patch.object(
+        recorder, "get_loopback_devices", return_value=[system_device]
+    )
+    # get_default_microphone must never be consulted when None is explicit.
+    default_mic = mocker.patch.object(recorder, "get_default_microphone")
+
+    recorder.start_recording(0, microphone=None)
+
+    assert default_mic.call_count == 0
+    assert recorder._mic_thread is None
+    assert recorder._mic_active is False
+
+    recorder.stop_recording(tmp_path / "solo.wav")
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +257,16 @@ def test_device_drop_recovery(mocker, tmp_path) -> None:
 
     mocker.patch.object(recorder, "get_loopback_devices", return_value=[device_mock])
 
-    recorder.start_recording(0)  # handshake succeeds: the stream "opens"
+    # microphone=None records system audio only, so no real input device is
+    # opened during the test.
+    recorder.start_recording(0, microphone=None)  # handshake: stream "opens"
 
     # Let the daemon thread run to completion (it fails on the 2nd record()).
-    assert recorder._thread is not None
-    recorder._thread.join(timeout=5.0)
+    assert recorder._system_thread is not None
+    recorder._system_thread.join(timeout=5.0)
 
     # Thread exited cleanly; the recording event was cleared; no open error.
-    assert not recorder._thread.is_alive()
+    assert not recorder._system_thread.is_alive()
     assert not recorder.is_recording.is_set()
     assert recorder._open_complete.is_set()
     assert recorder._open_error is None
@@ -159,7 +293,7 @@ def test_stop_recording_idempotent(tmp_path) -> None:
         np.array([0.5, 0.5], dtype=np.float32), (SAMPLE_RATE // 2, 1)
     )
     with recorder._buffer_lock:
-        recorder._buffer.append(_to_mono(stereo))
+        recorder._system_buffer.append(_to_mono(stereo))
 
     wav_path = tmp_path / "test.wav"
 
@@ -184,7 +318,8 @@ def test_stop_recording_idempotent(tmp_path) -> None:
 
     # The buffer was flushed on the first call.
     with recorder._buffer_lock:
-        assert recorder._buffer == []
+        assert recorder._system_buffer == []
+        assert recorder._mic_buffer == []
 
 
 # ---------------------------------------------------------------------------
