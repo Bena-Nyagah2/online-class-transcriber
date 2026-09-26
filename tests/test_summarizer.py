@@ -17,6 +17,7 @@ from summarizer import (
     MODEL_NAME,
     SLIDE_EXTRACT_PROMPT,
     SYNTHESIS_INSTRUCTION,
+    SYSTEM_PROMPT,
 )
 
 # ---------------------------------------------------------------------------
@@ -137,7 +138,9 @@ def test_extract_slide_data_sends_single_image(mocker, tmp_path) -> None:
     text_part, image_part = content
     assert text_part["type"] == "text"
     assert SLIDE_EXTRACT_PROMPT == text_part["text"]
-    assert "statutory references" in text_part["text"]
+    assert "statutory/case references" in text_part["text"]
+    # The map stage must instruct the model to narrate visual elements.
+    assert "infographics" in text_part["text"]
 
     assert image_part["type"] == "image_url"
     url = image_part["image_url"]["url"]
@@ -247,7 +250,11 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     assert reduce_call.kwargs["max_tokens"] == 4000
     assert reduce_call.kwargs["model"] == MODEL_NAME
     assert reduce_call.kwargs["messages"][0]["role"] == "system"
-    assert "Law and Criminology" in reduce_call.kwargs["messages"][0]["content"]
+    system_content = reduce_call.kwargs["messages"][0]["content"]
+    assert system_content == SYSTEM_PROMPT
+    # The reduce stage must demand rich formatting and a references appendix.
+    assert "Markdown Tables" in system_content
+    assert "References, Statutes & Citations" in system_content
 
     user_content = reduce_call.kwargs["messages"][1]["content"]
     assert isinstance(user_content, str)
