@@ -18,12 +18,13 @@ import pytest
 
 from transcriber import (
     HF_TOKEN_ENV,
+    INITIAL_PROMPT,
     LocalTranscriber,
     MAX_TURN_GAP_SECONDS,
     TRANSCRIPT_FILENAME,
     UNKNOWN_SPEAKER,
-    _format_timestamp,
     _format_turns,
+    format_timestamp,
     resolve_hf_token,
 )
 
@@ -34,7 +35,11 @@ from transcriber import (
 
 
 def _make_whisperx(mocker, segments, language="en", speakers=None):
-    """Stub the three WhisperX stages and return the ``whisperx`` mock.
+    """Stub the three WhisperX stages; return ``(whisperx, pipeline_cls, assign)``.
+
+    The diarization pair is patched on ``transcriber`` itself, not on the
+    ``whisperx`` module, because ``transcriber`` imports those two names
+    directly from ``whisperx.diarize`` to sidestep the root namespace.
 
     Args:
         segments: Segment dicts returned by the align stage.
@@ -52,11 +57,15 @@ def _make_whisperx(mocker, segments, language="en", speakers=None):
         {"language": language},
     )
     whisperx.align.return_value = {"segments": list(segments)}
-    whisperx.assign_word_speakers.return_value = {"segments": list(segments)}
-    whisperx.DiarizationPipeline.return_value.return_value = (
+
+    assign = mocker.patch("transcriber.assign_word_speakers")
+    assign.return_value = {"segments": list(segments)}
+
+    pipeline_cls = mocker.patch("transcriber.DiarizationPipeline")
+    pipeline_cls.return_value.return_value = (
         speakers if speakers is not None else mocker.MagicMock(name="diarize_df")
     )
-    return whisperx
+    return whisperx, pipeline_cls, assign
 
 
 @pytest.fixture(autouse=True)
@@ -116,7 +125,7 @@ def test_transcriber_constructor_requires_token(monkeypatch) -> None:
     ],
 )
 def test_format_timestamp(seconds, expected) -> None:
-    assert _format_timestamp(seconds) == expected
+    assert format_timestamp(seconds) == expected
 
 
 def test_format_turns_merges_intra_sentence_splits() -> None:
@@ -184,15 +193,15 @@ def test_format_turns_gap_threshold_splits_or_merges(gap, expected_turns) -> Non
         # legitimately included in the range.
         assert lines == [
             f"[SPEAKER_00] (00:00 - "
-            f"{_format_timestamp(15.0 + gap)}): Good morning, please sit down."
+            f"{format_timestamp(15.0 + gap)}): Good morning, please sit down."
         ]
     else:
         # Two turns, same label, and the first turn keeps its true 8 s span
         # rather than absorbing the silence.
         assert lines == [
             "[SPEAKER_00] (00:00 - 00:08): Good morning,",
-            f"[SPEAKER_00] ({_format_timestamp(8.0 + gap)} - "
-            f"{_format_timestamp(15.0 + gap)}): please sit down.",
+            f"[SPEAKER_00] ({format_timestamp(8.0 + gap)} - "
+            f"{format_timestamp(15.0 + gap)}): please sit down.",
         ]
 
 
@@ -303,19 +312,37 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     segments = [
         {"start": 0.0, "end": 12.5, "text": "Welcome to the lecture.", "speaker": "SPEAKER_00"},
     ]
-    whisperx = _make_whisperx(mocker, segments)
+    whisperx, pipeline_cls, assign = _make_whisperx(mocker, segments)
 
     transcriber = LocalTranscriber()
     transcript_path = transcriber.transcribe_audio(wav_path)
 
     # -- Stage A: model loaded on CPU/int8, fed the decoded audio array -----
+    # The priming prompt rides in via asr_options at LOAD time. load_model
+    # merges it into the TranscriptionOptions it builds; transcribe() has no
+    # initial_prompt parameter, so passing it there is a TypeError.
+    # condition_on_previous_text=False breaks Whisper's repetition loop, the
+    # lowered no_speech_threshold biases ambiguous audio toward silence, and
+    # the raised log_prob_threshold drops segments the decoder is unsure of.
     whisperx.load_model.assert_called_once_with(
-        "base", device="cpu", compute_type="int8"
+        "base",
+        device="cpu",
+        compute_type="int8",
+        asr_options={
+            "initial_prompt": INITIAL_PROMPT,
+            "condition_on_previous_text": False,
+            "no_speech_threshold": 0.5,
+            "log_prob_threshold": -0.8,
+        },
+        vad_options={"vad_onset": 0.8, "vad_offset": 0.6},
     )
     transcribe_call = whisperx.load_model.return_value.transcribe.call_args
     assert transcribe_call.args[0] == whisperx.load_audio.return_value
-    assert transcribe_call.kwargs["language"] == "en"
-    assert "Swahili" in transcribe_call.kwargs["initial_prompt"]  # priming intact
+    # Regression guard: the prompt must NOT be passed to transcribe() again.
+    assert "initial_prompt" not in transcribe_call.kwargs
+    # Regression guard: no language pin, so WhisperX auto-detects instead of
+    # translating Swahili into English. See the pinning note in transcribe_audio.
+    assert "language" not in transcribe_call.kwargs
 
     # -- Stage B: alignment keyed on the detected language ------------------
     whisperx.load_align_model.assert_called_once_with(language_code="en", device="cpu")
@@ -324,9 +351,18 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     assert align_call.args[3] == whisperx.load_audio.return_value  # audio fourth
 
     # -- Stage C: diarization then speaker assignment -----------------------
-    whisperx.DiarizationPipeline.assert_called_once()
-    diarize_call = whisperx.assign_word_speakers.call_args
-    assert diarize_call.args[1]["segments"] == segments  # transcript_result 2nd
+    # Both names are the directly-imported ones, patched on the transcriber
+    # module rather than reached through the whisperx namespace.
+    pipeline_cls.assert_called_once()
+    assert assign.call_args.args[1]["segments"] == segments  # transcript_result 2nd
+    assert assign.call_args.kwargs == {}  # the bounds do NOT belong here
+    # Clustering bounds belong to the pyannote invocation, whose __call__ is
+    # ``(audio, num_speakers, min_speakers, max_speakers, ...)``. min=1 allows
+    # a mono-speaker recording, max=10 stops a short noisy exchange from
+    # shattering into a dozen one-line speakers.
+    diarize_call = pipeline_cls.return_value.call_args
+    assert diarize_call.args[0] == whisperx.load_audio.return_value  # audio first
+    assert diarize_call.kwargs == {"min_speakers": 1, "max_speakers": 10}
 
     # -- return contract + artifact ----------------------------------------
     assert transcript_path == tmp_path / TRANSCRIPT_FILENAME
@@ -335,18 +371,240 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     )
 
 
+def test_transcribe_audio_injects_prompt_via_asr_options(mocker, tmp_path) -> None:
+    """The Swahili/English prompt reaches the model as an asr_option.
+
+    ``load_model`` builds ``TranscriptionOptions`` once and merges this dict
+    over its defaults (``initial_prompt`` defaults to ``None``). The
+    alternative — ``transcribe(initial_prompt=...)`` — is a TypeError against
+    a real ``FasterWhisperPipeline``, because that method has no such
+    parameter. This test pins the correct channel so the bug cannot return.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx = _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])[0]
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    load_kwargs = whisperx.load_model.call_args.kwargs
+    assert load_kwargs["asr_options"] == {
+        "initial_prompt": INITIAL_PROMPT,
+        "condition_on_previous_text": False,
+        "no_speech_threshold": 0.5,
+        "log_prob_threshold": -0.8,
+    }
+    # The Kenyan / code-switch context must survive the move.
+    assert "Kenya" in load_kwargs["asr_options"]["initial_prompt"]
+    assert "Swahili" in load_kwargs["asr_options"]["initial_prompt"]
+
+    # And transcribe() must receive only arguments it actually accepts.
+    transcribe_kwargs = whisperx.load_model.return_value.transcribe.call_args.kwargs
+    assert set(transcribe_kwargs) <= {
+        "batch_size",
+        "num_workers",
+        "language",
+        "task",
+        "chunk_size",
+        "print_progress",
+        "combined_progress",
+        "verbose",
+        "progress_callback",
+    }, f"unsupported kwargs for FasterWhisperPipeline.transcribe: {transcribe_kwargs}"
+
+
+def test_language_is_not_pinned_so_whisper_transcribes_rather_than_translates(
+    mocker, tmp_path
+) -> None:
+    """Neither load_model nor transcribe may preset a language.
+
+    WhisperX decides between *transcribing* and *translating* purely from the
+    language it is handed. With ``language="en"`` on a Swahili lecture, Whisper
+    does not fail — it dutifully produces fluent English, so the bug is silent:
+    the transcript looks plausible and every word timestamp is anchored to the
+    wrong language. Leaving both call sites unset is what lets the pipeline's
+    ``detect_language()`` run.
+
+    Asserted on both channels because either one alone is enough to pin it: a
+    preset at load time builds the tokenizer eagerly, and a per-call value
+    overrides it.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx, _pipeline, _assign = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "habari"}]
+    )
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    assert "language" not in whisperx.load_model.call_args.kwargs
+    assert "language" not in whisperx.load_model.return_value.transcribe.call_args.kwargs
+
+
+def test_asr_and_vad_options_use_the_field_names_whisperx_actually_has(
+    mocker, tmp_path
+) -> None:
+    """The tuning keys must be real fields, or load_model raises TypeError.
+
+    ``load_model`` merges this dict into its defaults and then splats the
+    result into ``TranscriptionOptions(**...)``. Any key that is not a field
+    name on that dataclass is a hard TypeError at load, not a silently ignored
+    option. The one that bites is the log-probability gate: the field is
+    ``log_prob_threshold`` (underscored), so the intuitive
+    ``logprob_threshold`` looks right and silently crashes the pipeline. This
+    test pins the exact key set so the spellings cannot drift.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx = _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])[0]
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    load_kwargs = whisperx.load_model.call_args.kwargs
+
+    asr_options = load_kwargs["asr_options"]
+    assert "log_prob_threshold" in asr_options
+    assert "logprob_threshold" not in asr_options  # not a TranscriptionOptions field
+    assert asr_options["log_prob_threshold"] == -0.8
+
+    vad_options = load_kwargs["vad_options"]
+    assert vad_options == {"vad_onset": 0.8, "vad_offset": 0.6}
+    # Both are genuine default_vad_options keys in whisperx.asr.load_model.
+    assert set(vad_options) <= {"chunk_size", "vad_onset", "vad_offset"}
+
+
 def test_transcribe_audio_uses_injected_token(mocker, tmp_path) -> None:
     """An explicit hf_token overrides the environment for the diarizer."""
     wav_path = _write_wav(tmp_path)
-    whisperx = _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])
+    _whisperx, pipeline_cls, _assign = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    )
 
     LocalTranscriber(hf_token="hf_injected").transcribe_audio(wav_path)
 
-    kwargs = whisperx.DiarizationPipeline.call_args.kwargs
+    kwargs = pipeline_cls.call_args.kwargs
     assert kwargs["device"] == "cpu"
     assert "hf_injected" in kwargs.values()
+
+
+def test_diarization_kwargs_fall_back_from_legacy_to_current(mocker, tmp_path) -> None:
+    """The legacy ``use_auth_token`` is tried first, then ``token``.
+
+    WhisperX renamed the constructor argument in 3.2, so a current install
+    must reject the legacy name from the signature and fall through to
+    ``token=``. The stand-in below is deliberately strict (no ``**kwargs``)
+    so it reproduces that TypeError exactly as the real class does.
+    """
+    wav_path = _write_wav(tmp_path)
+    _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])
+
+    calls = []
+
+    class ModernPipeline:
+        """Signature-faithful stand-in for DiarizationPipeline(token=...)."""
+
+        def __init__(self, token=None, device="cpu"):
+            calls.append({"token": token, "device": device})
+            if token == "bad_token":
+                # A real auth failure surfaces as ValueError, NOT TypeError.
+                raise ValueError("401 Unauthorized from pyannote")
+
+        def __call__(self, audio, num_speakers=None, min_speakers=None,
+                     max_speakers=None):
+            return ["diarize_df_placeholder"]
+
+    mocker.patch("transcriber.DiarizationPipeline", ModernPipeline)
+
+    LocalTranscriber(hf_token="hf_good").transcribe_audio(wav_path)
+
+    # Exactly one surviving call: the legacy attempt raised TypeError, so only
+    # the modern token= form was constructed.
+    assert calls == [{"token": "hf_good", "device": "cpu"}]
+
+
+def test_diarization_auth_error_is_not_masked_by_the_fallback(mocker, tmp_path) -> None:
+    """A non-signature failure must propagate, not be retried as a TypeError.
+
+    The fallback catches ``TypeError`` only. If a bad token or an unreachable
+    model raised something else it must reach the user verbatim, otherwise the
+    retry would silently hide the real cause behind a second, equally opaque
+    error.
+    """
+    wav_path = _write_wav(tmp_path)
+    _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])
+
+    class StrictPipeline:
+        def __init__(self, token=None, device="cpu"):
+            raise ValueError("401 Unauthorized from pyannote")
+
+        def __call__(self, audio, **kwargs):
+            return []
+
+    mocker.patch("transcriber.DiarizationPipeline", StrictPipeline)
+
+    with pytest.raises(ValueError, match="401 Unauthorized"):
+        LocalTranscriber(hf_token="bad_token").transcribe_audio(wav_path)
 
 
 def test_transcribe_audio_rejects_missing_wav(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         LocalTranscriber().transcribe_audio(tmp_path / "nope.wav")
+
+
+def test_speaker_bounds_go_to_the_pipeline_not_the_assigner(mocker, tmp_path) -> None:
+    """Regression guard: min/max_speakers are ``__call__`` args, not assign args.
+
+    ``assign_word_speakers`` has the signature
+    ``(diarize_df, transcript_result, speaker_embeddings, fill_nearest)`` and
+    rejects ``min_speakers``/``max_speakers`` outright; those belong to
+    ``DiarizationPipeline.__call__``. Both stand-ins below reproduce the real
+    signatures *exactly* — no ``**kwargs`` — so putting the bounds on the wrong
+    function raises TypeError here instead of surviving to a live run where the
+    user meets it mid-lecture.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx = _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])[0]
+    seen: dict[str, object] = {}
+
+    class RealPipeline:
+        """Mirrors ``DiarizationPipeline.__call__``'s real parameter list."""
+
+        def __init__(self, model_name=None, token=None, device="cpu", cache_dir=None):
+            seen["constructed_with"] = {"token": token, "device": device}
+
+        def __call__(
+            self,
+            audio,
+            num_speakers=None,
+            min_speakers=None,
+            max_speakers=None,
+            return_embeddings=False,
+            progress_callback=None,
+        ):
+            seen["call_kwargs"] = {
+                "min_speakers": min_speakers,
+                "max_speakers": max_speakers,
+            }
+            seen["audio"] = audio
+            return "diarize_df"
+
+    def real_assign_word_speakers(
+        diarize_df, transcript_result, speaker_embeddings=None, fill_nearest=False
+    ):
+        seen["assign_kwargs"] = {
+            "speaker_embeddings": speaker_embeddings,
+            "fill_nearest": fill_nearest,
+        }
+        return transcript_result
+
+    mocker.patch("transcriber.DiarizationPipeline", RealPipeline)
+    mocker.patch("transcriber.assign_word_speakers", real_assign_word_speakers)
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    # The bounds reached the pipeline invocation...
+    assert seen["call_kwargs"] == {"min_speakers": 1, "max_speakers": 10}
+    assert seen["audio"] == whisperx.load_audio.return_value
+    # ...and the assigner got only its own four parameters.
+    assert seen["assign_kwargs"] == {
+        "speaker_embeddings": None,
+        "fill_nearest": False,
+    }
+    # The audio is decoded once and shared across all three stages.
+    assert whisperx.load_audio.call_count == 1

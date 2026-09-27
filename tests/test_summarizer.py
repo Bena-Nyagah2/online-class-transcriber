@@ -8,17 +8,27 @@ The whole suite runs **offline** — no NVIDIA API calls, no network I/O:
 
 from __future__ import annotations
 
+import importlib
+import json
+import os
+from unittest import mock
+
 import pytest
 from PIL import Image
 
+import summarizer
 from summarizer import (
     LectureSynthesizer,
     MANIFEST_FILENAME,
+    MAP_MODEL,
     MODEL_NAME,
+    REDUCE_MODEL,
     SLIDE_EXTRACT_PROMPT,
     SYNTHESIS_INSTRUCTION,
     SYSTEM_PROMPT,
 )
+from transcriber import format_timestamp
+from vision import SLIDE_TIMES_FILENAME
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -60,6 +70,57 @@ def _neutralise_backoff(mocker) -> None:
     mocker.patch.object(
         LectureSynthesizer._call_synthesis.retry, "sleep", lambda seconds: None
     )
+
+
+@pytest.fixture
+def fresh_summarizer():
+    """Yield a reloader that re-imports ``summarizer`` under a chosen environment.
+
+    ``MAP_MODEL``/``REDUCE_MODEL`` are read from ``os.environ`` at *import*
+    time, so their fallback behaviour cannot be tested by patching the
+    already-imported module — only by importing it again. Two hazards have to
+    be handled for that to be meaningful:
+
+    * ``load_dotenv()`` runs on import and would re-inject this project's real
+      ``.env`` (which sets ``MAP_MODEL``/``REDUCE_MODEL`` for live runs), so it
+      is neutralised and the environment is fully caller-controlled. The patch
+      is applied to ``dotenv.load_dotenv`` rather than to the attribute on
+      ``summarizer`` because reloading re-executes ``from dotenv import
+      load_dotenv``, which would rebind over a module-level patch;
+    * reloading mutates the shared ``summarizer`` module object in place, so the
+      module is reloaded once more during teardown to leave it as the rest of
+      the suite expects to find it.
+
+    Args:
+        **env: Environment overrides. A value of ``None`` means *unset this
+            variable*; any other value is set.
+
+    Returns:
+        The reloaded module.
+    """
+    missing = object()
+
+    def _load(**env):
+        saved = {key: os.environ.get(key, missing) for key in env}
+        for key, value in env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        try:
+            with mock.patch("dotenv.load_dotenv"):
+                return importlib.reload(summarizer)
+        finally:
+            for key, value in saved.items():
+                if value is missing:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    yield _load
+
+    with mock.patch("dotenv.load_dotenv"):
+        importlib.reload(summarizer)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +188,7 @@ def test_extract_slide_data_sends_single_image(mocker, tmp_path) -> None:
     result = synthesizer._extract_slide_data(slide_path)
 
     call = synthesizer.client.chat.completions.create.call_args
-    assert call.kwargs["model"] == MODEL_NAME
+    assert call.kwargs["model"] == MAP_MODEL
     assert call.kwargs["max_tokens"] == 800
 
     messages = call.kwargs["messages"]
@@ -192,6 +253,236 @@ def test_build_slide_manifest_extracts_new_and_resumes(mocker, tmp_path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Stage 2 — time-domain injection into the manifest
+# ---------------------------------------------------------------------------
+
+
+def _write_slide_times(slides_dir, mapping) -> None:
+    """Write the ``slide_times.json`` sidecar the vision catcher produces."""
+    (slides_dir / SLIDE_TIMES_FILENAME).write_text(
+        json.dumps(mapping), encoding="utf-8"
+    )
+
+
+def test_manifest_headers_carry_capture_timestamps(mocker, tmp_path) -> None:
+    """Each slide header is prefixed with the MM:SS offset it was captured at.
+
+    Stage 3's speaker-identification directive can only cross-reference a slide
+    against a transcript turn if both carry comparable clocks, so the elapsed
+    offset is written into the header rather than left implicit in the filename.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 2)
+    _write_slide_times(slides_dir, {"slide_001.jpg": 12.0, "slide_002.jpg": 104.0})
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Content of slide one"),
+        _make_response(mocker, "Content of slide two"),
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert manifest == (
+        "### Slide: [00:12] slide_001.jpg\nContent of slide one\n\n"
+        "### Slide: [01:44] slide_002.jpg\nContent of slide two"
+    )
+
+
+def test_manifest_timestamps_roll_over_into_hours(mocker, tmp_path) -> None:
+    """Past the hour the header uses H:MM:SS, matching the transcript format.
+
+    A 90-minute lecture would otherwise render "90:00" in the manifest while
+    the transcript says "1:30:00" — two spellings of one instant, which the
+    model has to reconcile by arithmetic instead of reading.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 2)
+    _write_slide_times(slides_dir, {"slide_001.jpg": 5999.0, "slide_002.jpg": 5430.0})
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "one"),
+        _make_response(mocker, "two"),
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert "### Slide: [1:39:59] slide_001.jpg" in manifest
+    assert "### Slide: [1:30:30] slide_002.jpg" in manifest
+
+
+def test_manifest_resumes_across_timestamped_and_legacy_headers(mocker, tmp_path) -> None:
+    """Both header spellings resume without re-paying for the API.
+
+    Session directories captured before this feature have bare-filename
+    headers. If the resume matcher only understood the new spelling, every
+    existing session would re-run its whole deck on the next summarization.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 3)
+    # Written in the new spelling; the legacy spelling is covered separately
+    # by the untouched ``test_build_slide_manifest_extracts_new_and_resumes``.
+    (tmp_path / MANIFEST_FILENAME).write_text(
+        "### Slide: [00:10] slide_001.jpg\nnew one", encoding="utf-8"
+    )
+    _write_slide_times(
+        slides_dir,
+        {"slide_001.jpg": 10.0, "slide_002.jpg": 20.0, "slide_003.jpg": 30.0},
+    )
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "two"),
+        _make_response(mocker, "three"),
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    # slide_001 was recognised through its "[00:10] " prefix and skipped.
+    assert "new one" in manifest
+    assert synthesizer.client.chat.completions.create.call_count == 2
+    assert "### Slide: [00:20] slide_002.jpg\ntwo" in manifest
+    assert "### Slide: [00:30] slide_003.jpg\nthree" in manifest
+
+
+def test_legacy_untimestamped_manifest_still_resumes(mocker, tmp_path) -> None:
+    """A pre-feature manifest is recognised, not re-billed.
+
+    ``[MM:SS] `` is optional in the header matcher, so a session captured
+    before timestamps existed resumes on its bare filenames. Without the
+    optionality, every historical session would re-pay for its whole deck.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 3)
+    (tmp_path / MANIFEST_FILENAME).write_text(
+        "### Slide: slide_001.jpg\nlegacy one\n\n"
+        "### Slide: slide_002.jpg\nlegacy two",
+        encoding="utf-8",
+    )
+    _write_slide_times(slides_dir, {"slide_003.jpg": 30.0})
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "three")
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert synthesizer.client.chat.completions.create.call_count == 1
+    assert "legacy one" in manifest and "legacy two" in manifest
+    # The new slide still gets stamped, even beside legacy neighbours.
+    assert "### Slide: [00:30] slide_003.jpg\nthree" in manifest
+
+
+@pytest.mark.parametrize(
+    "sidecar_contents",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("{not json", id="malformed"),
+        pytest.param('["a", "b"]', id="wrong-shape"),
+        pytest.param('{"slide_001.jpg": "soon"}', id="non-numeric"),
+    ],
+)
+def test_unusable_sidecar_degrades_to_bare_headers(
+    mocker, tmp_path, sidecar_contents
+) -> None:
+    """A missing or corrupt sidecar never fabricates a timestamp.
+
+    The module advertises an offline re-run over an existing session
+    directory, and those sessions predate the sidecar. Emitting "[00:00]" for
+    an unknown capture time would be worse than omitting it: the model would
+    read a confident, wrong instant and could anchor a speaker's name to the
+    wrong part of the lecture.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 1)
+    if sidecar_contents is not None:
+        (slides_dir / SLIDE_TIMES_FILENAME).write_text(sidecar_contents, encoding="utf-8")
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "content")
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert manifest == "### Slide: slide_001.jpg\ncontent"
+    assert "[00:00]" not in manifest
+
+
+def test_partial_sidecar_timestamps_only_the_slides_it_covers(
+    mocker, tmp_path
+) -> None:
+    """A slide absent from the sidecar keeps a bare header; others are stamped."""
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 2)
+    _write_slide_times(slides_dir, {"slide_002.jpg": 65.0})  # slide_001 missing
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "one"),
+        _make_response(mocker, "two"),
+    ]
+
+    manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert "### Slide: slide_001.jpg\none" in manifest
+    assert "### Slide: [01:05] slide_002.jpg\ntwo" in manifest
+
+
+def test_timestamps_reach_the_stage_three_prompt_on_the_transcript_clock(
+    mocker, tmp_path
+) -> None:
+    """End-to-end: a slide offset arrives in the reduce prompt, matching the
+    transcript's own clock for the same instant.
+
+    This is the entire point of the feature. The Stage 3 speaker-identification
+    directive instructs the model to cross-reference slide timestamps against
+    transcript timestamps, which is only actionable if both are present *and*
+    spelled the same way. The assertion pairs slide ``[01:44]`` with a
+    transcript turn at 104.0s — the same moment — so a future change to either
+    clock renderer that desynchronised the two would fail here.
+    """
+    # A turn header rendered by the transcriber at exactly 104.0 seconds.
+    transcript_text = (
+        f"[SPEAKER_01] ({format_timestamp(104.0)} - {format_timestamp(120.0)}): "
+        "My name is Dr Amara Ochieng and I lead the forensics unit. "
+    ) + " ".join(["filler"] * 60)
+
+    transcript_path = tmp_path / "raw_transcript.txt"
+    transcript_path.write_text(transcript_text, encoding="utf-8")
+
+    slides_dir = _write_slides(tmp_path, 2)
+    _write_slide_times(
+        slides_dir, {"slide_001.jpg": 20.0, "slide_002.jpg": 104.0}
+    )
+
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Intro title slide"),
+        _make_response(mocker, "Lower third: DR AMARA OCHIENG - FORENSICS"),
+        _make_response(mocker, "# Notes"),
+    ]
+
+    synthesizer.generate_notes(
+        transcript_path, tmp_path / "notes.md", slides_dir
+    )
+
+    reduce_call = synthesizer.client.chat.completions.create.call_args_list[2]
+    user_content = reduce_call.kwargs["messages"][1]["content"]
+
+    # The lower-third slide is stamped at the same instant the speaker is
+    # talking, so the model has everything the directive asks for.
+    assert "### Slide: [01:44] slide_002.jpg" in user_content
+    assert "DR AMARA OCHIENG" in user_content
+    assert f"[SPEAKER_01] ({format_timestamp(104.0)} -" in user_content
+    # Same spelling on both sides of the cross-reference.
+    assert format_timestamp(104.0) in user_content
+
+
+# ---------------------------------------------------------------------------
 # Stage 3 — text-only final synthesis across the whole session
 # ---------------------------------------------------------------------------
 
@@ -248,13 +539,24 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     # Stage 3 call: TEXT ONLY — a plain str, no image elements.
     reduce_call = calls[2]
     assert reduce_call.kwargs["max_tokens"] == 4000
-    assert reduce_call.kwargs["model"] == MODEL_NAME
+    assert reduce_call.kwargs["model"] == REDUCE_MODEL
     assert reduce_call.kwargs["messages"][0]["role"] == "system"
     system_content = reduce_call.kwargs["messages"][0]["content"]
     assert system_content == SYSTEM_PROMPT
     # The reduce stage must demand rich formatting and a references appendix.
     assert "Markdown Tables" in system_content
     assert "References, Statutes & Citations" in system_content
+    # Anti-hallucination guard for broadcast/weather edge cases: no invented
+    # URLs, code, or narrative filler; mismatched audio/slide pairs get
+    # reported as two separate facts rather than reconciled into fiction.
+    assert "STRICT GROUNDING DIRECTIVE" in system_content
+    assert "NEVER invent, infer, or hallucinate" in system_content
+    assert "report both facts neutrally" in system_content
+    # Vision-audio fusion: slide OCR crossed with transcript timestamps so a
+    # lower-third name replaces the raw [SPEAKER_XX] label in the notes.
+    assert "SPEAKER IDENTIFICATION" in system_content
+    assert "[SPEAKER_XX]" in system_content
+    assert "lower-third graphic" in system_content
 
     user_content = reduce_call.kwargs["messages"][1]["content"]
     assert isinstance(user_content, str)
@@ -262,3 +564,101 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     assert transcript_text in user_content
     assert "### Slide: slide_001.jpg" in user_content
     assert "Content of slide two" in user_content
+
+
+# ---------------------------------------------------------------------------
+# per-stage model selection
+# ---------------------------------------------------------------------------
+
+
+def test_map_and_reduce_route_to_their_own_model_variables(
+    mocker, tmp_path, monkeypatch
+) -> None:
+    """Each stage reads its own module-level model, not a shared constant.
+
+    The point of splitting ``MAP_MODEL``/``REDUCE_MODEL`` is that either stage
+    can be retuned in isolation — e.g. a vision-tuned 70B for slide OCR and a
+    cheaper 8B for the long-context merge. If either stage silently reverted to
+    ``MODEL_NAME`` the split would be cosmetic.
+    """
+    monkeypatch.setattr(summarizer, "MAP_MODEL", "meta/map-specialised")
+    monkeypatch.setattr(summarizer, "REDUCE_MODEL", "meta/reduce-specialised")
+
+    transcript_path = tmp_path / "transcript.txt"
+    transcript_path.write_text(
+        "[SPEAKER_00] (00:00 - 00:31): " + " ".join(["word"] * 80)
+    )
+    slides_dir = _write_slides(tmp_path, 1)
+
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Content of slide one"),
+        _make_response(mocker, "# Notes"),
+    ]
+
+    synthesizer.generate_notes(
+        transcript_path, tmp_path / "notes.md", slides_dir
+    )
+
+    calls = synthesizer.client.chat.completions.create.call_args_list
+    assert len(calls) == 2  # 1 map + 1 reduce
+    assert calls[0].kwargs["model"] == "meta/map-specialised"
+    assert calls[1].kwargs["model"] == "meta/reduce-specialised"
+    # The shared constant must not leak into either call.
+    assert MODEL_NAME not in {"meta/map-specialised", "meta/reduce-specialised"}
+
+
+def test_stage_models_default_to_the_shared_model_name(fresh_summarizer) -> None:
+    """With no per-stage override, both stages inherit ``MODEL_NAME``.
+
+    ``MAP_MODEL``/``REDUCE_MODEL`` fall back to ``MODEL_NAME`` rather than
+    hardcoding a model id, so a single ``LLM_MODEL_NAME`` export still moves
+    the whole pipeline.
+
+    Asserted against a freshly reloaded module under a controlled environment.
+    This project's ``.env`` genuinely sets ``MAP_MODEL``/``REDUCE_MODEL`` for
+    real runs, so asserting the already-imported values would only be testing
+    the developer's machine — and did pass or fail depending on their config.
+    """
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/known-model",
+        MAP_MODEL=None,  # absent -> exercise the fallback
+        REDUCE_MODEL=None,
+    )
+
+    assert module.MODEL_NAME == "meta/known-model"
+    assert module.MAP_MODEL == "meta/known-model"
+    assert module.REDUCE_MODEL == "meta/known-model"
+
+
+def test_per_stage_env_overrides_beat_the_shared_model(fresh_summarizer) -> None:
+    """A per-stage export wins over ``LLM_MODEL_NAME`` independently per stage.
+
+    This is the case that actually bit us: a developer who pins only
+    ``REDUCE_MODEL`` to a bigger model for the reasoning-heavy merge while
+    leaving the cheap vision model on the map stage.
+    """
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/shared",
+        MAP_MODEL="meta/map-only",
+        REDUCE_MODEL="meta/reduce-only",
+    )
+
+    assert module.MAP_MODEL == "meta/map-only"
+    assert module.REDUCE_MODEL == "meta/reduce-only"
+    assert module.MODEL_NAME == "meta/shared"  # untouched
+
+
+def test_only_one_stage_pinned_leaves_the_other_on_the_fallback(
+    fresh_summarizer,
+) -> None:
+    """Pinning REDUCE_MODEL alone must not drag MAP_MODEL along with it."""
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/shared",
+        MAP_MODEL=None,
+        REDUCE_MODEL="meta/reduce-only",
+    )
+
+    assert module.REDUCE_MODEL == "meta/reduce-only"
+    assert module.MAP_MODEL == "meta/shared"  # inherited, not dragged along

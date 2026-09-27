@@ -9,9 +9,9 @@ on-device, in three stages:
 2.  **Align** — ``whisperx.load_align_model`` + ``whisperx.align`` attach
     word-level timestamps using a wav2vec2 phoneme model. The output is
     segmented per sentence, which is what makes speaker turns crisp.
-3.  **Diarize** — ``whisperx.DiarizationPipeline`` runs pyannote to work out
-    *who* spoke when, then ``whisperx.assign_word_speakers`` labels every
-    segment and word with a speaker ID.
+3.  **Diarize** — ``DiarizationPipeline`` (from ``whisperx.diarize``) runs
+    pyannote to work out *who* spoke when, then ``assign_word_speakers``
+    labels every segment and word with a speaker ID.
 
 The final ``raw_transcript.txt`` groups contiguous turns from the same
 speaker::
@@ -37,6 +37,15 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 import whisperx
+# The diarization classes are imported from their defining module rather than
+# reached through the root ``whisperx`` namespace. That namespace is not
+# stable across releases: v3.2.0 re-exports both names, while current main
+# exports only ``assign_word_speakers``. Worse, if ``whisperx.diarize`` fails
+# to import partway, Python leaves a partially initialised ``whisperx`` whose
+# attributes were never bound, and the resulting AttributeError on the root
+# namespace masks the real cause. Importing directly works on every version
+# and surfaces the genuine error if the submodule itself is broken.
+from whisperx.diarize import DiarizationPipeline, assign_word_speakers
 
 from recorder import SAMPLE_RATE
 
@@ -107,11 +116,16 @@ def resolve_hf_token() -> str:
     return token
 
 
-def _format_timestamp(seconds: float) -> str:
-    """Render a segment boundary as ``MM:SS``, or ``H:MM:SS`` past an hour.
+def format_timestamp(seconds: float) -> str:
+    """Render an offset as ``MM:SS``, or ``H:MM:SS`` past an hour.
 
     Lectures routinely run past 60 minutes, so the hour component is only
     added when it is actually needed to keep the field width stable.
+
+    This is the single canonical clock renderer for the project: the transcript
+    turn headers and the slide manifest both go through it, which is what
+    makes a manifest timestamp directly comparable to a transcript timestamp
+    in the Stage 3 prompt.
 
     Args:
         seconds: Offset from the start of the recording.
@@ -145,9 +159,9 @@ def _build_diarization_pipeline(token: str) -> Any:
             installed WhisperX exposes an unrecognised constructor.
     """
     try:
-        return whisperx.DiarizationPipeline(use_auth_token=token, device=DEVICE)
+        return DiarizationPipeline(use_auth_token=token, device=DEVICE)
     except TypeError:
-        return whisperx.DiarizationPipeline(token=token, device=DEVICE)
+        return DiarizationPipeline(token=token, device=DEVICE)
 
 
 def _format_turns(segments: list[dict[str, Any]]) -> str:
@@ -221,8 +235,8 @@ def _format_turns(segments: list[dict[str, Any]]) -> str:
         text = " ".join(" ".join(turn["text"]).split())
         if not text:
             continue
-        start = _format_timestamp(turn["start"])
-        end = _format_timestamp(turn["end"])
+        start = format_timestamp(turn["start"])
+        end = format_timestamp(turn["end"])
         lines.append(f"[{turn['speaker']}] ({start} - {end}): {text}")
     return "\n".join(lines)
 
@@ -270,10 +284,59 @@ class LocalTranscriber:
         )
 
         # -- Stage A: transcribe ------------------------------------------
+        # The Swahili/English priming prompt must be injected through
+        # ``asr_options`` at load time. ``load_model`` builds the
+        # ``TranscriptionOptions`` once and merges this dict over its
+        # defaults, whereas ``FasterWhisperPipeline.transcribe()`` has no
+        # ``initial_prompt`` parameter of its own — passing it there raises
+        # TypeError against a real model.
+        #
+        # ``condition_on_previous_text=False`` is the single most effective
+        # guard against Whisper's degenerate repetition loop: the decoder is
+        # no longer primed with its own previous output, so a garbled or
+        # music-only window cannot snowball into "thank you. thank you.
+        # thank you." across the whole lecture. ``no_speech_threshold=0.5``
+        # (default 0.6) additionally biases the model toward calling
+        # ambiguous stretches silence rather than inventing speech, which is
+        # what broadcast/weather audio triggers most often.
+        #
+        # ``log_prob_threshold`` is raised from the -1.0 default. A segment the
+        # decoder is very unsure about is now dropped instead of being emitted
+        # as fluent, wrong text — which is what turns one bad 30 s window into
+        # a paragraph of confident nonsense. NOTE the underscore: this is the
+        # field name on faster_whisper's ``TranscriptionOptions``, which
+        # ``load_model`` splats this dict into. The un-underscored
+        # ``logprob_threshold`` is not a field and raises TypeError at load.
+        asr_options = {
+            "initial_prompt": INITIAL_PROMPT,
+            "condition_on_previous_text": False,
+            "no_speech_threshold": 0.5,
+            "log_prob_threshold": -0.8,
+        }
+
+        # Aggressive VAD. The defaults (onset 0.500 / offset 0.363) are tuned
+        # for clean dictation and keep low-energy speech that opens and closes
+        # softly. Room-mic plus laptop-loopback lecture audio has far more
+        # borderline energy, so the default windowing fragments words across
+        # chunk boundaries. Raising both values makes the detector commit to
+        # speech earlier and hold the tail longer, giving the decoder fewer,
+        # longer, more coherent chunks.
+        vad_options = {"vad_onset": 0.8, "vad_offset": 0.6}
+
         model = whisperx.load_model(
-            WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE
+            WHISPER_MODEL,
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE,
+            asr_options=asr_options,
+            vad_options=vad_options,
         )
-        result = model.transcribe(audio, language="en", initial_prompt=INITIAL_PROMPT)
+        # No ``language=`` here on purpose. WhisperX's transcribe() falls back
+        # to ``detect_language()`` when neither a preset nor a per-call language
+        # is supplied, and load_model() was likewise called without one, so the
+        # pipeline holds no tokenizer. Pinning "en" made Whisper *translate*
+        # rather than transcribe, so Swahili came out as English prose and every
+        # downstream word timestamp belonged to the wrong language.
+        result = model.transcribe(audio)
         segments: list[dict[str, Any]] = result["segments"]
         print(f"  -> transcribed {len(segments)} segments; aligning words...")
 
@@ -291,10 +354,18 @@ class LocalTranscriber:
         segments = result["segments"]
 
         # -- Stage C: speaker diarization ----------------------------------
+        # The speaker-count bounds are arguments to the pyannote *invocation*,
+        # not to assign_word_speakers (whose signature is
+        # ``(diarize_df, transcript_result, speaker_embeddings, fill_nearest)``).
+        # min_speakers=1 permits a mono-speaker recording, while max_speakers=10
+        # stops a noisy short interaction from shattering into a dozen
+        # one-line "speakers".
         print("  -> assigning speakers (this downloads pyannote on first run)...")
         diarize_pipeline = _build_diarization_pipeline(self.hf_token)
-        diarize_segments = diarize_pipeline(audio)
-        result = whisperx.assign_word_speakers(diarize_segments, result)
+        diarize_segments = diarize_pipeline(
+            audio, min_speakers=1, max_speakers=10
+        )
+        result = assign_word_speakers(diarize_segments, result)
         segments = result["segments"]
 
         transcript = _format_turns(segments)

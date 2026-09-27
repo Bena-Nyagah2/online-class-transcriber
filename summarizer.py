@@ -15,9 +15,12 @@ compact Markdown block. NVIDIA rate limits are absorbed by tenacity retries
 
 Stage 2 — *Accumulate*  ``_build_slide_manifest``: the per-slide extracts are
 combined chronologically into ``slides_manifest.txt`` next to the raw
-transcript. The manifest doubles as a **resume cache** — any slide filename
-already present is skipped on re-runs, so an interrupted extraction continues
-where it stopped and completed sessions never re-pay for API calls.
+transcript. Each slide header is prefixed with the offset at which that frame
+was captured (``### Slide: [01:44] slide_002.jpg``), read from the
+``slide_times.json`` sidecar that :mod:`vision` writes. The manifest doubles as
+a **resume cache** — any slide filename already present is skipped on re-runs,
+so an interrupted extraction continues where it stopped and completed sessions
+never re-pay for API calls.
 
 Stage 3 — *Reduce*  ``generate_notes``: a single **text-only** call merges the
 raw transcript with the accumulated slide text into one cohesive academic
@@ -27,6 +30,7 @@ study guide, written to the session's ``<session-name>.md`` file.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import sys
@@ -44,13 +48,27 @@ from tenacity import (
     wait_random,
 )
 
-from transcriber import TRANSCRIPT_FILENAME
+from transcriber import TRANSCRIPT_FILENAME, format_timestamp
+
+# Read the slide timing sidecar written by vision.py. Reusing the constant
+# keeps the two modules from drifting on the filename.
+from vision import SLIDE_TIMES_FILENAME
 
 # Load NVIDIA_API_KEY from a local .env (if present) before any client reads
 # the environment. Explicit shell exports still take precedence.
 load_dotenv()
 
 MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
+
+# Per-stage model overrides. Stage 1 (Map) reads one small image per call and
+# only needs OCR/description quality; Stage 3 (Reduce) is the reasoning-heavy
+# merge over the whole transcript plus deck and benefits from a larger model.
+# Keeping them separate lets either stage be retuned independently — e.g. a
+# vision-tuned 70B for the map, a cheap 8B for the reduce — without editing
+# call sites. ``MODEL_NAME`` remains the shared fallback for both.
+MAP_MODEL = os.environ.get("MAP_MODEL", MODEL_NAME)
+REDUCE_MODEL = os.environ.get("REDUCE_MODEL", MODEL_NAME)
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 
@@ -59,6 +77,10 @@ MAX_TOKENS = 4000  # Stage 3: final synthesis over the full transcript + deck
 TEMPERATURE = 0.2
 
 MANIFEST_FILENAME = "slides_manifest.txt"
+
+# Matches a manifest slide header, tolerating the optional ``[MM:SS] `` timing
+# prefix so manifests written before timestamps existed still resume correctly.
+_SLIDE_HEADER_RE = re.compile(r"^### Slide: (?:\[[^\]]*\]\s*)?(.+)$", re.MULTILINE)
 
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
 
@@ -76,6 +98,10 @@ SYSTEM_PROMPT = textwrap.dedent(
        - **Blockquotes (>)** for major definitions or lecturer quotes.
        - **Bold text** for key terminology.
     4. **References:** Create a dedicated "📚 References, Statutes & Citations" appendix at the bottom containing every case, law, book, or paper mentioned.
+
+    STRICT GROUNDING DIRECTIVE: NEVER invent, infer, or hallucinate URLs, code snippets, or fictional narratives. If a slide shows code, transcribe exactly what is visible. If the audio topic entirely mismatches the visual slide, report both facts neutrally.
+
+    SPEAKER IDENTIFICATION: Cross-reference the timestamps of the slides with the timestamps of the audio transcript. If a slide's OCR text reveals a person's name or title (e.g., a lower-third graphic) during the exact time a specific [SPEAKER_XX] is talking, deduce their identity and replace [SPEAKER_XX] with their real name in the final notes.
 
     Make the formatting highly scannable, intellectually stimulating, and academically rigorous.
     """
@@ -190,7 +216,7 @@ class LectureSynthesizer:
             },
         ]
         response = self.client.chat.completions.create(
-            model=MODEL_NAME,
+            model=MAP_MODEL,
             messages=[{"role": "user", "content": content}],
             temperature=TEMPERATURE,
             max_tokens=800,
@@ -199,6 +225,37 @@ class LectureSynthesizer:
 
     # -- Stage 2 (Accumulate): chronological manifest with resume -----------
 
+    @staticmethod
+    def _read_slide_times(slides_dir: Path) -> dict[str, float]:
+        """Load the ``slide_times.json`` sidecar written by the vision catcher.
+
+        Args:
+            slides_dir: Directory holding the captured slide JPEGs.
+
+        Returns:
+            A filename-to-elapsed-seconds mapping, or an empty mapping when the
+            sidecar is absent. The offline re-run path documented in the module
+            header feeds this method sessions captured before timestamps were
+            recorded, and a missing or unreadable sidecar must not fail the run —
+            the manifest simply falls back to untimestamped headers.
+        """
+        times_path = Path(slides_dir) / SLIDE_TIMES_FILENAME
+        if not times_path.is_file():
+            return {}
+        try:
+            raw = json.loads(times_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        # Keep only real numeric offsets; a corrupt entry must not become a
+        # bogus "[00:00]" that reads to the model as a confident claim.
+        return {
+            str(name): float(value)
+            for name, value in raw.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+
     def _build_slide_manifest(self, slides_dir: Path, session_dir: Path) -> str:
         """Combine per-slide extracts into a resumable ``slides_manifest.txt``.
 
@@ -206,6 +263,17 @@ class LectureSynthesizer:
         naming sorts lexicographically). Any slide whose ``### Slide:`` header
         already exists in the manifest is skipped — this is the resume
         checkpoint, so interrupted runs continue and re-runs are free.
+
+        Each header carries the slide's capture offset from
+        ``slide_times.json``::
+
+            ### Slide: [01:44] slide_002.jpg
+            <extracted content>
+
+        That ``[01:44]`` is rendered by the same :func:`format_timestamp` the
+        transcript's turn headers use, so Stage 3 receives both channels on one
+        clock and can align them. Slides with no recorded offset keep a bare
+        filename instead of a fabricated time.
 
         Args:
             slides_dir: Directory of deduplicated JPEG slides.
@@ -224,12 +292,13 @@ class LectureSynthesizer:
         if manifest_path.exists():
             existing = manifest_path.read_text(encoding="utf-8")
 
+        slide_times = self._read_slide_times(slides_dir)
+
         # Filenames already extracted — treat as processed even if a rerun.
+        # The regex swallows the optional ``[MM:SS] `` prefix, so a manifest
+        # from before this feature (and one from after) both resume correctly.
         already_have = {
-            match.group(1).strip()
-            for match in re.finditer(
-                r"^### Slide: (.+)$", existing, flags=re.MULTILINE
-            )
+            match.group(1).strip() for match in _SLIDE_HEADER_RE.finditer(existing)
         }
         pending = [slide for slide in slide_paths if slide.name not in already_have]
 
@@ -238,7 +307,19 @@ class LectureSynthesizer:
             position = slide_paths.index(slide) + 1
             print(f"Extracting slide {position}/{total} ({slide.name})...")
             entry = self._extract_slide_data(slide)
-            existing += f"### Slide: {slide.name}\n{entry}\n\n"
+            # Prefix the header with the capture offset so Stage 3 can line the
+            # slide up against the transcript's [SPEAKER_xx] (MM:SS) headers.
+            # format_timestamp is shared with the transcript, so both channels
+            # are guaranteed to be on the same clock. A slide with no recorded
+            # time (a hand-dropped image, or a pre-timestamp session) simply
+            # keeps the bare filename rather than inventing a time.
+            offset = slide_times.get(slide.name)
+            label = (
+                f"[{format_timestamp(offset)}] {slide.name}"
+                if offset is not None
+                else slide.name
+            )
+            existing += f"### Slide: {label}\n{entry}\n\n"
             # Persist after every slide so a crash mid-deck resumes cleanly.
             manifest_path.write_text(existing, encoding="utf-8")
 
@@ -262,7 +343,7 @@ class LectureSynthesizer:
             Raw markdown response from the model.
         """
         response = self.client.chat.completions.create(
-            model=MODEL_NAME,
+            model=REDUCE_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},

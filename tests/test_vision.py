@@ -15,18 +15,24 @@ with everything that touches physical hardware mocked away:
 * ``time.time`` is replayed frame-by-frame (fast-forwarded) to drive the
   ``settle_delay`` logic without sleeping.
 
-All three scenarios below correspond one-to-one to the documented behaviours:
+The elapsed-offset tests set ``catcher.start_time`` directly, which is exactly
+what ``start()`` does; ``test_start_stamps_the_elapsed_time_origin`` covers that
+stamping itself.
+
+All three original scenarios correspond one-to-one to the documented behaviours:
 scroll = motion storm (0 slides), hold = settle (exactly 1 slide), and a
 transition = a *second* slide once the new frame settles.
 """
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
+import pytest
 from imagehash import hex_to_hash
 
-from vision import SlideCatcher
+from vision import SLIDE_TIMES_FILENAME, SlideCatcher
 
 # Two hashes 64 bits apart: every motion (>2) and dedup (>5) check triggers.
 HASH_A = "0" * 16
@@ -183,3 +189,330 @@ def test_transition_captures_second_slide(mocker, tmp_path) -> None:
     assert catcher.slide_index == 2
     assert all(p.exists() for p in catcher.captured_slides)
     assert all(p.read_bytes()[:2] == b"\xff\xd8" for p in catcher.captured_slides)
+
+
+# ---------------------------------------------------------------------------
+# Test Case 4 — capture timestamps (the time-domain signal Stage 3 consumes)
+# ---------------------------------------------------------------------------
+
+
+def test_slide_times_are_recorded_as_elapsed_offsets(mocker, tmp_path) -> None:
+    """Each save records how long into the session the frame was captured.
+
+    The offset is measured from ``start_time`` — the value ``start()`` stamps —
+    so it lines up with the transcript's own elapsed timestamps. Here the
+    origin is 100.0, matching the harness clock, so slide_001 lands 3.1s in and
+    slide_002 6.6s in.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+    catcher.start_time = 100.0  # what start() would stamp
+
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (103.1, HASH_A),  # -> slide_001 at t=103.1
+            (103.5, HASH_B),
+            (106.6, HASH_B),  # -> slide_002 at t=106.6
+        ],
+    )
+
+    assert catcher.slide_times == pytest.approx(
+        {"slide_001.jpg": 3.1, "slide_002.jpg": 6.6}
+    )
+
+
+def test_slide_times_sidecar_is_persisted_for_the_summarizer(mocker, tmp_path) -> None:
+    """The sidecar lands on disk, keyed by filename, in the slides directory.
+
+    ``_build_slide_manifest`` only ever receives the slides directory, so the
+    timestamps have to survive as a file rather than live in memory.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+    catcher.start_time = 100.0
+
+    _run(
+        catcher,
+        mocker,
+        frames=[(100.0, HASH_A), (104.0, HASH_A)],
+    )
+
+    sidecar = catcher.slides_dir / SLIDE_TIMES_FILENAME
+    assert sidecar.is_file()
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == pytest.approx(
+        {"slide_001.jpg": 4.0}
+    )
+    # The .json sidecar must not be mistaken for a slide by any *.jpg glob.
+    assert [p.name for p in catcher.slides_dir.glob("*.jpg")] == ["slide_001.jpg"]
+
+
+def test_stop_flushes_the_sidecar_even_without_a_new_save(mocker, tmp_path) -> None:
+    """A session that captures nothing still leaves a valid (empty) sidecar.
+
+    Writing it unconditionally means a downstream reader never has to
+    distinguish "never captured" from "sidecar missing".
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+    sidecar = catcher.slides_dir / SLIDE_TIMES_FILENAME
+    assert not sidecar.exists()
+
+    catcher.stop()  # no start(), no _run() — must not raise
+
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {}
+
+
+def test_sidecar_write_failure_does_not_kill_the_capture(mocker, tmp_path) -> None:
+    """An unwritable sidecar degrades timing, never the slides themselves.
+
+    ``_persist_slide_times`` runs on the capture thread after every save. If it
+    raised, the thread would die and the rest of the lecture would go
+    unrecorded — a much worse outcome than losing the timing metadata.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+    catcher.start_time = 100.0
+    # Point the sidecar at a parent directory that does not exist, so
+    # write_text raises FileNotFoundError (an OSError) on every attempt.
+    catcher.times_path = tmp_path / "no_such_dir" / SLIDE_TIMES_FILENAME
+
+    _run(catcher, mocker, frames=[(100.0, HASH_A), (104.0, HASH_A)])
+
+    # The slide is still on disk and still tracked in memory.
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+    assert catcher.slide_times == pytest.approx({"slide_001.jpg": 4.0})
+    assert catcher.captured_slides[0].exists()
+
+
+def test_start_stamps_the_elapsed_time_origin(mocker, tmp_path) -> None:
+    """``start()`` sets the clock origin, not ``__init__``.
+
+    main.py constructs the catcher and starts it back-to-back, but a caller
+    that builds a catcher early (or restarts one) must not accumulate dead
+    time into every offset.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+    assert catcher.start_time == 0.0  # unset until capture begins
+
+    stamped = {"now": 500.0}
+    mocker.patch("vision.time.time", side_effect=lambda: stamped["now"])
+    mocker.patch("vision.mss.mss", return_value=_FakeSCT())
+    # Replace the thread body so start() never touches a capture device.
+    mocker.patch.object(catcher, "_run", lambda: stamped.setdefault("ran", True))
+
+    catcher.start()
+    catcher._thread.join(timeout=5.0)
+
+    assert catcher.start_time == 500.0
+    assert stamped.get("ran") is True
+
+
+# ---------------------------------------------------------------------------
+# Test Case 5 — continuous-motion safety valve
+# ---------------------------------------------------------------------------
+
+
+def test_continuous_motion_force_captures_after_the_timeout(mocker, tmp_path) -> None:
+    """A screen that never settles still yields slides.
+
+    Every poll here is a motion spike, so the settle branch never runs. Without
+    the safety valve the whole session would produce zero slides and the
+    summarizer would have nothing visual to work with — the exact failure that
+    appears when the lecturer shares a playing video or a live demo.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    # Alternating A/B is a delta of 64 every poll, so every poll is motion.
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (105.0, HASH_B),
+            (110.0, HASH_A),
+            (115.0, HASH_B),  # 15.0s of unbroken motion -> forced capture
+            (120.0, HASH_A),
+        ],
+    )
+
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+    # Stamped at the moment of the forced grab, not at session start.
+    assert catcher.slide_times["slide_001.jpg"] == pytest.approx(15.0)
+    assert catcher.captured_slides[0].exists()
+
+
+def test_forced_capture_logs_the_continuously_moving_reason(
+    mocker, tmp_path, capsys
+) -> None:
+    """The log distinguishes a forced grab from a genuine settle.
+
+    A forced frame is a mid-motion blur, not a slide the lecturer chose to
+    show, and the operator reading the console needs to be able to tell which
+    is which when they review the deck.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    _run(
+        catcher,
+        mocker,
+        frames=[(100.0, HASH_A), (105.0, HASH_B), (110.0, HASH_A), (115.0, HASH_B)],
+    )
+
+    output = capsys.readouterr().out
+    assert "Forced capture due to continuous motion (slide_001.jpg)" in output
+    assert "Settled frame captured" not in output
+
+
+def test_settled_capture_does_not_claim_continuous_motion(
+    mocker, tmp_path, capsys
+) -> None:
+    """The ordinary settle path must not emit the forced-capture wording."""
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    _run(catcher, mocker, frames=[(100.0, HASH_A), (103.1, HASH_A)])
+
+    output = capsys.readouterr().out
+    assert "Settled frame captured (slide_001.jpg)" in output
+    assert "continuous motion" not in output
+
+
+def test_motion_timer_resets_when_the_screen_settles(mocker, tmp_path) -> None:
+    """Settling clears the motion run, so the timeout cannot leak across it.
+
+    Without the reset, a burst of motion early in the lecture would leave the
+    timer primed and force a spurious capture on the very next still frame.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),  # motion onset -> motion_since = 100
+            (104.0, HASH_B),  # motion, 4.0s in
+            (108.0, HASH_B),  # still -> settled capture, motion run cleared
+            (130.0, HASH_B),  # long gap; must NOT force-capture
+        ],
+    )
+
+    assert catcher.motion_since == 0.0
+    # Exactly the one settled slide; no forced capture after the 22s gap.
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+
+
+def test_timeout_does_not_re_fire_every_poll_after_a_forced_capture(
+    mocker, tmp_path, capsys
+) -> None:
+    """One forced capture per timeout window, not one per poll.
+
+    The dedup check would absorb most repeats, but the timer must still be
+    rearmed unconditionally: otherwise a busy screen either floods the
+    summarizer with near-duplicate slides or busy-loops the log.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    # Four polls inside one 15s window, all motion: 100, 105, 110, 115 forces
+    # at 115, then 116..120 stay inside the rearmed window.
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (105.0, HASH_B),
+            (110.0, HASH_A),
+            (115.0, HASH_B),  # forced capture here
+            (116.0, HASH_A),
+            (117.0, HASH_B),
+            (118.0, HASH_A),
+        ],
+    )
+
+    forced_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "Forced capture" in line
+    ]
+    assert len(forced_lines) == 1
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+
+
+def test_forced_capture_still_honours_deduplication(mocker, tmp_path) -> None:
+    """A near-static but jittering screen does not flood the deck.
+
+    Frames drifting by 4 pHash units read as motion (threshold 2) but fall
+    under the dedup threshold of 5. Saving them unconditionally would emit a
+    slide every 15s for a screen that has not really changed — each one costing
+    a vision API call in Stage 1.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, settle_delay=3.0)
+    catcher.start_time = 100.0
+
+    near = "000000000000000f"  # 4 bits from HASH_A: motion, but dedup-blocked
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (103.1, HASH_A),  # settles -> slide_001, dedup reference is HASH_A
+            (108.1, near),  # delta 4 -> motion, motion_since = 108.1
+            (113.1, HASH_A),  # delta 4 -> motion
+            (118.1, near),  # delta 4 -> motion
+            (123.1, HASH_A),  # 15.0s of motion -> forced, but dedup blocks
+            (128.1, near),
+            (133.1, HASH_A),
+            (138.1, near),  # forced again, dedup blocks again
+        ],
+    )
+
+    # Only the genuine settled slide was written.
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+
+
+def test_forced_capture_timeout_of_zero_disables_the_safety_valve(
+    mocker, tmp_path
+) -> None:
+    """``0`` turns the valve off, restoring strict settle-only behaviour."""
+    catcher = SlideCatcher(
+        output_dir=tmp_path, settle_delay=3.0, forced_capture_timeout=0
+    )
+    catcher.start_time = 100.0
+
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (115.0, HASH_B),
+            (130.0, HASH_A),
+            (145.0, HASH_B),
+        ],
+    )
+
+    assert catcher.captured_slides == []
+    # The motion run is still tracked; only the forced capture is suppressed.
+    assert catcher.motion_since == 100.0
+
+
+def test_forced_capture_timeout_is_configurable(mocker, tmp_path) -> None:
+    """A shorter timeout fires sooner, so the knob actually does something."""
+    catcher = SlideCatcher(
+        output_dir=tmp_path, settle_delay=3.0, forced_capture_timeout=4.0
+    )
+    catcher.start_time = 100.0
+
+    _run(
+        catcher,
+        mocker,
+        frames=[
+            (100.0, HASH_A),
+            (102.0, HASH_B),
+            (104.0, HASH_A),  # 4.0s of motion -> forced under this timeout
+        ],
+    )
+
+    assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
+    assert catcher.slide_times["slide_001.jpg"] == pytest.approx(4.0)
