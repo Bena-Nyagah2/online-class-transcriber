@@ -321,8 +321,9 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     # The priming prompt rides in via asr_options at LOAD time. load_model
     # merges it into the TranscriptionOptions it builds; transcribe() has no
     # initial_prompt parameter, so passing it there is a TypeError.
-    # condition_on_previous_text=False breaks Whisper's repetition loop, and
-    # the lowered no_speech_threshold biases ambiguous audio toward silence.
+    # condition_on_previous_text=False breaks Whisper's repetition loop, the
+    # lowered no_speech_threshold biases ambiguous audio toward silence, and
+    # the raised log_prob_threshold drops segments the decoder is unsure of.
     whisperx.load_model.assert_called_once_with(
         "base",
         device="cpu",
@@ -331,13 +332,17 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
             "initial_prompt": INITIAL_PROMPT,
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.5,
+            "log_prob_threshold": -0.8,
         },
+        vad_options={"vad_onset": 0.8, "vad_offset": 0.6},
     )
     transcribe_call = whisperx.load_model.return_value.transcribe.call_args
     assert transcribe_call.args[0] == whisperx.load_audio.return_value
-    assert transcribe_call.kwargs["language"] == "en"
     # Regression guard: the prompt must NOT be passed to transcribe() again.
     assert "initial_prompt" not in transcribe_call.kwargs
+    # Regression guard: no language pin, so WhisperX auto-detects instead of
+    # translating Swahili into English. See the pinning note in transcribe_audio.
+    assert "language" not in transcribe_call.kwargs
 
     # -- Stage B: alignment keyed on the detected language ------------------
     whisperx.load_align_model.assert_called_once_with(language_code="en", device="cpu")
@@ -385,6 +390,7 @@ def test_transcribe_audio_injects_prompt_via_asr_options(mocker, tmp_path) -> No
         "initial_prompt": INITIAL_PROMPT,
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.5,
+        "log_prob_threshold": -0.8,
     }
     # The Kenyan / code-switch context must survive the move.
     assert "Kenya" in load_kwargs["asr_options"]["initial_prompt"]
@@ -403,6 +409,64 @@ def test_transcribe_audio_injects_prompt_via_asr_options(mocker, tmp_path) -> No
         "verbose",
         "progress_callback",
     }, f"unsupported kwargs for FasterWhisperPipeline.transcribe: {transcribe_kwargs}"
+
+
+def test_language_is_not_pinned_so_whisper_transcribes_rather_than_translates(
+    mocker, tmp_path
+) -> None:
+    """Neither load_model nor transcribe may preset a language.
+
+    WhisperX decides between *transcribing* and *translating* purely from the
+    language it is handed. With ``language="en"`` on a Swahili lecture, Whisper
+    does not fail — it dutifully produces fluent English, so the bug is silent:
+    the transcript looks plausible and every word timestamp is anchored to the
+    wrong language. Leaving both call sites unset is what lets the pipeline's
+    ``detect_language()`` run.
+
+    Asserted on both channels because either one alone is enough to pin it: a
+    preset at load time builds the tokenizer eagerly, and a per-call value
+    overrides it.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx, _pipeline, _assign = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "habari"}]
+    )
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    assert "language" not in whisperx.load_model.call_args.kwargs
+    assert "language" not in whisperx.load_model.return_value.transcribe.call_args.kwargs
+
+
+def test_asr_and_vad_options_use_the_field_names_whisperx_actually_has(
+    mocker, tmp_path
+) -> None:
+    """The tuning keys must be real fields, or load_model raises TypeError.
+
+    ``load_model`` merges this dict into its defaults and then splats the
+    result into ``TranscriptionOptions(**...)``. Any key that is not a field
+    name on that dataclass is a hard TypeError at load, not a silently ignored
+    option. The one that bites is the log-probability gate: the field is
+    ``log_prob_threshold`` (underscored), so the intuitive
+    ``logprob_threshold`` looks right and silently crashes the pipeline. This
+    test pins the exact key set so the spellings cannot drift.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx = _make_whisperx(mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}])[0]
+
+    LocalTranscriber().transcribe_audio(wav_path)
+
+    load_kwargs = whisperx.load_model.call_args.kwargs
+
+    asr_options = load_kwargs["asr_options"]
+    assert "log_prob_threshold" in asr_options
+    assert "logprob_threshold" not in asr_options  # not a TranscriptionOptions field
+    assert asr_options["log_prob_threshold"] == -0.8
+
+    vad_options = load_kwargs["vad_options"]
+    assert vad_options == {"vad_onset": 0.8, "vad_offset": 0.6}
+    # Both are genuine default_vad_options keys in whisperx.asr.load_model.
+    assert set(vad_options) <= {"chunk_size", "vad_onset", "vad_offset"}
 
 
 def test_transcribe_audio_uses_injected_token(mocker, tmp_path) -> None:

@@ -10,7 +10,12 @@ writes a slide when the screen *settles* on a stable, distinctly new frame:
    seconds, the frame becomes a save candidate;
 3. **Deduplication** — a candidate is written only when it differs from the
    last saved frame by more than ``hash_threshold``, so a repeated or
-   near-identical slide costs nothing.
+   near-identical slide costs nothing;
+4. **Continuous-motion safety valve** — a screen that never settles (playing
+   video, a live demo, an endless scroll) would otherwise yield *zero* slides
+   for the whole session. Once motion has run unbroken for
+   ``forced_capture_timeout`` seconds the current frame is written anyway, so
+   a busy screen still contributes evidence.
 
 Every saved slide also records **when** it was captured, as an elapsed offset
 from the start of the capture session, in ``slides/slide_times.json``. Stage 3
@@ -26,6 +31,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import imagehash
 import mss
@@ -49,6 +55,7 @@ class SlideCatcher:
         poll_interval: float = 1.0,
         settle_delay: float = 3.0,
         hash_threshold: int = 5,
+        forced_capture_timeout: float = 15.0,
     ) -> None:
         """Configure the catcher and prepare the ``slides`` subdirectory.
 
@@ -59,6 +66,9 @@ class SlideCatcher:
                 frame counts as settled.
             hash_threshold: Largest pHash distance still considered the same
                 slide (lower = stricter deduplication).
+            forced_capture_timeout: Seconds of unbroken motion after which a
+                frame is captured anyway, even though the screen never settled.
+                Set to ``0`` to disable the safety valve entirely.
         """
         self.output_dir = Path(output_dir)
         self.slides_dir = self.output_dir / "slides"
@@ -68,6 +78,7 @@ class SlideCatcher:
         self.poll_interval = poll_interval
         self.settle_delay = settle_delay
         self.hash_threshold = hash_threshold
+        self.forced_capture_timeout = forced_capture_timeout
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -81,6 +92,9 @@ class SlideCatcher:
         self.last_saved_hash: imagehash.ImageHash | None = None
         # Wall-clock timestamp of the last detected motion.
         self.stable_since: float = 0.0
+        # When the current unbroken run of motion began; 0.0 means the screen
+        # is currently considered still. Drives forced_capture_timeout.
+        self.motion_since: float = 0.0
         self.slide_index: int = 0
         # Append-only from the capture thread, read after stop(); safe
         # under the GIL, no extra locking needed.
@@ -121,6 +135,7 @@ class SlideCatcher:
                     "RGB", raw_frame.size, raw_frame.bgra, "raw", "BGRX"
                 )
                 current_hash = imagehash.phash(img)
+                now = time.time()
 
                 # Motion check: a large delta means the screen is still
                 # scrolling/playing, so reset the settle stopwatch.
@@ -128,52 +143,103 @@ class SlideCatcher:
                     self.last_frame_hash is None
                     or (current_hash - self.last_frame_hash) > 2
                 ):
-                    self.stable_since = time.time()
+                    self.stable_since = now
+                    # Start (or continue) the unbroken-motion run. Sentinel 0.0
+                    # means "not currently in motion", so only the first frame
+                    # of a run stamps it.
+                    if self.motion_since == 0.0:
+                        self.motion_since = now
                 else:
                     # Screen is still — has it been still long enough?
-                    if (time.time() - self.stable_since) >= self.settle_delay:
+                    if (now - self.stable_since) >= self.settle_delay:
                         # Dedup: only write frames distinct from the last file.
                         if (
                             self.last_saved_hash is None
                             or (current_hash - self.last_saved_hash)
                             > self.hash_threshold
                         ):
-                            self.slide_index += 1
-                            filename = f"slide_{self.slide_index:03d}.jpg"
-                            filepath = self.slides_dir / filename
-                            # Stamp the moment the frame is written. Taken
-                            # before the (slow) JPEG encode so the offset
-                            # reflects when the slide was actually on screen,
-                            # not when encoding finished.
-                            elapsed = time.time() - self.start_time
-                            img.save(
-                                filepath, format="JPEG", quality=85, optimize=True
-                            )
-                            self.last_saved_hash = current_hash
-                            self.captured_slides.append(filepath)
-                            self.slide_times[filename] = elapsed
-                            self._persist_slide_times()
-                            # Guard the log: cp1252 stdout (e.g. redirected
-                            # Windows output) cannot encode the emoji and
-                            # would kill the thread.
-                            try:
-                                print(
-                                    "📸 Vision: Settled frame captured "
-                                    f"({filename})"
-                                )
-                            except UnicodeEncodeError:
-                                print(
-                                    "Vision: Settled frame captured "
-                                    f"({filename})"
-                                )
+                            self._save_frame(img, current_hash, now)
                         # Aggressively reset after a settle cycle so a frame
                         # can only be saved once per period of stillness.
-                        self.stable_since = time.time()
+                        self.stable_since = now
+                    # The screen is still, so any motion run is over.
+                    self.motion_since = 0.0
+
+                # Safety valve: a screen that never settles (playing video,
+                # continuous scroll, a live demo) would otherwise produce zero
+                # slides for the entire session. After the timeout, take the
+                # frame we have rather than nothing, then start the clock
+                # over. This deliberately bypasses the settle requirement but
+                # NOT deduplication — see _save_frame's docstring.
+                if (
+                    self.forced_capture_timeout
+                    and self.motion_since
+                    and (now - self.motion_since) >= self.forced_capture_timeout
+                ):
+                    if (
+                        self.last_saved_hash is None
+                        or (current_hash - self.last_saved_hash)
+                        > self.hash_threshold
+                    ):
+                        self._save_frame(img, current_hash, now, forced=True)
+                    # Reset either way: a forced capture that deduped away
+                    # still consumed this window, and letting the timeout
+                    # re-fire every poll would busy-loop the log.
+                    self.motion_since = now
 
                 self.last_frame_hash = current_hash
 
                 # Poll wait; the event wakes it immediately on stop().
                 self._stop_event.wait(timeout=self.poll_interval)
+
+    def _save_frame(
+        self, img: Image.Image, current_hash: Any, now: float, forced: bool = False
+    ) -> None:
+        """Write one settled (or forced) frame and record its capture offset.
+
+        Shared by the settle path and the continuous-motion safety valve so the
+        two cannot drift apart in how they name, stamp, persist, or log a
+        slide. Callers are responsible for having already cleared the
+        deduplication check.
+
+        ``forced`` selects the log line only. A forced capture still honours
+        deduplication upstream: during genuinely continuous motion consecutive
+        frames are genuinely different, so dedup costs nothing there, while
+        honouring it stops a near-static screen (a blinking cursor, a
+        chatty UI) from emitting a near-duplicate slide every timeout window
+        and flooding the summarizer with vision API calls.
+
+        Args:
+            img: The decoded PIL frame to encode.
+            current_hash: pHash of ``img``, cached as the dedup reference.
+            now: Wall-clock value stamped as the capture instant.
+            forced: True when triggered by the motion timeout rather than a
+                genuine settle.
+        """
+        self.slide_index += 1
+        filename = f"slide_{self.slide_index:03d}.jpg"
+        filepath = self.slides_dir / filename
+        # Stamp the moment the frame is written. Taken before the (slow) JPEG
+        # encode so the offset reflects when the slide was actually on screen,
+        # not when encoding finished.
+        elapsed = now - self.start_time
+        img.save(filepath, format="JPEG", quality=85, optimize=True)
+        self.last_saved_hash = current_hash
+        self.captured_slides.append(filepath)
+        self.slide_times[filename] = elapsed
+        self._persist_slide_times()
+
+        message = (
+            f"Forced capture due to continuous motion ({filename})"
+            if forced
+            else f"Settled frame captured ({filename})"
+        )
+        # Guard the log: cp1252 stdout (e.g. redirected Windows output) cannot
+        # encode the emoji and would kill the thread.
+        try:
+            print(f"📸 Vision: {message}")
+        except UnicodeEncodeError:
+            print(f"Vision: {message}")
 
     def _persist_slide_times(self) -> None:
         """Write :attr:`slide_times` to the sidecar JSON, never fatally.

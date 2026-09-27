@@ -8,7 +8,10 @@ The whole suite runs **offline** — no NVIDIA API calls, no network I/O:
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
+from unittest import mock
 
 import pytest
 from PIL import Image
@@ -67,6 +70,57 @@ def _neutralise_backoff(mocker) -> None:
     mocker.patch.object(
         LectureSynthesizer._call_synthesis.retry, "sleep", lambda seconds: None
     )
+
+
+@pytest.fixture
+def fresh_summarizer():
+    """Yield a reloader that re-imports ``summarizer`` under a chosen environment.
+
+    ``MAP_MODEL``/``REDUCE_MODEL`` are read from ``os.environ`` at *import*
+    time, so their fallback behaviour cannot be tested by patching the
+    already-imported module — only by importing it again. Two hazards have to
+    be handled for that to be meaningful:
+
+    * ``load_dotenv()`` runs on import and would re-inject this project's real
+      ``.env`` (which sets ``MAP_MODEL``/``REDUCE_MODEL`` for live runs), so it
+      is neutralised and the environment is fully caller-controlled. The patch
+      is applied to ``dotenv.load_dotenv`` rather than to the attribute on
+      ``summarizer`` because reloading re-executes ``from dotenv import
+      load_dotenv``, which would rebind over a module-level patch;
+    * reloading mutates the shared ``summarizer`` module object in place, so the
+      module is reloaded once more during teardown to leave it as the rest of
+      the suite expects to find it.
+
+    Args:
+        **env: Environment overrides. A value of ``None`` means *unset this
+            variable*; any other value is set.
+
+    Returns:
+        The reloaded module.
+    """
+    missing = object()
+
+    def _load(**env):
+        saved = {key: os.environ.get(key, missing) for key in env}
+        for key, value in env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        try:
+            with mock.patch("dotenv.load_dotenv"):
+                return importlib.reload(summarizer)
+        finally:
+            for key, value in saved.items():
+                if value is missing:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    yield _load
+
+    with mock.patch("dotenv.load_dotenv"):
+        importlib.reload(summarizer)
 
 
 # ---------------------------------------------------------------------------
@@ -555,12 +609,56 @@ def test_map_and_reduce_route_to_their_own_model_variables(
     assert MODEL_NAME not in {"meta/map-specialised", "meta/reduce-specialised"}
 
 
-def test_stage_models_default_to_the_shared_model_name() -> None:
+def test_stage_models_default_to_the_shared_model_name(fresh_summarizer) -> None:
     """With no per-stage override, both stages inherit ``MODEL_NAME``.
 
     ``MAP_MODEL``/``REDUCE_MODEL`` fall back to ``MODEL_NAME`` rather than
     hardcoding a model id, so a single ``LLM_MODEL_NAME`` export still moves
     the whole pipeline.
+
+    Asserted against a freshly reloaded module under a controlled environment.
+    This project's ``.env`` genuinely sets ``MAP_MODEL``/``REDUCE_MODEL`` for
+    real runs, so asserting the already-imported values would only be testing
+    the developer's machine — and did pass or fail depending on their config.
     """
-    assert MAP_MODEL == MODEL_NAME
-    assert REDUCE_MODEL == MODEL_NAME
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/known-model",
+        MAP_MODEL=None,  # absent -> exercise the fallback
+        REDUCE_MODEL=None,
+    )
+
+    assert module.MODEL_NAME == "meta/known-model"
+    assert module.MAP_MODEL == "meta/known-model"
+    assert module.REDUCE_MODEL == "meta/known-model"
+
+
+def test_per_stage_env_overrides_beat_the_shared_model(fresh_summarizer) -> None:
+    """A per-stage export wins over ``LLM_MODEL_NAME`` independently per stage.
+
+    This is the case that actually bit us: a developer who pins only
+    ``REDUCE_MODEL`` to a bigger model for the reasoning-heavy merge while
+    leaving the cheap vision model on the map stage.
+    """
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/shared",
+        MAP_MODEL="meta/map-only",
+        REDUCE_MODEL="meta/reduce-only",
+    )
+
+    assert module.MAP_MODEL == "meta/map-only"
+    assert module.REDUCE_MODEL == "meta/reduce-only"
+    assert module.MODEL_NAME == "meta/shared"  # untouched
+
+
+def test_only_one_stage_pinned_leaves_the_other_on_the_fallback(
+    fresh_summarizer,
+) -> None:
+    """Pinning REDUCE_MODEL alone must not drag MAP_MODEL along with it."""
+    module = fresh_summarizer(
+        LLM_MODEL_NAME="meta/shared",
+        MAP_MODEL=None,
+        REDUCE_MODEL="meta/reduce-only",
+    )
+
+    assert module.REDUCE_MODEL == "meta/reduce-only"
+    assert module.MAP_MODEL == "meta/shared"  # inherited, not dragged along

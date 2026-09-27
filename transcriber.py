@@ -299,18 +299,44 @@ class LocalTranscriber:
         # (default 0.6) additionally biases the model toward calling
         # ambiguous stretches silence rather than inventing speech, which is
         # what broadcast/weather audio triggers most often.
+        #
+        # ``log_prob_threshold`` is raised from the -1.0 default. A segment the
+        # decoder is very unsure about is now dropped instead of being emitted
+        # as fluent, wrong text — which is what turns one bad 30 s window into
+        # a paragraph of confident nonsense. NOTE the underscore: this is the
+        # field name on faster_whisper's ``TranscriptionOptions``, which
+        # ``load_model`` splats this dict into. The un-underscored
+        # ``logprob_threshold`` is not a field and raises TypeError at load.
         asr_options = {
             "initial_prompt": INITIAL_PROMPT,
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.5,
+            "log_prob_threshold": -0.8,
         }
+
+        # Aggressive VAD. The defaults (onset 0.500 / offset 0.363) are tuned
+        # for clean dictation and keep low-energy speech that opens and closes
+        # softly. Room-mic plus laptop-loopback lecture audio has far more
+        # borderline energy, so the default windowing fragments words across
+        # chunk boundaries. Raising both values makes the detector commit to
+        # speech earlier and hold the tail longer, giving the decoder fewer,
+        # longer, more coherent chunks.
+        vad_options = {"vad_onset": 0.8, "vad_offset": 0.6}
+
         model = whisperx.load_model(
             WHISPER_MODEL,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
             asr_options=asr_options,
+            vad_options=vad_options,
         )
-        result = model.transcribe(audio, language="en")
+        # No ``language=`` here on purpose. WhisperX's transcribe() falls back
+        # to ``detect_language()`` when neither a preset nor a per-call language
+        # is supplied, and load_model() was likewise called without one, so the
+        # pipeline holds no tokenizer. Pinning "en" made Whisper *translate*
+        # rather than transcribe, so Swahili came out as English prose and every
+        # downstream word timestamp belonged to the wrong language.
+        result = model.transcribe(audio)
         segments: list[dict[str, Any]] = result["segments"]
         print(f"  -> transcribed {len(segments)} segments; aligning words...")
 
