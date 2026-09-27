@@ -11,10 +11,17 @@ writes a slide when the screen *settles* on a stable, distinctly new frame:
 3. **Deduplication** — a candidate is written only when it differs from the
    last saved frame by more than ``hash_threshold``, so a repeated or
    near-identical slide costs nothing.
+
+Every saved slide also records **when** it was captured, as an elapsed offset
+from the start of the capture session, in ``slides/slide_times.json``. Stage 3
+of the summarizer needs that offset to line a slide up against the audio
+transcript: the transcript's turn headers and the manifest's slide headers must
+be expressed on the same clock before a model can cross-reference them.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -23,6 +30,14 @@ from pathlib import Path
 import imagehash
 import mss
 from PIL import Image
+
+SLIDE_TIMES_FILENAME = "slide_times.json"
+"""Sidecar in the slides directory mapping each slide filename to its offset.
+
+Raw seconds are stored rather than a preformatted string so the summarizer can
+render them with the *same* clock helper the transcript uses. Preformatting here
+would let the two clocks drift apart and break the comparison.
+"""
 
 
 class SlideCatcher:
@@ -48,6 +63,7 @@ class SlideCatcher:
         self.output_dir = Path(output_dir)
         self.slides_dir = self.output_dir / "slides"
         os.makedirs(self.slides_dir, exist_ok=True)
+        self.times_path = self.slides_dir / SLIDE_TIMES_FILENAME
 
         self.poll_interval = poll_interval
         self.settle_delay = settle_delay
@@ -55,6 +71,9 @@ class SlideCatcher:
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Origin for every elapsed offset below. Set in start() so the clock
+        # begins when capture does, not at construction.
+        self.start_time: float = 0.0
 
         # pHash of the most recent frame (drives the motion check).
         self.last_frame_hash: imagehash.ImageHash | None = None
@@ -66,11 +85,23 @@ class SlideCatcher:
         # Append-only from the capture thread, read after stop(); safe
         # under the GIL, no extra locking needed.
         self.captured_slides: list[Path] = []
+        # Elapsed seconds from start_time at the instant each frame was
+        # written, keyed by filename. This is the time-domain signal Stage 3
+        # needs to align a slide against the transcript.
+        self.slide_times: dict[str, float] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn and start the daemon capture thread."""
+        """Spawn and start the daemon capture thread.
+
+        The elapsed-time origin is stamped here rather than in ``__init__`` so
+        that a catcher constructed early (or restarted) does not accumulate
+        dead time into every slide offset. In ``main.py`` this runs just before
+        the recorder starts, so the slide clock and the transcript clock share
+        an origin to within the thread-spawn delay.
+        """
+        self.start_time = time.time()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -110,11 +141,18 @@ class SlideCatcher:
                             self.slide_index += 1
                             filename = f"slide_{self.slide_index:03d}.jpg"
                             filepath = self.slides_dir / filename
+                            # Stamp the moment the frame is written. Taken
+                            # before the (slow) JPEG encode so the offset
+                            # reflects when the slide was actually on screen,
+                            # not when encoding finished.
+                            elapsed = time.time() - self.start_time
                             img.save(
                                 filepath, format="JPEG", quality=85, optimize=True
                             )
                             self.last_saved_hash = current_hash
                             self.captured_slides.append(filepath)
+                            self.slide_times[filename] = elapsed
+                            self._persist_slide_times()
                             # Guard the log: cp1252 stdout (e.g. redirected
                             # Windows output) cannot encode the emoji and
                             # would kill the thread.
@@ -137,9 +175,29 @@ class SlideCatcher:
                 # Poll wait; the event wakes it immediately on stop().
                 self._stop_event.wait(timeout=self.poll_interval)
 
+    def _persist_slide_times(self) -> None:
+        """Write :attr:`slide_times` to the sidecar JSON, never fatally.
+
+        Called from the capture thread after every save, so the timestamps
+        survive an abrupt shutdown (the process being killed mid-lecture) and
+        not just a clean ``stop()``. A write failure must not kill the capture
+        thread: the slides themselves are already safely on disk, so losing
+        the timing sidecar is a degradation, not a failure.
+        """
+        try:
+            self.times_path.write_text(
+                json.dumps(self.slide_times, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     def stop(self) -> list[Path]:
         """Stop the capture daemon and return the settled slides captured."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5.0)
+        # Final flush so a session that ends without a new save (e.g. the last
+        # slide is the only one) still has a complete sidecar.
+        self._persist_slide_times()
         return self.captured_slides
