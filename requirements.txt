@@ -15,3 +15,4 @@ ImageHash>=4.3.1            # perceptual hash for slide deduplication
 whisperx>=3.1               # Phase 2: ASR + wav2vec2 alignment + pyannote diarization
 torch>=2.1                  # WhisperX inference backend (pinned for reproducibility)
 torchaudio>=2.1             # wav2vec2 forced-alignment pipelines used by WhisperX
+rich>=13.0.0

@@ -20,14 +20,84 @@ import re
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from recorder import AudioRecorder
 from transcriber import LocalTranscriber, TRANSCRIPT_FILENAME
 from summarizer import LectureSynthesizer
 from vision import SlideCatcher
+
+# ``Console`` renders the markup; ``Status`` is the live spinner type returned
+# by ``Console.status``. NOTE the split: ``Status`` is *not* re-exported from
+# ``rich.console`` -- ``from rich.console import Status`` raises ImportError --
+# so it must come from ``rich.status``.
+from rich.console import Console
+from rich.status import Status
+
+# Single shared console. Rich auto-detects and enables VT processing on legacy
+# Windows terminals, captures stdout at import time, and degrades to plain
+# unstyled text when the output is not a TTY (piped to a file, run under
+# pytest), so every one of these call sites is safe unconditionally.
+console = Console()
+
+# A second console bound to stderr, so genuine errors keep going to stderr
+# even when stdout is piped to a file (``python main.py > run.log``). The
+# original code distinguished these via ``print(..., file=sys.stderr)``; folding
+# them into ``console`` would have silently downgraded them.
+console_err = Console(stderr=True)
+
+# Pipeline stage labels, kept in one place so the outline the operator reads at
+# startup is the same one each phase announces.
+STAGE_INIT = "[bold blue]Initialization[/bold blue]"
+STAGE_CAPTURE = "[bold blue]Audio Capture[/bold blue]"
+STAGE_TRANSCRIBE = "[bold blue]Transcription & Diarization[/bold blue]"
+STAGE_SYNTHESIZE = "[bold blue]Academic Synthesis[/bold blue]"
+
+
+def _stage(title: str) -> None:
+    """Announce a pipeline stage with a rule so the phases are scannable.
+
+    A lecture run is dominated by two long silent phases, so the operator needs
+    a persistent visual marker of *where the pipeline currently is* that
+    survives scrolling: a labelled rule, not just another line of text.
+    """
+    console.rule(f"[bold]{title}[/bold]", style="blue")
+
+
+def _kv(label: str, value: object, width: int = 13) -> None:
+    """Print an aligned ``label : value`` row without ever breaking the value.
+
+    ``soft_wrap=True`` is load-bearing here, not cosmetic. A Windows path is a
+    single unbreakable token that routinely exceeds the terminal width; rich's
+    default word-wrap would push the path onto its own line, orphaning the
+    label and, worse, inserting a newline into the middle of a string the user
+    is likely to select and paste. ``soft_wrap`` lets the terminal fold the
+    line visually while leaving the underlying text intact.
+    """
+    console.print(
+        f"   [cyan]{label:<{width}}[/cyan]{value}",
+        soft_wrap=True,
+        highlight=False,
+    )
+
+
+@contextmanager
+def _spinner(label: str, spinner: str = "dots") -> Iterator[Status]:
+    """Run a blocking call behind a live spinner.
+
+    Yields the live :class:`~rich.status.Status` so a caller can update
+    ``status.update(...)`` mid-stage, but nothing in this pipeline needs to.
+
+    The ``with`` block is what makes Ctrl+C safe: ``Status.__exit__`` stops the
+    Live display on the exception path too, so a double Ctrl+C during
+    transcription cannot leave the cursor parked inside a spinner frame with
+    no newline.
+    """
+    with console.status(label, spinner=spinner) as status:
+        yield status
 
 
 def _configure_streams() -> None:
@@ -61,12 +131,12 @@ def _enable_windows_ansi() -> None:
 def print_warning_banner() -> None:
     """Print the startup warning: loopback records *everything* you hear."""
     bar = "!" * 78
-    print(f"\n\033[1;31m{bar}")
-    print(
-        "⚠️ WARNING: Mute system notifications (Slack, Email). "
-        "Loopback captures ALL OS audio."
+    console.print(f"\n[bold red]{bar}[/bold red]")
+    console.print(
+        "[bold red]⚠️  WARNING:[/bold red] Mute system notifications (Slack, "
+        "Email). Loopback captures ALL OS audio."
     )
-    print(f"{bar}\033[0m\n")
+    console.print(f"[bold red]{bar}[/bold red]\n")
 
 
 def _sanitize_course_code(raw: str) -> str:
@@ -90,11 +160,13 @@ def prompt_course_code() -> str:
     while True:
         raw = input("Enter Course Unit Code (e.g. CRM_1106): ").strip()
         if not raw:
-            print("  Course code cannot be empty — try again.")
+            console.print("  [yellow]Course code cannot be empty — try again.[/yellow]")
             continue
         safe = _sanitize_course_code(raw)
         if safe != raw:
-            print(f"  Note: using {safe!r} as the folder name.")
+            console.print(
+                f"  [yellow]Note: using [bold]{safe!r}[/bold] as the folder name.[/yellow]"
+            )
         return safe
 
 
@@ -124,7 +196,11 @@ def _confirm_overwrite(wav_path: Path) -> bool:
     """
     if not wav_path.exists():
         return True
-    print(f"⚠️ {wav_path} already exists and will be OVERWRITTEN.")
+    console.print(
+        f"[bold yellow]⚠️  {wav_path} already exists and will be "
+        f"OVERWRITTEN.[/bold yellow]",
+        soft_wrap=True,
+    )
     return input("Continue? [y/N]: ").strip().lower() in {"y", "yes"}
 
 
@@ -142,27 +218,31 @@ def select_device(recorder: AudioRecorder) -> int:
     """
     devices = recorder.get_loopback_devices()
     if not devices:
-        print(
-            "No loopback audio devices found. Enable your speakers "
-            "(or Stereo Mix) and retry.",
-            file=sys.stderr,
+        console_err.print(
+            "[bold red]No loopback audio devices found.[/bold red] Enable "
+            "your speakers (or Stereo Mix) and retry.",
         )
         raise SystemExit(1)
 
-    print("\nAvailable loopback devices:")
+    console.print("\n[bold]Available loopback devices:[/bold]")
     for index, device in enumerate(devices):
-        print(f"  [{index}] {device.name}  ({device.channels} ch)")
+        console.print(
+            f"  [bold cyan][{index}][/bold cyan] {device.name}  "
+            f"({device.channels} ch)"
+        )
 
     while True:
         raw = input("Select a device by number: ").strip()
         try:
             index = int(raw)
         except ValueError:
-            print("  Enter an integer, e.g. 0.")
+            console.print("  [yellow]Enter an integer, e.g. 0.[/yellow]")
             continue
         if 0 <= index < len(devices):
             return index
-        print(f"  Choose a number between 0 and {len(devices) - 1}.")
+        console.print(
+            f"  [yellow]Choose a number between 0 and {len(devices) - 1}.[/yellow]"
+        )
 
 
 def run_status_loop(recorder: AudioRecorder) -> None:
@@ -181,15 +261,21 @@ def run_status_loop(recorder: AudioRecorder) -> None:
         while recorder.is_recording.is_set():
             elapsed = int(time.monotonic() - started)
             minutes, seconds = divmod(elapsed, 60)
-            print(
-                "\r● Recording in progress... Press Ctrl+C to stop  "
-                f"[{minutes:02d}:{seconds:02d}]",
+            # Written in place with a carriage return. Deliberately a plain
+            # console.print rather than a ``Status`` spinner: the Live display
+            # would repaint the line on its own refresh timer and fight this
+            # one-second tick, and a Live display started here would have to be
+            # torn down before every later print in the pipeline.
+            console.print(
+                "\r[bold yellow]●[/bold yellow] Recording in progress... "
+                "Press [bold]Ctrl+C[/bold] to stop  "
+                f"[bold cyan]{minutes:02d}:{seconds:02d}[/bold cyan]",
                 end="",
-                flush=True,
+                highlight=False,
             )
             time.sleep(1.0)
     finally:
-        print()  # terminate the \r status line before further output
+        console.print()  # terminate the \r line before further output
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +301,9 @@ def _interrupt_protected(label: str, fn: Callable[[], Any]) -> Any:
     try:
         return fn()
     except KeyboardInterrupt:
-        print(
-            f"\n⚠️ Pipeline processing in progress ({label}). "
-            "Aborting now may result in data loss. Let it finish.",
-            flush=True,
+        console.print(
+            f"\n[bold yellow]⚠️  Pipeline processing in progress ({label}).[/bold yellow] "
+            "Aborting now may result in data loss. [italic]Let it finish.[/italic]"
         )
         return fn()  # single press only: give the phase one clean retry
 
@@ -239,14 +324,16 @@ def main() -> int:
     print_warning_banner()
 
     # ---- setup: course code + output directory (Phase 1 logic) ------------
+    _stage(STAGE_INIT)
     course_code = prompt_course_code()
     output_dir = create_output_dir(course_code)
     wav_path = output_dir / "raw_audio.wav"
     backup_path = output_dir / "emergency_backup.wav"
-    print(f"Output directory : {output_dir}")
+    console.print(f"[bold blue]ℹ[/bold blue] Output directory : {output_dir}",
+                  soft_wrap=True, highlight=False)
 
     if not _confirm_overwrite(wav_path):
-        print("Aborted — nothing was recorded.")
+        console.print("[bold yellow]Aborted[/bold yellow] — nothing was recorded.")
         return 1
 
     # ---- instantiate the three components ----------------------------------
@@ -257,8 +344,10 @@ def main() -> int:
     device_id = select_device(recorder)
     # Same cached list as above, so the index still points at this device:
     device_name = recorder.get_loopback_devices()[device_id].name
-    print(f"\nRecording from  : {device_name}")
-    print(f"Emergency backup: {backup_path}\n")
+    _stage(STAGE_CAPTURE)
+    console.print(f"[bold blue]ℹ[/bold blue] Recording from  : {device_name}")
+    console.print(f"[bold blue]ℹ[/bold blue] Emergency backup: {backup_path}\n",
+                  soft_wrap=True, highlight=False)
 
     # ---- Phase A: recording (1st Ctrl+C = clean stop) ----------------------
     # Phase 5: visual capture runs alongside the audio recording loop.
@@ -277,15 +366,18 @@ def main() -> int:
             recorder.stop_recording(wav_path)
         finally:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
-        print("🛑 Recording stopped. Initiating AI Transcription...")
+        console.print(
+            "[bold green]🛑  Recording stopped.[/bold green] "
+            "Initiating AI Transcription..."
+        )
         captured_slides = slide_catcher.stop()
-        print(
-            f"🛑 Slide capture stopped. "
-            f"Captured {len(captured_slides)} unique slide(s)."
+        console.print(
+            f"[bold green]🛑[/bold green] Slide capture stopped. "
+            f"Captured [bold]{len(captured_slides)}[/bold] unique slide(s)."
         )
     except (RuntimeError, OSError) as exc:
         slide_catcher.stop()
-        print(f"\nError: {exc}", file=sys.stderr)
+        console_err.print(f"\n[bold red]✗ Error:[/bold red] {exc}")
         return 1
     else:
         # Loop ended without Ctrl+C: the device dropped and the capture
@@ -295,16 +387,21 @@ def main() -> int:
             recorder.stop_recording(wav_path)
         finally:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
-        print("⚠️ Recording ended on its own (possible device drop).")
+        console.print(
+            "[bold yellow]⚠️  Recording ended on its own "
+            "(possible device drop).[/bold yellow]"
+        )
         captured_slides = slide_catcher.stop()
-        print(
-            f"🛑 Slide capture stopped. "
-            f"Captured {len(captured_slides)} unique slide(s)."
+        console.print(
+            f"[bold green]🛑[/bold green] Slide capture stopped. "
+            f"Captured [bold]{len(captured_slides)}[/bold] unique slide(s)."
         )
 
     # ---- Phase B: AI handoff (double-Ctrl+C protected) ---------------------
     if not (wav_path.exists() and wav_path.stat().st_size > 0):
-        print("⚠️ No audio captured — skipping AI processing.")
+        console.print(
+            "[bold yellow]⚠️  No audio captured — skipping AI processing.[/bold yellow]"
+        )
         return 1
 
     transcript_path = output_dir / TRANSCRIPT_FILENAME
@@ -312,35 +409,55 @@ def main() -> int:
     slides_dir = output_dir / "slides"
 
     try:
-        _interrupt_protected(
-            "transcription",
-            lambda: transcriber.transcribe_audio(wav_path),
+        # -- Transcription & Diarization -----------------------------------
+        # The longest silent stretch in the pipeline (tens of minutes on CPU),
+        # so it is the one that most needs a visible "still working" signal.
+        # The spinner sits *inside* _interrupt_protected, not around it, so the
+        # deliberate single-Ctrl+C retry re-enters a live spinner rather than
+        # dropping to a frozen prompt.
+        _stage(STAGE_TRANSCRIBE)
+        with _spinner("[bold yellow]Transcribing and diarizing...[/bold yellow]"):
+            _interrupt_protected(
+                "transcription",
+                lambda: transcriber.transcribe_audio(wav_path),
+            )
+        console.print(
+            "[bold green]✓[/bold green] Transcription complete → "
+            f"[bold cyan]{transcript_path.name}[/bold cyan]"
         )
-        print("🧠 Transcription complete. Synthesizing Study Notes...")
 
-        _interrupt_protected(
-            "synthesis",
-            lambda: (
-                transcript_path, notes_path, slides_dir
-            ),
-        )
+        # -- Academic Synthesis --------------------------------------------
+        # NOTE: this lambda must *call* generate_notes. It previously only
+        # built the argument tuple and returned it, so the whole synthesis
+        # phase was a silent no-op -- no LLM call, no notes file -- while still
+        # reporting "All stages completed" and printing a path that did not
+        # exist. Covered by test_transcription_runs_before_synthesis.
+        _stage(STAGE_SYNTHESIZE)
+        with _spinner("[bold yellow]Synthesizing study notes...[/bold yellow]"):
+            _interrupt_protected(
+                "synthesis",
+                lambda: synthesizer.generate_notes(
+                    transcript_path, notes_path, slides_dir
+                ),
+            )
     except ValueError as exc:
-        print(f"\n⚠️ Synthesis skipped: {exc}")
-        print(f"   The raw transcript is still available at: {transcript_path}")
+        console.print(f"\n[bold yellow]⚠️  Synthesis skipped:[/bold yellow] {exc}")
+        console.print("   [yellow]The raw transcript is still available at:[/yellow]")
+        console.print(f"   {transcript_path}", soft_wrap=True, highlight=False)
         return 1
     except KeyboardInterrupt:
-        print(f"\n⚠️ Pipeline interrupted — saved files kept in: {output_dir}")
+        console.print(
+            "\n[bold yellow]⚠️  Pipeline interrupted — saved files kept in:[/bold yellow]"
+        )
+        console.print(f"   {output_dir}", soft_wrap=True, highlight=False)
         return 130
 
-    print(
-        f"\n{'=' * 60}\n"
-        "✅ PIPELINE COMPLETE\n"
-        f"   Audio      : {wav_path}\n"
-        f"   Transcript : {transcript_path}\n"
-        f"   Slides     : {len(captured_slides)} saved in {slide_catcher.slides_dir}\n"
-        f"   Study Notes: {notes_path}\n"
-        f"{'=' * 60}"
-    )
+    _stage("Pipeline Complete")
+    console.print(f"[bold green]✅  All stages completed.[/bold green]\n")
+    _kv("Audio      :", wav_path)
+    _kv("Transcript :", transcript_path)
+    _kv("Slides     :", f"{len(captured_slides)} saved in {slide_catcher.slides_dir}")
+    _kv("Study Notes:", f"[bold]{notes_path}[/bold]")
     return 0
 
 
@@ -348,5 +465,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (KeyboardInterrupt, EOFError):
-        print("\nCancelled — exiting.")
+        console.print("\n[bold yellow]Cancelled — exiting.[/bold yellow]")
         raise SystemExit(130)
