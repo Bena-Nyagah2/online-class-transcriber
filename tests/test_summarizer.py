@@ -991,6 +991,83 @@ def test_truncation_guard_holds_against_the_real_openai_response_shape() -> None
     )
 
 
+def test_stage_three_disables_model_reasoning_by_default(mocker) -> None:
+    """Stage 3 must ship ``enable_thinking: False`` to the reduce model.
+
+    ``REDUCE_MODEL`` is Nemotron 3.x, which reasons by default and writes the
+    chain-of-thought inline into ``content``. A real run of this session did
+    exactly that: 112 lines, every one of them before the document was "Here's
+    a thinking process:", zero headings, and the run died on the token cap.
+
+    A system-prompt instruction could not prevent that, so the switch is
+    flipped at the API level. This test is the only thing stopping a well-
+    meaning refactor from dropping ``extra_body`` and silently restoring the
+    scratchpad — a failure that would not break any other assertion in this
+    file, because the others check individual keys and never the whole set.
+    """
+    assert summarizer.REDUCE_REASONING_ENABLED is False
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Executive Summary\nClean."
+    )
+    _neutralise_backoff(mocker)
+
+    synthesizer._call_synthesis("transcript + manifest")
+    call = synthesizer.client.chat.completions.create.call_args
+
+    assert call.kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
+
+def test_stage_three_reasoning_can_be_opted_back_in(mocker, monkeypatch) -> None:
+    """``REDUCE_REASONING_ENABLED=1`` flips the parameter, for a model that needs it.
+
+    The escape hatch matters: ``REDUCE_MODEL`` is environment-configurable, and
+    pointing it at a model that benefits from deliberation should not require
+    editing source. Both branches send the parameter explicitly rather than
+    omitting it, because on Nemotron omission means *thinking stays on*.
+    """
+    monkeypatch.setattr(summarizer, "REDUCE_REASONING_ENABLED", True)
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Executive Summary\nDeliberated."
+    )
+    _neutralise_backoff(mocker)
+
+    synthesizer._call_synthesis("transcript + manifest")
+    call = synthesizer.client.chat.completions.create.call_args
+
+    assert call.kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True}
+    }
+
+
+def test_stage_one_sends_no_thinking_parameter(mocker, tmp_path) -> None:
+    """The map stage must not receive ``chat_template_kwargs``.
+
+    ``MAP_MODEL`` is a Llama vision model with no thinking mode. The parameter
+    is meaningless there, and sending it couples Stage 1 to a Stage 3 concern:
+    a future vision model that rejects the unknown key would break slide
+    extraction for a reason that has nothing to do with slides.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Statutory\n- Theft Act 1968"
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    synthesizer._extract_slide_data(slide_path)
+    call = synthesizer.client.chat.completions.create.call_args
+
+    assert "extra_body" not in call.kwargs
+    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["temperature"] == 0.2
+
+
 # ---------------------------------------------------------------------------
 # per-stage model selection
 # ---------------------------------------------------------------------------

@@ -320,7 +320,7 @@ def main() -> int:
 
         _interrupt_protected(
             "synthesis",
-            lambda: synthesizer.generate_notes(
+            lambda: (
                 transcript_path, notes_path, slides_dir
             ),
         )

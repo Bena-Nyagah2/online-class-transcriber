@@ -69,6 +69,19 @@ MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 MAP_MODEL = os.environ.get("MAP_MODEL", MODEL_NAME)
 REDUCE_MODEL = os.environ.get("REDUCE_MODEL", MODEL_NAME)
 
+# Nemotron 3.x (the current REDUCE_MODEL) reasons by default and writes that
+# chain-of-thought into ``content`` ahead of the document, which starves the
+# output budget and produces meta-commentary instead of notes. Off by default
+# because this pipeline wants the document, not the deliberation. Set
+# ``REDUCE_REASONING_ENABLED=1`` to turn it back on for a non-reasoning
+# ``REDUCE_MODEL``, or if you ever want the model to think before writing.
+#
+# Stage 1 is unaffected by design: ``MAP_MODEL`` is a Llama vision model with
+# no thinking mode, so sending the parameter there would be noise.
+REDUCE_REASONING_ENABLED = os.environ.get(
+    "REDUCE_REASONING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 
@@ -124,9 +137,9 @@ SYSTEM_PROMPT = textwrap.dedent(
        - Use **bold** for the concept name on first use.
 
     4. **Statutes, Case Law, & References** -- Extract *explicitly* from OCR and audio. Each entry must include:
-       - Full citation (e.g., "Theft Act 1968, s.1", "R v Cunningham [1957] 2 QB 396").
+       - Full citation, written as a *format template* with the real values substituted in: a statute as "<Act Name> <Year>, s. <section>"; a case as "<Case Name> [<Year>] <reporter> <page>". Never reproduce the template itself -- it contains no real authority.
        - The context in which it was discussed (one sentence).
-       - Do NOT add citations the lecturer did not mention. If the slides reference a case the lecturer skipped, note it as "[Slide reference only]".
+       - Do NOT add citations the lecturer did not mention. This is absolute: if no authority was spoken or shown, the section says so and lists nothing. Never supply a citation from your own knowledge, however well known it is, and never reuse the format templates above as if they were real cases. If a slide shows an authority the lecturer skipped, note it as "[Slide reference only]".
        - Use a Markdown table with columns: **Citation | Context | Source (Audio/Slide/Both)**.
 
     5. **Exam Preparation** -- Generate exactly THREE high-level synthesis questions that:
@@ -433,6 +446,32 @@ class LectureSynthesizer:
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
+            # Nemotron 3.x ships as a *reasoning* model: thinking is on by
+            # default, and the chain-of-thought is emitted inline in `content`
+            # rather than in a separate `reasoning` field. Left on, it spends
+            # the whole budget narrating its own plan -- the previous run of
+            # this session produced 112 lines in which everything before the
+            # document was "Here's a thinking process:", and not one heading.
+            #
+            # The STRICT OUTPUT FORMAT DIRECTIVE in SYSTEM_PROMPT cannot fix
+            # this. A model whose training makes CoT the default path does not
+            # reliably abandon it because a system prompt asked nicely; the
+            # switch has to be flipped at the API level. Disabling reasoning
+            # frees the entire budget for the four mandated sections, which is
+            # what MAX_TOKENS was sized for in the first place.
+            #
+            # Stage 1 is deliberately untouched: MAP_MODEL is a Llama vision
+            # model with no thinking mode, and the parameter is meaningless
+            # there. See REDUCE_REASONING_ENABLED below.
+            #
+            # Both branches send the parameter explicitly. Omitting it is NOT
+            # the same as disabling: Nemotron 3 defaults to thinking *on*, so
+            # a bare request would silently reintroduce the scratchpad.
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": REDUCE_REASONING_ENABLED
+                }
+            },
         )
 
         # A response that stopped because it ran out of budget is not a
