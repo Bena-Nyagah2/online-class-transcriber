@@ -241,13 +241,19 @@ class LectureSynthesizer:
         NVIDIA's endpoint accepts one image per request, so each slide is
         mapped independently. ``max_tokens=800`` is a deliberate cap — a
         single slide's extract is short, and keeping Stage 1 cheap leaves
-        room for the big Stage 3 synthesis.
+        room for the big Stage 3 synthesis. Because that budget is a cap
+        rather than a target, the response is checked for exhaustion and a
+        truncated extract is refused rather than written to the manifest.
 
         Args:
             image_path: Path to one captured slide JPEG.
 
         Returns:
             The extracted content as concise, fence-free Markdown.
+
+        Raises:
+            RuntimeError: If the model stopped at the token cap for this
+                slide. The partial extract is discarded rather than stored.
         """
         content = [
             {"type": "text", "text": SLIDE_EXTRACT_PROMPT},
@@ -262,7 +268,33 @@ class LectureSynthesizer:
             temperature=TEMPERATURE,
             max_tokens=800,
         )
-        return self._clean_markdown(response.choices[0].message.content or "")
+
+        # Symmetric to the Stage 3 failsafe, and for the same reason. A slide
+        # that ran out of budget at 800 tokens yields an extract that stops
+        # mid-sentence, and that partial text is about to be written into the
+        # manifest as though it were the whole slide. Stage 3 is then told to
+        # treat the manifest as ground truth -- a truncated extract does not
+        # read as "incomplete", it reads as "this is all the slide said", so
+        # the model will reason from a gap it cannot see. Failing here is the
+        # only honest option; the alternative launders missing content into
+        # confident wrong notes.
+        #
+        # The blast radius is bounded: ``_build_slide_manifest`` persists the
+        # manifest after every slide, so a crash here costs only the in-flight
+        # slide and a re-run resumes from the last good one.
+        #
+        # As in Stage 3, RuntimeError is absent from ``_RETRYABLE_ERRORS`` so
+        # tenacity re-raises immediately instead of spending two more calls to
+        # hit the same wall. The remedy is a larger 800 or a tighter
+        # SLIDE_EXTRACT_PROMPT, not a retry loop.
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                f"Stage 1 hit the token cap on {image_path.name} — "
+                "slide extract would be truncated."
+            )
+
+        return self._clean_markdown(choice.message.content or "")
 
     # -- Stage 2 (Accumulate): chronological manifest with resume -----------
 

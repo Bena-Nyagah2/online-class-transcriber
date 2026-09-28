@@ -223,6 +223,177 @@ def test_extract_slide_data_sends_single_image(mocker, tmp_path) -> None:
     assert result == "## Statutory\n- Theft Act 1968"  # fence-free extract
 
 
+def test_stage_one_raises_rather_than_storing_a_truncated_extract(
+    mocker, tmp_path
+) -> None:
+    """A slide that exhausted the 800-token budget is refused, not stored.
+
+    The manifest is Stage 3's ground truth. A partial extract written into it
+    does not announce itself as partial — Stage 3 reads "the extract stopped
+    here" as "the slide ended here" and reasons confidently from the gap. The
+    message must name the offending slide, because in a 90-slide deck the
+    filename is the only thing that tells an operator where to look.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Framework\n- Mens Rea\n- Actus Reus\n- Dolus Eventualis and then",
+        finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        synthesizer._extract_slide_data(slide_path)
+
+    message = str(excinfo.value)
+    assert "Stage 1 hit the token cap" in message
+    assert "slide_001.jpg" in message
+    assert "would be truncated" in message
+
+
+def test_stage_one_guard_does_not_disturb_the_request_budget(mocker, tmp_path) -> None:
+    """The guard is a pure check: the outgoing request is untouched.
+
+    Guards the requirement that adding the failsafe must not quietly relax the
+    budget to "stop the crash" or inherit Stage 3's 4096. The same 800/0.2 pair
+    has to go out on the request that trips the guard as on the one that
+    doesn't.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "cut off", finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    with pytest.raises(RuntimeError):
+        synthesizer._extract_slide_data(slide_path)
+
+    call = synthesizer.client.chat.completions.create.call_args
+    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["temperature"] == 0.2
+    assert call.kwargs["model"] == MAP_MODEL
+    # Still exactly one image, and no system prompt added for the map stage.
+    assert len(call.kwargs["messages"]) == 1
+    assert len(call.kwargs["messages"][0]["content"]) == 2
+
+
+def test_stage_one_truncation_is_not_retried(mocker, tmp_path) -> None:
+    """One truncated slide costs one call, not three.
+
+    Vision calls are the most expensive thing in the pipeline — 90 of them on a
+    full lecture. Retrying a deterministic cap hit triples the bill to produce
+    the identical failure.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "cut off", finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    with pytest.raises(RuntimeError):
+        synthesizer._extract_slide_data(slide_path)
+
+    assert synthesizer.client.chat.completions.create.call_count == 1
+
+
+def test_stage_one_guard_holds_against_the_real_openai_response_shape(
+    tmp_path,
+) -> None:
+    """Stage 1's guard is bound to the real SDK type, not just to a MagicMock.
+
+    Same reasoning as the Stage 3 equivalent. Every other test in this file
+    fabricates responses, and ``MagicMock`` invents any attribute — so a suite
+    built only on mocks stays green even if the SDK moves ``finish_reason``,
+    while production quietly stops guarding.
+    """
+    chat_completion = ChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": MAP_MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "## Framework\n- Mens Rea and then it stops",
+                    },
+                }
+            ],
+        }
+    )
+
+    synthesizer = LectureSynthesizer(api_key="test-key")
+    synthesizer.client = mock.MagicMock()
+    synthesizer.client.chat.completions.create.return_value = chat_completion
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    with pytest.raises(RuntimeError) as excinfo:
+        synthesizer._extract_slide_data(slide_path)
+
+    assert "slide_001.jpg" in str(excinfo.value)
+
+
+def test_truncated_stage_one_preserves_the_slides_already_extracted(
+    mocker, tmp_path
+) -> None:
+    """A mid-deck crash keeps every completed slide on disk and resumable.
+
+    This is what makes raising the right call at Stage 1. ``_build_slide_manifest``
+    flushes after each slide, so aborting on slide 2 of 3 must leave slide 1
+    written and must not write a partial entry for the slide that failed. A
+    re-run then resumes from slide 2 for the price of one vision call, not a
+    full re-extraction of the deck.
+    """
+    slides_dir = _write_slides(tmp_path, 3)
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Extract of slide one"),
+        _make_response(mocker, "Extract of slide two, truncated", finish_reason="length"),
+    ]
+    _neutralise_backoff(mocker)
+
+    with pytest.raises(RuntimeError):
+        synthesizer._build_slide_manifest(slides_dir, session_dir)
+
+    # The completed slide survives; the failed one left no trace.
+    manifest = (session_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
+    assert "slide_001.jpg" in manifest
+    assert "Extract of slide one" in manifest
+    assert "slide_002.jpg" not in manifest
+    assert "truncated" not in manifest
+    # Only two calls were spent: one good extract, one that failed.
+    assert synthesizer.client.chat.completions.create.call_count == 2
+
+    # And a re-run picks up exactly where it stopped. Only the two missing
+    # slides are re-extracted — slide_001 is skipped via the resume cache, so
+    # the delta is 2, not 3.
+    calls_before_rerun = synthesizer.client.chat.completions.create.call_count
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Extract of slide two"),
+        _make_response(mocker, "Extract of slide three"),
+    ]
+    synthesizer._build_slide_manifest(slides_dir, session_dir)
+
+    manifest = (session_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
+    assert "Extract of slide one" in manifest
+    assert "Extract of slide two" in manifest
+    assert "Extract of slide three" in manifest
+    # slide_001 was not re-extracted — only the two that were missing.
+    rerun_calls = (
+        synthesizer.client.chat.completions.create.call_count - calls_before_rerun
+    )
+    assert rerun_calls == 2
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 — chronological manifest with resume
 # ---------------------------------------------------------------------------
