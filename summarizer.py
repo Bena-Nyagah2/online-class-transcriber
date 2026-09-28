@@ -69,11 +69,42 @@ MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 MAP_MODEL = os.environ.get("MAP_MODEL", MODEL_NAME)
 REDUCE_MODEL = os.environ.get("REDUCE_MODEL", MODEL_NAME)
 
+# Nemotron 3.x (the current REDUCE_MODEL) reasons by default and writes that
+# chain-of-thought into ``content`` ahead of the document, which starves the
+# output budget and produces meta-commentary instead of notes. Off by default
+# because this pipeline wants the document, not the deliberation. Set
+# ``REDUCE_REASONING_ENABLED=1`` to turn it back on for a non-reasoning
+# ``REDUCE_MODEL``, or if you ever want the model to think before writing.
+#
+# Stage 1 is unaffected by design: ``MAP_MODEL`` is a Llama vision model with
+# no thinking mode, so sending the parameter there would be noise.
+REDUCE_REASONING_ENABLED = os.environ.get(
+    "REDUCE_REASONING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
 
 MIN_TRANSCRIPT_WORDS = 50
-MAX_TOKENS = 4000  # Stage 3: final synthesis over the full transcript + deck
+
+# Stage 3 token budget: the final synthesis merges the whole transcript plus the
+# whole slide deck into four mandated sections. 4000 was not enough -- a
+# reasoner model (Llama 3.1 70B and friends) often spends its first few hundred
+# tokens on a visible scratchpad before it starts the document, so the notes
+# lost their entire "Exam Preparation" section to a `finish_reason: "length"`
+# cut. 4096 is the round figure above that leak, and the STRICT OUTPUT FORMAT
+# DIRECTIVE at the head of SYSTEM_PROMPT attacks the same failure from the
+# other end by forbidding the scratchpad in the first place.
+#
+# If a real lecture still trips the cap, the failsafe in ``_call_synthesis``
+# will now crash rather than write a partial document. That crash is the
+# signal to raise this number -- or to switch REDUCE_MODEL to a model that
+# does not narrate its planning -- not to remove the check.
+MAX_TOKENS = 4096  # Stage 3: final synthesis over the full transcript + deck
+
+# Low temperature keeps the merge extractive rather than inventive, which is
+# what the grounding directive assumes. Applied to both stages: Stage 1 wants
+# faithful OCR, Stage 3 wants faithful synthesis.
 TEMPERATURE = 0.2
 
 MANIFEST_FILENAME = "slides_manifest.txt"
@@ -85,27 +116,49 @@ _SLIDE_HEADER_RE = re.compile(r"^### Slide: (?:\[[^\]]*\]\s*)?(.+)$", re.MULTILI
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
 
 SYSTEM_PROMPT = textwrap.dedent(
-    """\
-    You are an elite, highly engaging academic study assistant. You are receiving a chronological lecture transcript and a manifest of described visual slides.
+    """
+    STRICT OUTPUT FORMAT DIRECTIVE: Output ONLY the final Markdown document. Do NOT include preambles, drafting thoughts, scratchpads, or meta-commentary (e.g., NEVER output "Here's a thinking process:" or outline your planning steps). Your response MUST begin immediately with the exact characters "## Executive Summary".
 
-    Your mandate is to fuse these into a comprehensive, deeply analytical, and fun-to-read study guide.
+    You are a Tenured University Professor in Law and Criminology. You are receiving a chronological lecture transcript and a manifest of described visual slides. Your mandate is to produce a rigorous, structured academic study guide -- not a blog post, not a summary, and certainly not a hallucinated narrative.
 
     CRITICAL RULES:
-    1. **Read the Tone:** Look for semantic emphasis. If the lecturer repeats a concept, says "this is important", or if there are structural pauses (indicated by line breaks), highlight these as 🚨 **Core Concepts**.
-    2. **Visual Fusion:** When the transcript aligns with a described infographic or diagram from the slides, explain the visual relationship in context.
-    3. **Rich Formatting:** DO NOT output boring walls of text. You MUST use:
-       - **Markdown Tables** for any comparisons, pros/cons, or chronological events.
-       - **Blockquotes (>)** for major definitions or lecturer quotes.
-       - **Bold text** for key terminology.
-    4. **References:** Create a dedicated "📚 References, Statutes & Citations" appendix at the bottom containing every case, law, book, or paper mentioned.
+    1. **Structure is Mandatory.** The output MUST be organized into exactly these four Markdown sections, in this order, using ATX headings (##):
+       - ## Executive Summary
+       - ## Core Theories & Concepts
+       - ## Statutes, Case Law, & References
+       - ## Exam Preparation
+
+    2. **Executive Summary** -- A concise TL;DR of the lecture (150-250 words). No fluff, no rhetorical questions. State the central thesis, the key statutes discussed, and the practical takeaway for a practitioner.
+
+    3. **Core Theories & Concepts** -- For each major theory or concept lectured:
+       - Name it precisely (e.g., "Actus Reus", "Mens Rea", "Dolus Eventualis").
+       - Define it using the lecturer's own wording where possible, citing the transcript timestamp.
+       - Note any academic debates or competing interpretations raised in the lecture.
+       - Use **bold** for the concept name on first use.
+
+    4. **Statutes, Case Law, & References** -- Extract *explicitly* from OCR and audio. Each entry must include:
+       - Full citation, written as a *format template* with the real values substituted in: a statute as "<Act Name> <Year>, s. <section>"; a case as "<Case Name> [<Year>] <reporter> <page>". Never reproduce the template itself -- it contains no real authority.
+       - The context in which it was discussed (one sentence).
+       - Do NOT add citations the lecturer did not mention. This is absolute: if no authority was spoken or shown, the section says so and lists nothing. Never supply a citation from your own knowledge, however well known it is, and never reuse the format templates above as if they were real cases. If a slide shows an authority the lecturer skipped, note it as "[Slide reference only]".
+       - Use a Markdown table with columns: **Citation | Context | Source (Audio/Slide/Both)**.
+
+    5. **Exam Preparation** -- Generate exactly THREE high-level synthesis questions that:
+       - Require integrating multiple concepts from the lecture.
+       - Are answerable *only* from the provided material.
+       - Mirror the style of a final-year law school exam (problem question or essay prompt).
+       - Number them 1., 2., 3.
+
+    6. **Visual Fusion:** When the transcript aligns with a described infographic or diagram from the slides, explain the visual relationship in context. Do not describe the visual in isolation -- anchor it to the spoken argument.
+
+    7. **No Hallucinations, No Fluff.** The STRICT OUTPUT FORMAT DIRECTIVE, the STRICT GROUNDING DIRECTIVE and the SPEAKER IDENTIFICATION directives are all non-negotiable.
 
     STRICT GROUNDING DIRECTIVE: NEVER invent, infer, or hallucinate URLs, code snippets, or fictional narratives. If a slide shows code, transcribe exactly what is visible. If the audio topic entirely mismatches the visual slide, report both facts neutrally.
 
     SPEAKER IDENTIFICATION: Cross-reference the timestamps of the slides with the timestamps of the audio transcript. If a slide's OCR text reveals a person's name or title (e.g., a lower-third graphic) during the exact time a specific [SPEAKER_XX] is talking, deduce their identity and replace [SPEAKER_XX] with their real name in the final notes.
 
-    Make the formatting highly scannable, intellectually stimulating, and academically rigorous.
+    Your output will be graded on precision, legal accuracy, and utility to a student preparing for examinations.
     """
-)
+).strip()  # .strip() so the first directive is character 0, not character 1
 
 # Stage 1: sent alongside exactly one slide image.
 SLIDE_EXTRACT_PROMPT = (
@@ -144,6 +197,7 @@ class LectureSynthesizer:
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=NVIDIA_BASE_URL,
+            timeout=120.0,
         )
 
     # -- image encoding ----------------------------------------------------
@@ -200,13 +254,19 @@ class LectureSynthesizer:
         NVIDIA's endpoint accepts one image per request, so each slide is
         mapped independently. ``max_tokens=800`` is a deliberate cap — a
         single slide's extract is short, and keeping Stage 1 cheap leaves
-        room for the big Stage 3 synthesis.
+        room for the big Stage 3 synthesis. Because that budget is a cap
+        rather than a target, the response is checked for exhaustion and a
+        truncated extract is refused rather than written to the manifest.
 
         Args:
             image_path: Path to one captured slide JPEG.
 
         Returns:
             The extracted content as concise, fence-free Markdown.
+
+        Raises:
+            RuntimeError: If the model stopped at the token cap for this
+                slide. The partial extract is discarded rather than stored.
         """
         content = [
             {"type": "text", "text": SLIDE_EXTRACT_PROMPT},
@@ -221,7 +281,33 @@ class LectureSynthesizer:
             temperature=TEMPERATURE,
             max_tokens=800,
         )
-        return self._clean_markdown(response.choices[0].message.content or "")
+
+        # Symmetric to the Stage 3 failsafe, and for the same reason. A slide
+        # that ran out of budget at 800 tokens yields an extract that stops
+        # mid-sentence, and that partial text is about to be written into the
+        # manifest as though it were the whole slide. Stage 3 is then told to
+        # treat the manifest as ground truth -- a truncated extract does not
+        # read as "incomplete", it reads as "this is all the slide said", so
+        # the model will reason from a gap it cannot see. Failing here is the
+        # only honest option; the alternative launders missing content into
+        # confident wrong notes.
+        #
+        # The blast radius is bounded: ``_build_slide_manifest`` persists the
+        # manifest after every slide, so a crash here costs only the in-flight
+        # slide and a re-run resumes from the last good one.
+        #
+        # As in Stage 3, RuntimeError is absent from ``_RETRYABLE_ERRORS`` so
+        # tenacity re-raises immediately instead of spending two more calls to
+        # hit the same wall. The remedy is a larger 800 or a tighter
+        # SLIDE_EXTRACT_PROMPT, not a retry loop.
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                f"Stage 1 hit the token cap on {image_path.name} — "
+                "slide extract would be truncated."
+            )
+
+        return self._clean_markdown(choice.message.content or "")
 
     # -- Stage 2 (Accumulate): chronological manifest with resume -----------
 
@@ -336,11 +422,21 @@ class LectureSynthesizer:
     def _call_synthesis(self, prompt: str) -> str:
         """Send the merged transcript + slide text to the LLM (no images).
 
+        The call is deliberately pinned to ``max_tokens=4096`` and
+        ``temperature=0.2``. The budget is the outer guard against a truncated
+        document; the STRICT OUTPUT FORMAT DIRECTIVE is the inner one, since
+        every token a reasoner model spends narrating its own planning is a
+        token taken from the last section of the notes.
+
         Args:
             prompt: Fully assembled Stage 3 prompt.
 
         Returns:
             Raw markdown response from the model.
+
+        Raises:
+            RuntimeError: If the model stopped at the token cap. The partial
+                document is discarded rather than returned.
         """
         response = self.client.chat.completions.create(
             model=REDUCE_MODEL,
@@ -350,8 +446,54 @@ class LectureSynthesizer:
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
+            # Nemotron 3.x ships as a *reasoning* model: thinking is on by
+            # default, and the chain-of-thought is emitted inline in `content`
+            # rather than in a separate `reasoning` field. Left on, it spends
+            # the whole budget narrating its own plan -- the previous run of
+            # this session produced 112 lines in which everything before the
+            # document was "Here's a thinking process:", and not one heading.
+            #
+            # The STRICT OUTPUT FORMAT DIRECTIVE in SYSTEM_PROMPT cannot fix
+            # this. A model whose training makes CoT the default path does not
+            # reliably abandon it because a system prompt asked nicely; the
+            # switch has to be flipped at the API level. Disabling reasoning
+            # frees the entire budget for the four mandated sections, which is
+            # what MAX_TOKENS was sized for in the first place.
+            #
+            # Stage 1 is deliberately untouched: MAP_MODEL is a Llama vision
+            # model with no thinking mode, and the parameter is meaningless
+            # there. See REDUCE_REASONING_ENABLED below.
+            #
+            # Both branches send the parameter explicitly. Omitting it is NOT
+            # the same as disabling: Nemotron 3 defaults to thinking *on*, so
+            # a bare request would silently reintroduce the scratchpad.
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": REDUCE_REASONING_ENABLED
+                }
+            },
         )
-        return response.choices[0].message.content or ""
+
+        # A response that stopped because it ran out of budget is not a
+        # response. Left unchecked, the caller receives a document that simply
+        # stops mid-section -- normally losing "Exam Preparation", the last of
+        # the four mandated sections -- writes it to disk, and
+        # ``generate_notes`` still returns True. That is silent data loss
+        # wearing the costume of a clean run, and the reader has no way to tell
+        # the notes are incomplete.
+        #
+        # Raising rather than warning also keeps this out of the retry loop:
+        # RuntimeError is absent from ``_RETRYABLE_ERRORS``, so tenacity
+        # re-raises it on the first pass instead of spending three more
+        # full-length calls to hit the identical wall. Truncation is
+        # deterministic for a given prompt and transcript, so retrying is pure
+        # cost. The fix belongs at the budget (raise MAX_TOKENS) or the
+        # directive (stop the model leaking a scratchpad), not in a loop.
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError("Stage 3 hit the token cap — notes would be truncated.")
+
+        return choice.message.content or ""
 
     # -- public entry point ------------------------------------------------
 

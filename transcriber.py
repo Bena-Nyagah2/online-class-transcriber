@@ -87,12 +87,6 @@ discourse, so neither case is misclassified. Raise it only if transcripts
 still fragment mid-sentence; lower it if pauses are still being swallowed.
 """
 
-INITIAL_PROMPT: str = (
-    "This is a university law and criminology lecture in Kenya, "
-    "heavily mixing English and Swahili."
-)
-"""Primes the decoder with regional context for better code-switch handling."""
-
 
 def resolve_hf_token() -> str:
     """Read the Hugging Face token used by the diarization stage.
@@ -284,12 +278,11 @@ class LocalTranscriber:
         )
 
         # -- Stage A: transcribe ------------------------------------------
-        # The Swahili/English priming prompt must be injected through
-        # ``asr_options`` at load time. ``load_model`` builds the
-        # ``TranscriptionOptions`` once and merges this dict over its
-        # defaults, whereas ``FasterWhisperPipeline.transcribe()`` has no
-        # ``initial_prompt`` parameter of its own — passing it there raises
-        # TypeError against a real model.
+        # The Swahili/English priming prompt was removed (prompt lobotomy).
+        # Passing an initial_prompt to Whisper biases the decoder toward
+        # fluent, confident hallucinations — the very thing we are trying to
+        # kill. The engine now relies solely on the acoustic signal and the
+        # tuned VAD/log-prob thresholds to suppress invention.
         #
         # ``condition_on_previous_text=False`` is the single most effective
         # guard against Whisper's degenerate repetition loop: the decoder is
@@ -308,7 +301,6 @@ class LocalTranscriber:
         # ``load_model`` splats this dict into. The un-underscored
         # ``logprob_threshold`` is not a field and raises TypeError at load.
         asr_options = {
-            "initial_prompt": INITIAL_PROMPT,
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.5,
             "log_prob_threshold": -0.8,
