@@ -18,7 +18,6 @@ import pytest
 
 from transcriber import (
     HF_TOKEN_ENV,
-    INITIAL_PROMPT,
     LocalTranscriber,
     MAX_TURN_GAP_SECONDS,
     TRANSCRIPT_FILENAME,
@@ -321,6 +320,7 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     # The priming prompt rides in via asr_options at LOAD time. load_model
     # merges it into the TranscriptionOptions it builds; transcribe() has no
     # initial_prompt parameter, so passing it there is a TypeError.
+    # The prompt lobotomy: initial_prompt removed to prevent hallucination bias.
     # condition_on_previous_text=False breaks Whisper's repetition loop, the
     # lowered no_speech_threshold biases ambiguous audio toward silence, and
     # the raised log_prob_threshold drops segments the decoder is unsure of.
@@ -329,7 +329,6 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
         device="cpu",
         compute_type="int8",
         asr_options={
-            "initial_prompt": INITIAL_PROMPT,
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.5,
             "log_prob_threshold": -0.8,
@@ -386,15 +385,13 @@ def test_transcribe_audio_injects_prompt_via_asr_options(mocker, tmp_path) -> No
     LocalTranscriber().transcribe_audio(wav_path)
 
     load_kwargs = whisperx.load_model.call_args.kwargs
+    # Prompt lobotomy: initial_prompt must NOT be present in asr_options.
+    assert "initial_prompt" not in load_kwargs["asr_options"]
     assert load_kwargs["asr_options"] == {
-        "initial_prompt": INITIAL_PROMPT,
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.5,
         "log_prob_threshold": -0.8,
     }
-    # The Kenyan / code-switch context must survive the move.
-    assert "Kenya" in load_kwargs["asr_options"]["initial_prompt"]
-    assert "Swahili" in load_kwargs["asr_options"]["initial_prompt"]
 
     # And transcribe() must receive only arguments it actually accepts.
     transcribe_kwargs = whisperx.load_model.return_value.transcribe.call_args.kwargs

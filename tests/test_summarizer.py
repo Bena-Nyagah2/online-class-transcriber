@@ -14,6 +14,7 @@ import os
 from unittest import mock
 
 import pytest
+from openai.types.chat import ChatCompletion
 from PIL import Image
 
 import summarizer
@@ -42,11 +43,21 @@ def _make_synthesizer(mocker) -> LectureSynthesizer:
     return synthesizer
 
 
-def _make_response(mocker, content: str):
-    """A duck-typed chat completion response returning ``content``."""
+def _make_response(mocker, content: str, finish_reason: str = "stop"):
+    """A duck-typed chat completion response returning ``content``.
+
+    ``finish_reason`` defaults to ``"stop"``, the success case. It is named
+    explicitly because a bare ``MagicMock`` attribute never compares equal to
+    ``"length"``: a helper that left it unset would make Stage 3's truncation
+    guard untriggerable in every test, and the guard would look covered while
+    being dead code.
+    """
     response = mocker.MagicMock()
     response.choices = [
-        mocker.MagicMock(message=mocker.MagicMock(content=content))
+        mocker.MagicMock(
+            message=mocker.MagicMock(content=content),
+            finish_reason=finish_reason,
+        )
     ]
     return response
 
@@ -538,14 +549,26 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
 
     # Stage 3 call: TEXT ONLY — a plain str, no image elements.
     reduce_call = calls[2]
-    assert reduce_call.kwargs["max_tokens"] == 4000
+    # 4096, not the old 4000: a reasoner model that leaks its scratchpad eats
+    # the budget and the notes lose their final section to a length cut.
+    assert reduce_call.kwargs["max_tokens"] == 4096
+    assert reduce_call.kwargs["temperature"] == 0.2
     assert reduce_call.kwargs["model"] == REDUCE_MODEL
     assert reduce_call.kwargs["messages"][0]["role"] == "system"
     system_content = reduce_call.kwargs["messages"][0]["content"]
     assert system_content == SYSTEM_PROMPT
-    # The reduce stage must demand rich formatting and a references appendix.
-    assert "Markdown Tables" in system_content
-    assert "References, Statutes & Citations" in system_content
+    # Zero-preamble guard. The directive must lead the prompt, before the
+    # persona line, so it is the first thing the decoder is conditioned on.
+    assert system_content.startswith("STRICT OUTPUT FORMAT DIRECTIVE:")
+    assert (
+        'Your response MUST begin immediately with the exact characters '
+        '"## Executive Summary".' in system_content
+    )
+    # The new professor persona requires these structural elements:
+    assert "## Executive Summary" in system_content
+    assert "## Core Theories & Concepts" in system_content
+    assert "## Statutes, Case Law, & References" in system_content
+    assert "## Exam Preparation" in system_content
     # Anti-hallucination guard for broadcast/weather edge cases: no invented
     # URLs, code, or narrative filler; mismatched audio/slide pairs get
     # reported as two separate facts rather than reconciled into fiction.
@@ -557,6 +580,9 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     assert "SPEAKER IDENTIFICATION" in system_content
     assert "[SPEAKER_XX]" in system_content
     assert "lower-third graphic" in system_content
+    # Three synthesis questions for exam preparation
+    assert "exactly THREE" in system_content
+    assert "final-year law school exam" in system_content
 
     user_content = reduce_call.kwargs["messages"][1]["content"]
     assert isinstance(user_content, str)
@@ -564,6 +590,234 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     assert transcript_text in user_content
     assert "### Slide: slide_001.jpg" in user_content
     assert "Content of slide two" in user_content
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 sampling budget
+# ---------------------------------------------------------------------------
+
+
+def test_synthesis_pins_token_budget_and_low_temperature(mocker) -> None:
+    """``_call_synthesis`` sends max_tokens=4096 and temperature=0.2.
+
+    Pinned directly against the call rather than through ``generate_notes``,
+    because this is the one number that decides whether the notes survive at
+    all: a model that spends the first few hundred tokens narrating its own
+    planning is spending them out of the last section of the document. 4000 was
+    not enough headroom; 4096 is.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Executive Summary\nA lecture."
+    )
+    _neutralise_backoff(mocker)
+
+    result = synthesizer._call_synthesis("transcript + manifest")
+
+    assert result == "## Executive Summary\nA lecture."
+    call = synthesizer.client.chat.completions.create.call_args
+    assert call.kwargs["max_tokens"] == 4096
+    assert call.kwargs["temperature"] == 0.2
+
+
+def test_synthesis_token_budget_matches_the_module_constant(mocker) -> None:
+    """The literal 4096 in the call must be the module's documented budget.
+
+    Guards against the constant and the call site drifting apart, and records
+    *why* the number is 4096 rather than a rounder, cheaper figure.
+    """
+    assert summarizer.MAX_TOKENS == 4096
+    assert summarizer.TEMPERATURE == 0.2
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Executive Summary"
+    )
+    _neutralise_backoff(mocker)
+
+    synthesizer._call_synthesis("prompt")
+    call = synthesizer.client.chat.completions.create.call_args
+    assert call.kwargs["max_tokens"] == summarizer.MAX_TOKENS
+    assert call.kwargs["temperature"] == summarizer.TEMPERATURE
+
+
+def test_system_prompt_opens_with_the_zero_preamble_directive() -> None:
+    """The no-scratchpad directive leads the prompt, ahead of the persona.
+
+    Placement is the whole mechanism. A grounding rule buried at the end of a
+    long prompt competes with everything above it for the decoder's attention;
+    the first line is unconditionally the strongest conditioning the API
+    offers, so the format ban goes there.
+    """
+    assert SYSTEM_PROMPT.startswith("STRICT OUTPUT FORMAT DIRECTIVE:")
+    assert 'NEVER output "Here\'s a thinking process:"' in SYSTEM_PROMPT
+    assert "Do NOT include preambles, drafting thoughts, scratchpads" in SYSTEM_PROMPT
+    # It must precede the persona, and the grounding/fusion directives must
+    # still be present after it.
+    assert SYSTEM_PROMPT.index("Tenured University Professor") > 0
+    assert "STRICT GROUNDING DIRECTIVE" in SYSTEM_PROMPT
+    assert "SPEAKER IDENTIFICATION" in SYSTEM_PROMPT
+
+
+def test_stage_one_keeps_its_own_small_budget(mocker, tmp_path) -> None:
+    """Stage 1 is not swept up in the Stage 3 budget bump.
+
+    A 90-slide lecture issues 90 vision calls. Lifting each from 800 to 4096
+    tokens is a 5x cost increase on the stage that has no truncation problem
+    -- a single slide never needs more than ~800 tokens of extract. The two
+    budgets are deliberately different.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Statutory\n- Theft Act 1968"
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    synthesizer._extract_slide_data(slide_path)
+
+    call = synthesizer.client.chat.completions.create.call_args
+    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["temperature"] == 0.2
+
+
+def test_synthesis_raises_rather_than_returning_a_truncated_document(mocker) -> None:
+    """A ``finish_reason`` of "length" is a hard failure, not a short answer.
+
+    The whole point of the failsafe: the model burned its budget and stopped
+    mid-document, so the notes are missing their last section. Handing those
+    partial notes back lets them reach disk and be read as complete.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker,
+        "## Executive Summary\nThe lecture opened with mens rea, and then it just\n"
+        "## Core Theories & Concepts\n- Actus Reus\n- Mens Rea\n- Dolus Eventualis\n- A",
+        finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        synthesizer._call_synthesis("transcript + manifest")
+
+    assert str(excinfo.value) == (
+        "Stage 3 hit the token cap — notes would be truncated."
+    )
+
+
+def test_truncation_is_not_retried(mocker) -> None:
+    """The failsafe must not burn three more full-length calls on the same wall.
+
+    Truncation is deterministic for a fixed prompt, so a retry can only
+    reproduce it while tripling the spend. ``RuntimeError`` is deliberately
+    outside ``_RETRYABLE_ERRORS`` so tenacity re-raises it immediately; this
+    test is what stops someone "helpfully" adding it to that tuple later.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Executive Summary\ncut off here",
+        finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    with pytest.raises(RuntimeError):
+        synthesizer._call_synthesis("transcript + manifest")
+
+    assert synthesizer.client.chat.completions.create.call_count == 1
+    assert RuntimeError not in summarizer._RETRYABLE_ERRORS
+
+
+def test_synthesis_returns_content_on_a_clean_stop(mocker) -> None:
+    """The happy path is untouched: a "stop" response flows through as before.
+
+    Guards the guard — a failsafe wired to the wrong condition would turn every
+    successful run into a crash.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker,
+        "## Executive Summary\nComplete.\n\n## Exam Preparation\n1. Question?",
+        finish_reason="stop",
+    )
+    _neutralise_backoff(mocker)
+
+    result = synthesizer._call_synthesis("transcript + manifest")
+
+    assert result.startswith("## Executive Summary")
+    assert "## Exam Preparation" in result
+
+
+def test_truncated_synthesis_writes_no_notes_file(mocker, tmp_path) -> None:
+    """End-to-end: a truncated Stage 3 leaves no study notes on disk.
+
+    ``generate_notes`` writes its output only after ``_call_synthesis``
+    returns, so the crash has to happen before that write. Asserting the file
+    is *absent* is the difference between "the run failed loudly" and "the run
+    failed but left a plausible-looking broken artifact behind".
+    """
+    transcript_path = tmp_path / "transcript.txt"
+    transcript_path.write_text(
+        " ".join(["word"] * (summarizer.MIN_TRANSCRIPT_WORDS + 10)),
+        encoding="utf-8",
+    )
+    slides_dir = _write_slides(tmp_path, 1)
+    output_path = tmp_path / "study_notes.md"
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Content of slide one"),
+        _make_response(mocker, "## Executive Summary\nTrunc", finish_reason="length"),
+    ]
+    _neutralise_backoff(mocker)
+
+    with pytest.raises(RuntimeError):
+        synthesizer.generate_notes(transcript_path, output_path, slides_dir)
+
+    assert not output_path.exists()
+
+
+def test_truncation_guard_holds_against_the_real_openai_response_shape() -> None:
+    """The guard is pinned to the real SDK type, not only to our own mock.
+
+    Everything else in this module fabricates responses with ``MagicMock``, so
+    a test suite built on mocks would happily keep passing if the SDK renamed or
+    moved ``finish_reason`` -- the production guard would stop firing and the
+    tests would never notice. This builds an actual ``ChatCompletion`` and drives
+    the real method, so an SDK contract change breaks the build instead of
+    silently disarming the failsafe.
+
+    Note the field lives on the ``Choice`` submodel, not on ``ChatCompletion``
+    itself, so the guard has to read ``choices[0].finish_reason``.
+    """
+    chat_completion = ChatCompletion.model_validate(
+        {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": REDUCE_MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "## Executive Summary\nThe lecture opened and then",
+                    },
+                }
+            ],
+        }
+    )
+
+    synthesizer = LectureSynthesizer(api_key="test-key")
+    synthesizer.client = mock.MagicMock()
+    synthesizer.client.chat.completions.create.return_value = chat_completion
+
+    with pytest.raises(RuntimeError) as excinfo:
+        synthesizer._call_synthesis("transcript + manifest")
+
+    assert str(excinfo.value) == (
+        "Stage 3 hit the token cap — notes would be truncated."
+    )
 
 
 # ---------------------------------------------------------------------------
