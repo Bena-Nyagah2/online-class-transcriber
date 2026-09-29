@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from recorder import AudioRecorder
-from transcriber import LocalTranscriber, TRANSCRIPT_FILENAME
+from transcriber import (
+    DEFAULT_LANGUAGE,
+    LocalTranscriber,
+    TRANSCRIPT_FILENAME,
+)
 from summarizer import LectureSynthesizer
 from vision import SlideCatcher
 
@@ -168,6 +172,40 @@ def prompt_course_code() -> str:
                 f"  [yellow]Note: using [bold]{safe!r}[/bold] as the folder name.[/yellow]"
             )
         return safe
+
+
+def prompt_language(default: str = DEFAULT_LANGUAGE) -> str:
+    """Prompt for the spoken language, falling back to ``default`` on Enter.
+
+    WhisperX can detect the language itself, but that costs an extra model pass
+    over the opening 30 s, so the code is asked for up front instead. An empty
+    answer is the documented "just use the default" path rather than an error —
+    the overwhelming majority of lectures are English, and making the operator
+    type ``en`` every run trains them to mash Enter without reading.
+
+    The value is lower-cased because Whisper's language codes are ISO-639-1
+    and a capitalised ``EN`` is not recognised. Length is bounded to two
+    characters to catch a pasted sentence before it reaches the decoder, where
+    it would fail as an opaque error deep in CTranslate2.
+
+    Args:
+        default: Code used when the operator just presses Enter.
+
+    Returns:
+        A normalised, lower-case language code.
+    """
+    raw = input(
+        f"Language Code [Press Enter for {default!r}]: "
+    ).strip().lower()
+    if not raw:
+        return default
+    if len(raw) > 2:
+        console.print(
+            f"  [yellow]Using [bold]{default!r}[/bold] — expected a 2-letter "
+            f"code like 'en' or 'sw', not a whole phrase.[/yellow]"
+        )
+        return default
+    return raw
 
 
 def create_output_dir(course_code: str) -> Path:
@@ -313,8 +351,26 @@ def _interrupt_protected(label: str, fn: Callable[[], Any]) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def main(language: str | None = None) -> int:
     """Run the Phase 4 pipeline: record → transcribe → synthesize.
+
+    Args:
+        language: Spoken-language code forwarded to the transcriber, or
+            ``None`` to prompt for it interactively. Skipping language
+            detection is a deliberate speed trade; see
+            :data:`transcriber.DEFAULT_LANGUAGE`.
+
+            ``None`` rather than a literal default is what makes the prompt
+            order work. The alternative -- prompting in the ``__main__`` block
+            and passing the result in, e.g. ``main(prompt_language())`` -- is
+            correct Python but asks the *language* question first, because
+            arguments are evaluated before the call. That put the language
+            prompt above the course code, and the two questions are related
+            enough that whoever is recording a Swahili lecture should name the
+            course before being told the language. The prompt therefore lives
+            here, where it can be ordered against :func:`prompt_course_code`,
+            and a caller who already knows the language can skip the question
+            entirely by passing it.
 
     Returns:
         Process exit code: 0 success, 1 error, 130 cancelled/interrupted.
@@ -323,9 +379,11 @@ def main() -> int:
     _enable_windows_ansi()
     print_warning_banner()
 
-    # ---- setup: course code + output directory (Phase 1 logic) ------------
+    # ---- setup: course code, then language, then output directory ---------
     _stage(STAGE_INIT)
     course_code = prompt_course_code()
+    if language is None:
+        language = prompt_language()
     output_dir = create_output_dir(course_code)
     wav_path = output_dir / "raw_audio.wav"
     backup_path = output_dir / "emergency_backup.wav"
@@ -419,7 +477,7 @@ def main() -> int:
         with _spinner("[bold yellow]Transcribing and diarizing...[/bold yellow]"):
             _interrupt_protected(
                 "transcription",
-                lambda: transcriber.transcribe_audio(wav_path),
+                lambda: transcriber.transcribe_audio(wav_path, language=language),
             )
         console.print(
             "[bold green]✓[/bold green] Transcription complete → "
@@ -463,6 +521,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        # The language prompt is *not* made here. Doing so -- e.g.
+        # ``main(prompt_language())`` -- is correct Python but evaluates the
+        # argument before main() is entered, which asks for the language before
+        # the course code. ``main()`` prompts for it, in order, instead; pass
+        # ``main(language="sw")`` to skip the question entirely.
         raise SystemExit(main())
     except (KeyboardInterrupt, EOFError):
         console.print("\n[bold yellow]Cancelled — exiting.[/bold yellow]")

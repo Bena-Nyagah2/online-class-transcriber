@@ -26,16 +26,21 @@ genuinely exercised -- only the destination changes.
 from __future__ import annotations
 
 import io
+import os
+import subprocess
 import sys
 import time
 import types
 from pathlib import Path
 from unittest import mock
 
+ROOT = Path(__file__).resolve().parent.parent
+
 import pytest
 from rich.console import Console
 
 import main as m
+from transcriber import DEFAULT_LANGUAGE
 
 # Spinner glyphs rich cycles through for the "dots" spinner. Seeing more than
 # one proves the live display actually repainted rather than printing once.
@@ -145,10 +150,16 @@ def session(tmp_path, monkeypatch):
 
     ``main()`` refuses to run the AI phases unless the WAV exists and is
     non-empty, so it is pre-seeded rather than relying on the recorder fake.
+
+    ``prompt_language`` is stubbed for the same reason as ``prompt_course_code``:
+    ``main()`` now prompts for the language when called with no argument, and an
+    unmocked ``input()`` raises ``OSError`` under pytest's capture. Returning
+    :data:`DEFAULT_LANGUAGE` models an operator pressing Enter.
     """
     (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
     monkeypatch.setattr(m, "create_output_dir", lambda code: tmp_path)
     monkeypatch.setattr(m, "prompt_course_code", lambda: "CRM_1106")
+    monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
     monkeypatch.setattr(m, "select_device", lambda recorder: 0)
     monkeypatch.setattr(m, "_confirm_overwrite", lambda path: True)
     return tmp_path
@@ -162,7 +173,11 @@ def _stub_engines(slow: float | None = None):
             time.sleep(slow)
 
     transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = lambda p: (_block(), p)[1]
+    # Accepts the ``language=`` keyword that main() now forwards; a bare
+    # positional lambda would fail here the moment routing is added.
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: (_block(), p)[1]
+    )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = lambda *a: _block()
     return (
@@ -350,6 +365,7 @@ def test_no_devices_message_goes_to_stderr(consoles, tmp_path, monkeypatch):
     out, err = consoles
     monkeypatch.setattr(m, "create_output_dir", lambda code: tmp_path)
     monkeypatch.setattr(m, "prompt_course_code", lambda: "CRM_1106")
+    monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
     monkeypatch.setattr(m, "_confirm_overwrite", lambda path: True)
     with mock.patch.object(m, "AudioRecorder", EmptyDeviceRecorder):
         with pytest.raises(SystemExit) as excinfo:
@@ -408,7 +424,9 @@ def test_transcription_runs_before_synthesis(consoles, session):
     """
     order: list[str] = []
     transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = lambda p: order.append("t")
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: order.append("t")
+    )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = lambda *a: order.append("s")
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
@@ -456,6 +474,88 @@ def test_synthesis_value_error_reports_transcript_path(consoles, session):
     assert m.TRANSCRIPT_FILENAME in text
 
 
+def test_main_forwards_language_to_the_transcriber(consoles, session):
+    """The CLI's language choice must reach ``transcribe_audio``.
+
+    Routing regression guard: ``main()`` takes the code and ``transcriber``
+    consumes it, and nothing in between re-derives or drops it. A wrong code
+    does not crash the decoder — it returns fluent text in the wrong language.
+    """
+    # NOTE: ``_stub_engines`` also patches LocalTranscriber, and because that
+    # patcher is applied *after* the one under test it would silently win --
+    # leaving ``transcriber.call_args`` as None. Only the synthesizer is stubbed.
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    transcriber = mock.MagicMock()
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: p
+    )
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         mock.patch.object(m, "LocalTranscriber", transcriber), \
+         mock.patch.object(m, "LectureSynthesizer", synth):
+        assert m.main(language="sw") == 0
+    assert transcriber.return_value.transcribe_audio.call_args.kwargs == {
+        "language": "sw"
+    }
+
+
+def test_main_prompts_and_falls_back_to_english_on_empty_answer(
+    consoles, session, monkeypatch
+):
+    """``main()`` with no argument prompts, and Enter yields the default.
+
+    An unset language is not a neutral default: WhisperX falls back to
+    ``detect_language()``, an extra model pass this change exists to skip. So
+    the prompt must resolve to a real code, never ``""`` -- an empty string is
+    falsy and would re-enable detection anyway.
+    """
+    # See the note in test_main_forwards_language_to_the_transcriber: stubbing
+    # LocalTranscriber twice would let the later patcher win.
+    monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
+    transcriber = mock.MagicMock()
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: p
+    )
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         mock.patch.object(m, "LocalTranscriber", transcriber), \
+         mock.patch.object(m, "LectureSynthesizer", synth):
+        m.main()
+    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
+        "language"
+    ] == DEFAULT_LANGUAGE
+
+
+def test_explicit_language_skips_the_prompt_entirely(consoles, session, mocker):
+    """Passing a language must not ask the operator anything.
+
+    The prompt moved inside ``main()`` to fix the ordering, which means
+    ``main()`` now reads stdin on the default path. A caller that already knows
+    the language -- a scheduled run, a test, a repeat of the same lecture --
+    must be able to bypass that, or every automated invocation now hangs on a
+    question nobody is there to answer.
+    """
+    ask = mocker.patch.object(m, "prompt_language")
+    transcriber = mock.MagicMock()
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: p
+    )
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         mock.patch.object(m, "LocalTranscriber", transcriber), \
+         mock.patch.object(m, "LectureSynthesizer", synth):
+        assert m.main(language="sw") == 0
+    ask.assert_not_called()
+    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
+        "language"
+    ] == "sw"
+
+
 def test_double_ctrl_c_during_synthesis_returns_130(consoles, session):
     """Second interrupt must exit 130 and point at the preserved output dir."""
     out, _ = consoles
@@ -483,7 +583,7 @@ def test_single_ctrl_c_retries_the_phase_once(consoles, session):
     """
     attempts: list[int] = []
 
-    def flaky(_path):
+    def flaky(_path, language=None):
         attempts.append(1)
         if len(attempts) == 1:
             raise KeyboardInterrupt
@@ -508,6 +608,7 @@ def test_empty_wav_skips_ai_phases(consoles, tmp_path, monkeypatch):
     (tmp_path / "raw_audio.wav").write_bytes(b"")  # exists but zero bytes
     monkeypatch.setattr(m, "create_output_dir", lambda code: tmp_path)
     monkeypatch.setattr(m, "prompt_course_code", lambda: "CRM_1106")
+    monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
     monkeypatch.setattr(m, "select_device", lambda recorder: 0)
     monkeypatch.setattr(m, "_confirm_overwrite", lambda path: True)
     out, _ = consoles
@@ -526,6 +627,173 @@ def test_empty_wav_skips_ai_phases(consoles, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # 6. No stray output during the test run
 # ---------------------------------------------------------------------------
+
+
+def test_prompt_language_defaults_on_empty_enter(monkeypatch):
+    """Pressing Enter must yield the default, not an empty string.
+
+    An empty string would reach Whisper as ``language=""``, which is falsy and
+    so re-enables ``detect_language()`` — the exact cost this prompt removes.
+    """
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    assert m.prompt_language() == DEFAULT_LANGUAGE
+
+
+def test_prompt_language_normalises_case(monkeypatch):
+    """Whisper's codes are lower-case; a pasted 'EN' must be accepted."""
+    monkeypatch.setattr("builtins.input", lambda *a: "  SW  ")
+    assert m.prompt_language() == "sw"
+
+
+def test_prompt_language_honours_a_custom_default(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    assert m.prompt_language(default="fr") == "fr"
+
+
+def test_prompt_language_falls_back_on_absurd_input(monkeypatch):
+    """A pasted sentence falls back to the default.
+
+    Silently accepting one would otherwise fail as an opaque CTranslate2 error
+    deep inside the decoder, long after the recording is already written.
+    """
+    monkeypatch.setattr("builtins.input", lambda *a: "english please")
+    assert m.prompt_language() == DEFAULT_LANGUAGE
+
+
+def test_course_code_is_asked_before_the_language(consoles, tmp_path, mocker):
+    """The course code prompt must come first; the language prompt second.
+
+    This ordering is the whole reason the prompt moved out of the ``__main__``
+    block. ``main(prompt_language())`` is valid Python and asks for the language
+    *first*, because arguments are evaluated before the call is entered. The
+    failure is silent: the pipeline still runs, just with the answers attached
+    to the wrong questions.
+
+    Asserted by recording the prompt strings in the order they are issued,
+    rather than by checking the final language value -- that value is right in
+    both orderings, so only the sequence distinguishes them.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+    mocker.patch.object(m, "create_output_dir", lambda code: tmp_path)
+    mocker.patch.object(m, "select_device", lambda r: 0)
+    mocker.patch.object(m, "_confirm_overwrite", lambda p: True)
+
+    asked: list[str] = []
+
+    def _course() -> str:
+        asked.append("course")
+        return "CRM_1106"
+
+    def _language(default=DEFAULT_LANGUAGE) -> str:
+        asked.append("language")
+        return "sw"
+
+    mocker.patch.object(m, "prompt_course_code", _course)
+    mocker.patch.object(m, "prompt_language", _language)
+
+    transcriber = mock.MagicMock()
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: p
+    )
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         mock.patch.object(m, "LocalTranscriber", transcriber), \
+         mock.patch.object(m, "LectureSynthesizer", synth):
+        assert m.main() == 0
+
+    assert asked == ["course", "language"]
+    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
+        "language"
+    ] == "sw"
+
+
+def test_cli_entrypoint_prompts_and_forwards_the_language(tmp_path):
+    """The real ``__main__`` path must prompt, then forward the answer.
+
+    Asserted by executing the module as a script, not by hand-writing
+    ``main()``'s internals the way the ``__main__`` block relies on them. A test
+    that restates the production wiring proves nothing *about* the wiring: when
+    the CLI stopped calling into ``main()``, the hand-written version kept
+    passing, and a mutation run confirmed that mutant survived. Running the real
+    entry point means removing the prompt genuinely fails here.
+
+    NOTE ``monkeypatch`` is deliberately not a parameter -- see the patching
+    note below for why in-process patching cannot reach the CLI path.
+    """
+    wav = tmp_path / "raw_audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 200)
+
+    # NOTE the patching strategy. ``runpy.run_module(..., run_name="__main__")``
+    # re-executes main.py into a *fresh* module namespace, so patching the
+    # already-imported ``main`` object in this process would be silently
+    # discarded. The engines are therefore patched at their defining modules
+    # (``recorder``/``transcriber``/``summarizer``/``vision``), which
+    # main.py's own ``from X import Y`` lines pick up when it runs.
+    #
+    # Functions defined *inside* main.py (create_output_dir, prompt_course_code,
+    # select_device, _confirm_overwrite) cannot be patched this way, so their
+    # prompts are answered through a scripted stdin instead. cwd is redirected
+    # so the real create_output_dir writes into tmp_path, not the repo.
+    script = f'''\
+import builtins, contextlib, io, os, runpy, sys, types
+from unittest import mock
+sys.path.insert(0, {str(ROOT)!r})
+import recorder, transcriber, summarizer, vision
+
+class R:
+    def __init__(self, **k):
+        self.is_recording = types.SimpleNamespace(is_set=lambda: False)
+    def get_loopback_devices(self):
+        return [types.SimpleNamespace(name="Spk", channels=2)]
+    def start_recording(self, i): pass
+    def stop_recording(self, p): p.write_bytes(b"RIFF" + b"\\0" * 200)
+
+class C:
+    slides_dir = "slides"
+    def __init__(self, **k): pass
+    def start(self): pass
+    def stop(self): return ["a.jpg"]
+
+captured = {{}}
+def cap(p, language=None):
+    captured["language"] = language
+    return p
+
+T = mock.MagicMock()
+T.return_value.transcribe_audio.side_effect = cap
+S = mock.MagicMock()
+S.return_value.generate_notes.return_value = True
+
+recorder.AudioRecorder = R
+vision.SlideCatcher = C
+transcriber.LocalTranscriber = T
+summarizer.LectureSynthesizer = S
+
+# Prompt order, as main() now issues them: course code, language, overwrite
+# confirmation, device index. Getting this list wrong does not crash -- it
+# feeds each answer to the wrong question, and the pipeline still "succeeds".
+answers = iter(["CRM_1106", "sw", "y", "0"])
+builtins.input = lambda *a: next(answers)
+
+os.chdir({str(wav.parent)!r})
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        runpy.run_module("main", run_name="__main__")
+except SystemExit:
+    pass
+print("CAPTURED_LANG=" + repr(captured.get("language")))
+'''
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(ROOT), capture_output=True, text=True, env={**os.environ},
+    )
+    assert "CAPTURED_LANG='sw'" in proc.stdout, (
+        f"language not forwarded from the CLI prompt.\n"
+        f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
+    )
 
 
 def test_module_defines_no_bare_print_calls():
