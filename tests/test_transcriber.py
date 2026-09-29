@@ -14,9 +14,17 @@ audio hardware, no Hugging Face token:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+import transcriber
 from transcriber import (
+    BATCH_SIZE,
+    BATCH_SIZE_ENV,
+    COMPUTE_TYPE,
+    COMPUTE_TYPE_ENV,
+    DEFAULT_LANGUAGE,
     HF_TOKEN_ENV,
     LocalTranscriber,
     MAX_TURN_GAP_SECONDS,
@@ -24,6 +32,8 @@ from transcriber import (
     UNKNOWN_SPEAKER,
     _format_turns,
     format_timestamp,
+    resolve_batch_size,
+    resolve_compute_type,
     resolve_hf_token,
 )
 
@@ -327,7 +337,7 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     whisperx.load_model.assert_called_once_with(
         "base",
         device="cpu",
-        compute_type="int8",
+        compute_type=transcriber.compute_type,
         asr_options={
             "condition_on_previous_text": False,
             "no_speech_threshold": 0.5,
@@ -339,11 +349,14 @@ def test_transcribe_audio_runs_all_three_stages(mocker, tmp_path) -> None:
     assert transcribe_call.args[0] == whisperx.load_audio.return_value
     # Regression guard: the prompt must NOT be passed to transcribe() again.
     assert "initial_prompt" not in transcribe_call.kwargs
-    # Regression guard: no language pin, so WhisperX auto-detects instead of
-    # translating Swahili into English. See the pinning note in transcribe_audio.
-    assert "language" not in transcribe_call.kwargs
+    # The language is now supplied explicitly to skip detect_language().
+    assert transcribe_call.kwargs["language"] == "en"
+    assert transcribe_call.kwargs["batch_size"] == transcriber.batch_size
+    # load_model() must still take no language: a preset there builds the
+    # tokenizer eagerly, and the per-call value is the only place that needs it.
+    assert "language" not in whisperx.load_model.call_args.kwargs
 
-    # -- Stage B: alignment keyed on the detected language ------------------
+    # -- Stage B: alignment keyed on the caller's language -------------------
     whisperx.load_align_model.assert_called_once_with(language_code="en", device="cpu")
     align_call = whisperx.align.call_args
     assert align_call.args[0] == segments      # segments first
@@ -408,31 +421,178 @@ def test_transcribe_audio_injects_prompt_via_asr_options(mocker, tmp_path) -> No
     }, f"unsupported kwargs for FasterWhisperPipeline.transcribe: {transcribe_kwargs}"
 
 
-def test_language_is_not_pinned_so_whisper_transcribes_rather_than_translates(
-    mocker, tmp_path
-) -> None:
-    """Neither load_model nor transcribe may preset a language.
+def test_explicit_language_is_routed_to_asr_and_alignment(mocker, tmp_path) -> None:
+    """A non-English code must reach *both* the decoder and the aligner.
 
-    WhisperX decides between *transcribing* and *translating* purely from the
-    language it is handed. With ``language="en"`` on a Swahili lecture, Whisper
-    does not fail — it dutifully produces fluent English, so the bug is silent:
-    the transcript looks plausible and every word timestamp is anchored to the
-    wrong language. Leaving both call sites unset is what lets the pipeline's
-    ``detect_language()`` run.
+    Passing a wrong language to Whisper does not raise — it silently returns
+    fluent text in the wrong language, and every word timestamp is then
+    anchored to a phoneme model for the wrong language too. So the code the
+    operator typed has to arrive at both stages, not just the first.
 
-    Asserted on both channels because either one alone is enough to pin it: a
-    preset at load time builds the tokenizer eagerly, and a per-call value
-    overrides it.
+    ``load_model`` is asserted separately: it must *not* receive the language,
+    because a preset there builds the tokenizer eagerly and would override the
+    per-call value.
     """
     wav_path = _write_wav(tmp_path)
     whisperx, _pipeline, _assign = _make_whisperx(
-        mocker, [{"start": 0.0, "end": 1.0, "text": "habari"}]
+        mocker, [{"start": 0.0, "end": 1.0, "text": "habari"}], language="sw"
     )
 
-    LocalTranscriber().transcribe_audio(wav_path)
+    LocalTranscriber().transcribe_audio(wav_path, language="sw")
 
+    transcribe_kwargs = whisperx.load_model.return_value.transcribe.call_args.kwargs
+    assert transcribe_kwargs["language"] == "sw"
+    whisperx.load_align_model.assert_called_once_with(
+        language_code="sw", device="cpu"
+    )
     assert "language" not in whisperx.load_model.call_args.kwargs
-    assert "language" not in whisperx.load_model.return_value.transcribe.call_args.kwargs
+
+
+def test_alignment_language_is_not_laundered_from_the_result(mocker, tmp_path) -> None:
+    """The aligner uses the requested code, not ``result["language"]``.
+
+    WhisperX echoes the *requested* language back in its result dict, so
+    reading it there is a no-op that looks like validation. Worse, it would
+    silently "confirm" a bad guess: a Swahili lecture transcribed as ``en``
+    reports ``language="en"``, and any future code trusting the result would
+    bake the error in. The mock below reports a deliberately different code so
+    a regression is visible.
+    """
+    wav_path = _write_wav(tmp_path)
+    whisperx, _pipeline, _assign = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "habari"}], language="en"
+    )
+
+    LocalTranscriber().transcribe_audio(wav_path, language="sw")
+
+    # Requested "sw" must win even though the result claims "en".
+    whisperx.load_align_model.assert_called_once_with(
+        language_code="sw", device="cpu"
+    )
+
+
+def test_batch_size_routes_to_transcribe(mocker, tmp_path) -> None:
+    """Batching is the main throughput lever and must reach the decoder."""
+    wav_path = _write_wav(tmp_path)
+    whisperx, _pipeline, _assign = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    )
+
+    LocalTranscriber(batch_size=32).transcribe_audio(wav_path)
+
+    kwargs = whisperx.load_model.return_value.transcribe.call_args.kwargs
+    assert kwargs["batch_size"] == 32
+
+
+# ---------------------------------------------------------------------------
+# Compute type / batch size resolution
+# ---------------------------------------------------------------------------
+
+
+def test_compute_type_defaults_when_env_unset(monkeypatch) -> None:
+    monkeypatch.delenv(COMPUTE_TYPE_ENV, raising=False)
+    assert resolve_compute_type() == COMPUTE_TYPE
+
+
+def test_compute_type_reads_environment(monkeypatch) -> None:
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8")
+    assert resolve_compute_type() == "int8"
+
+
+def test_blank_compute_type_env_falls_back_to_default(monkeypatch) -> None:
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "   ")
+    assert resolve_compute_type() == COMPUTE_TYPE
+
+
+def test_invalid_compute_type_is_rejected_with_guidance(monkeypatch) -> None:
+    """Bad quantization must fail before the WAV is decoded, not inside CTranslate2."""
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int4")
+    with pytest.raises(ValueError) as excinfo:
+        resolve_compute_type()
+    message = str(excinfo.value)
+    assert COMPUTE_TYPE_ENV in message
+    assert "float16" in message  # lists the valid values
+
+
+def test_batch_size_defaults_when_env_unset(monkeypatch) -> None:
+    monkeypatch.delenv(BATCH_SIZE_ENV, raising=False)
+    assert resolve_batch_size() == BATCH_SIZE
+
+
+def test_batch_size_reads_environment(monkeypatch) -> None:
+    monkeypatch.setenv(BATCH_SIZE_ENV, "32")
+    assert resolve_batch_size() == 32
+
+
+def test_non_numeric_batch_size_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv(BATCH_SIZE_ENV, "lots")
+    with pytest.raises(ValueError) as excinfo:
+        resolve_batch_size()
+    assert BATCH_SIZE_ENV in str(excinfo.value)
+
+
+@pytest.mark.parametrize("bad", ["0", "-4"])
+def test_non_positive_batch_size_is_rejected(monkeypatch, bad) -> None:
+    """0 and negatives are *accepted* by faster_whisper and fail deep in the
+    decoder, so they are rejected up front with the value quoted."""
+    monkeypatch.setenv(BATCH_SIZE_ENV, bad)
+    with pytest.raises(ValueError) as excinfo:
+        resolve_batch_size()
+    assert ">= 1" in str(excinfo.value)
+
+
+def test_constructor_argument_beats_environment(monkeypatch) -> None:
+    """Explicit arguments win over env, so tests and callers need no env mutation."""
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8")
+    monkeypatch.setenv(BATCH_SIZE_ENV, "8")
+    transcriber = LocalTranscriber(compute_type="float16", batch_size=64)
+    assert transcriber.compute_type == "float16"
+    assert transcriber.batch_size == 64
+
+
+def test_constructor_picks_up_env_by_default(monkeypatch) -> None:
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8")
+    monkeypatch.setenv(BATCH_SIZE_ENV, "8")
+    transcriber = LocalTranscriber()
+    assert transcriber.compute_type == "int8"
+    assert transcriber.batch_size == 8
+
+
+def test_module_loads_dotenv_at_import() -> None:
+    """``transcriber`` must read ``.env`` itself, not lean on ``summarizer``.
+
+    The two tunables are documented as ``.env`` settings, so the module that
+    reads them has to load that file. It previously depended on ``summarizer``
+    loading it as an import side effect -- true under ``main.py``, false the
+    moment this module is imported alone, which silently fell back to the code
+    defaults (float16 rather than the configured int8).
+    """
+    source = Path(transcriber.__file__).read_text(encoding="utf-8")
+    assert "load_dotenv()" in source, "transcriber never calls load_dotenv()"
+
+
+def test_real_environment_beats_dotenv(monkeypatch) -> None:
+    """An exported variable must win over the ``.env`` file.
+
+    ``load_dotenv(override=False)`` is the python-dotenv default, and this
+    pins it: without it, a re-load of ``.env`` would clobber a test's
+    ``monkeypatch.setenv`` and reintroduce the real NVIDIA_API_KEY leak that
+    ``test_summarizer.py`` already has to work around.
+    """
+    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8_float16")
+    assert resolve_compute_type() == "int8_float16"
+
+
+def test_compute_type_reaches_load_model(mocker, tmp_path) -> None:
+    """The resolved value must actually be passed, not just stored."""
+    wav_path = _write_wav(tmp_path)
+    whisperx = _make_whisperx(
+        mocker, [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    )[0]
+
+    LocalTranscriber(compute_type="int8").transcribe_audio(wav_path)
+
+    assert whisperx.load_model.call_args.kwargs["compute_type"] == "int8"
 
 
 def test_asr_and_vad_options_use_the_field_names_whisperx_actually_has(
