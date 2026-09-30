@@ -16,3 +16,6 @@ whisperx>=3.1               # Phase 2: ASR + wav2vec2 alignment + pyannote diari
 torch>=2.1                  # WhisperX inference backend (pinned for reproducibility)
 torchaudio>=2.1             # wav2vec2 forced-alignment pipelines used by WhisperX
 rich>=13.0.0
+fastapi>=0.115.0            # Phase 7: HTTP API + static dashboard shell
+uvicorn>=0.30.0             # ASGI server for server.py (run: uvicorn server:app)
+httpx>=0.27.0               # tests only: Starlette's TestClient; separate from httpx2 above

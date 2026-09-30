@@ -10,10 +10,10 @@
 <!--
   Dashboard shell for the lecture pipeline.
 
-  Two constraints shaped this file.
+  Three constraints shaped this file.
 
   1. The backend is authoritative. The UI never infers progress from elapsed
-     time or from a local countdown; it renders exactly what /api/status
+     time or from a local countdown; it renders exactly what the SSE stream
      reports. Inventing a plausible-looking progress bar here would be a lie the
      operator could not detect, and a lecture's real duration is far too
      variable to estimate honestly.
@@ -22,6 +22,10 @@
      Transcription in particular takes tens of minutes and emits nothing. So the
      UI has to make "still working" legible, which is why the active state is a
      labelled, animated status card rather than a line of text.
+
+  3. Push, not poll. The stream pushes the current state on connect and every
+     change after it, so there are no requests at all while a dashboard sits
+     idle, and no up-to-two-second lag on a phase change.
 
   No framework and no build step: the shell is a placeholder, and a bundler
   would be a maintenance cost with nothing to amortise it against yet.
@@ -100,8 +104,8 @@
     </section>
 
     <!--
-      Live status. Populated entirely from /api/status; every element inside is
-      driven by render() below and carries no state of its own.
+      Live status. Populated entirely from the SSE stream; every element inside
+      is driven by render() below and carries no state of its own.
     -->
     <section
       id="status-card"
@@ -137,6 +141,37 @@
       <p id="status-course" class="mt-2 hidden text-sm text-slate-500">
         Course: <span id="status-course-value" class="font-mono text-slate-300"></span>
       </p>
+
+      <!--
+        Connection indicator. Separate from the status card on purpose: "the
+        pipeline is transcribing" and "we have lost the server" are independent
+        facts, and collapsing them into one message would make a stale card
+        indistinguishable from a live one. The card below keeps showing the last
+        state it was told, marked as stale rather than blanked -- a dashboard
+        that empties itself during a network blip is worse than one showing
+        slightly old truth, as long as it says so.
+      -->
+      <p
+        id="connection-banner"
+        class="mt-4 flex items-center gap-2 rounded-lg border border-amber-900/60
+               bg-amber-950/30 px-3 py-2 text-xs text-amber-200"
+        role="status"
+      >
+        <span
+          id="connection-dot"
+          class="h-2 w-2 shrink-0 rounded-full bg-amber-400 animate-pulse"
+          aria-hidden="true"
+        ></span>
+        <span id="connection-text">Connecting to the server...</span>
+        <button
+          id="connection-retry"
+          type="button"
+          class="ml-auto hidden rounded border border-amber-700/70 px-2 py-0.5
+                 font-medium text-amber-100 hover:bg-amber-900/40"
+        >
+          Retry
+        </button>
+      </p>
     </section>
 
     <!--
@@ -155,22 +190,18 @@
 (() => {
   "use strict";
 
-  // Poll cadence. Two seconds is a compromise: fast enough that a phase change
-  // feels immediate, slow enough that a dashboard left open all day does not
-  // generate thousands of requests. Nothing here is time-critical -- a lecture
-  // phase runs for minutes -- so there is no case for a tighter loop.
-  const POLL_MS = 2000;
+  const STREAM_URL = "/api/stream";
 
   // Backend status tokens -> what the operator sees. Kept as a lookup rather
   // than a chain of ifs so an unrecognised token falls through to a safe
   // default instead of rendering as raw snake_case.
   const LABELS = {
-    idle:         { label: "Idle",          dot: null,  badge: "bg-slate-800 text-slate-400" },
-    recording:    { label: "Recording",     dot: "bg-red-500",    badge: "bg-red-500/20 text-red-300" },
-    transcribing: { label: "Transcribing",  dot: "bg-blue-500",   badge: "bg-blue-500/20 text-blue-300" },
-    synthesizing: { label: "Synthesizing",  dot: "bg-blue-500",   badge: "bg-blue-500/20 text-blue-300" },
-    complete:     { label: "Complete",      dot: "bg-emerald-500",badge: "bg-emerald-500/20 text-emerald-300" },
-    error:        { label: "Failed",        dot: "bg-amber-500",  badge: "bg-amber-500/20 text-amber-300" },
+    idle:         { label: "Idle",          dot: null,   badge: "bg-slate-800 text-slate-400" },
+    recording:    { label: "Recording",     dot: "bg-red-500",     badge: "bg-red-500/20 text-red-300" },
+    transcribing: { label: "Transcribing",  dot: "bg-blue-500",    badge: "bg-blue-500/20 text-blue-300" },
+    synthesizing: { label: "Synthesizing",  dot: "bg-blue-500",    badge: "bg-blue-500/20 text-blue-300" },
+    complete:     { label: "Complete",      dot: "bg-emerald-500", badge: "bg-emerald-500/20 text-emerald-300" },
+    error:        { label: "Failed",        dot: "bg-amber-500",   badge: "bg-amber-500/20 text-amber-300" },
   };
 
   const UNKNOWN = { label: "Unknown", dot: null, badge: "bg-slate-800 text-slate-400" };
@@ -179,20 +210,47 @@
   // operator cannot queue a second recording the backend will reject anyway.
   const ACTIVE = new Set(["recording", "transcribing", "synthesizing"]);
 
-  const el = {
-    form:      document.getElementById("record-form"),
-    button:    document.getElementById("record-button"),
-    courseIn:  document.getElementById("course_code"),
-    langIn:    document.getElementById("language"),
-    card:      document.getElementById("status-card"),
-    dot:       document.getElementById("status-dot"),
-    label:     document.getElementById("status-label"),
-    badge:     document.getElementById("status-badge"),
-    message:   document.getElementById("status-message"),
-    courseRow: document.getElementById("status-course"),
-    courseVal: document.getElementById("status-course-value"),
-    error:     document.getElementById("form-error"),
+  // Connection presentation. "stale" is the one that matters: it marks the
+  // card below as showing the last known state rather than a live one.
+  const CONNECTION = {
+    connecting:  { text: "Connecting to the server...", tone: "amber", stale: true },
+    live:        { text: "Live",                            tone: "ok",    stale: false },
+    reconnecting:{ text: "Connection lost. Reconnecting...", tone: "amber", stale: true },
+    offline:     { text: "Disconnected from the server.",   tone: "red",   stale: true },
   };
+
+  const TONE_CLASSES = {
+    amber: "border-amber-900/60 bg-amber-950/30 text-amber-200",
+    red:   "border-red-900/60 bg-red-950/40 text-red-300",
+    ok:    "border-emerald-900/40 bg-emerald-950/20 text-emerald-200",
+  };
+  const TONE_DOT = { amber: "bg-amber-400", red: "bg-red-400", ok: "bg-emerald-400" };
+
+  const el = {
+    form:       document.getElementById("record-form"),
+    button:     document.getElementById("record-button"),
+    courseIn:   document.getElementById("course_code"),
+    langIn:     document.getElementById("language"),
+    card:       document.getElementById("status-card"),
+    dot:        document.getElementById("status-dot"),
+    label:      document.getElementById("status-label"),
+    badge:      document.getElementById("status-badge"),
+    message:    document.getElementById("status-message"),
+    courseRow:  document.getElementById("status-course"),
+    courseVal:  document.getElementById("status-course-value"),
+    error:      document.getElementById("form-error"),
+    connBox:    document.getElementById("connection-banner"),
+    connDot:    document.getElementById("connection-dot"),
+    connText:   document.getElementById("connection-text"),
+    connRetry:  document.getElementById("connection-retry"),
+  };
+
+  // Last state the server told us, and whether it is still current. Kept so a
+  // reconnect can re-render without waiting for the next change to arrive.
+  let lastState = null;
+  let lastStatus = "idle";
+  let connection = "connecting";
+  let source = null;
 
   function showError(text) {
     el.error.textContent = text;
@@ -204,11 +262,14 @@
     el.error.classList.add("hidden");
   }
 
-  /** Render one /api/status payload. Total function: unknown states are safe. */
+  /** Render one state payload. Total function: unknown states are safe. */
   function render(state) {
     const status = (state && state.status) || "idle";
     const view = LABELS[status] || UNKNOWN;
     const active = ACTIVE.has(status);
+
+    lastState = state;
+    lastStatus = status;
 
     el.label.textContent = view.label;
     el.badge.textContent = status;
@@ -218,10 +279,11 @@
 
     // The pulse is the only motion on the page, so it is reserved for a run that
     // is genuinely in progress. A "complete" card that kept blinking would read
-    // as still working.
+    // as still working. It is also suppressed while stale, so a lost connection
+    // does not leave a card animating as though work continued.
     el.dot.className = "h-3 w-3 rounded-full " + (view.dot || "bg-transparent");
     el.dot.classList.toggle("hidden", !view.dot);
-    el.dot.classList.toggle("animate-pulse", Boolean(view.dot) && active);
+    el.dot.classList.toggle("animate-pulse", Boolean(view.dot) && active && isLive());
 
     const course = state && state.course_code;
     el.courseRow.classList.toggle("hidden", !course);
@@ -229,23 +291,102 @@
       el.courseVal.textContent = course;
     }
 
-    el.button.disabled = active;
-    el.button.textContent = active ? "Recording in progress..." : "Start Recording";
-    el.card.classList.toggle("ring-1", active);
-    el.card.classList.toggle("ring-blue-500/40", active);
+    syncButton();
   }
 
-  /** Poll the backend. Failures are non-fatal: the last known state stays put. */
-  async function poll() {
-    try {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (!response.ok) throw new Error("status " + response.status);
-      render(await response.json());
-    } catch (err) {
-      // Deliberately silent on the card. A dashboard that blanks itself every
-      // time the dev server hiccups is worse than one that shows slightly stale
-      // truth; the next tick usually recovers.
+  function isLive() {
+    return connection === "live";
+  }
+
+  /**
+   * The start button is disabled for two independent reasons, and conflating
+   * them would mislead: a run is in flight (the backend would answer 409), or
+   * the connection is terminally dead (the request would go nowhere). A
+   * *transient* reconnect does not disable it -- the server is often reachable
+   * again before the stream is, and blocking on a cosmetic signal is worse than
+   * letting the POST report its own failure.
+   */
+  function syncButton() {
+    const blocked = ACTIVE.has(lastStatus) || connection === "offline";
+    el.button.disabled = blocked;
+    if (ACTIVE.has(lastStatus)) {
+      el.button.textContent = "Recording in progress...";
+    } else if (connection === "offline") {
+      el.button.textContent = "Server unreachable";
+    } else {
+      el.button.textContent = "Start Recording";
     }
+  }
+
+  function renderConnection() {
+    const view = CONNECTION[connection];
+    el.connText.textContent = view.text;
+    el.connBox.className = "mt-4 flex items-center gap-2 rounded-lg border px-3 py-2 " +
+                           "text-xs " + TONE_CLASSES[view.tone];
+    el.connDot.className = "h-2 w-2 shrink-0 rounded-full " + TONE_DOT[view.tone] +
+                           (connection === "live" ? "" : " animate-pulse");
+    // Manual retry only where auto-reconnect has given up. Calling close() on a
+    // transient error would disable the browser's own reconnection, so the
+    // button is the deliberate escape hatch, not part of the normal path.
+    el.connRetry.classList.toggle("hidden", connection !== "offline");
+    syncButton();
+  }
+
+  function connect() {
+    if (source) {
+      source.close();
+      source = null;
+    }
+    setConnection("connecting");
+
+    const es = new EventSource(STREAM_URL);
+    source = es;
+
+    es.onopen = function () {
+      // Note: this fires on every successful (re)connect, not just the first.
+      setConnection("live");
+    };
+
+    es.onmessage = function (event) {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch (_) {
+        // A single unparseable frame is not worth tearing the stream down for.
+        // Ignore it and wait for the next one.
+        return;
+      }
+      setConnection("live");
+      render(payload);
+    };
+
+    es.onerror = function () {
+      // EventSource reconnects on its own for transport failures -- the spec
+      // has it retry with a growing backoff, and browsers keep going
+      // indefinitely. Calling close() here is the classic mistake: it turns a
+      // self-healing blip into a permanent one. So this handler only reports.
+      //
+      // The one case needing intervention is readyState CLOSED, which means the
+      // browser has stopped retrying -- a protocol-level rejection such as a
+      // 404 or a wrong Content-Type. No amount of waiting fixes that; a fresh
+      // connection might, if the server was mid-restart.
+      if (es.readyState === EventSource.CLOSED) {
+        es.close();
+        source = null;
+        setConnection("offline");
+      } else {
+        setConnection("reconnecting");
+      }
+    };
+  }
+
+  function setConnection(next) {
+    if (connection === next) return;
+    connection = next;
+    renderConnection();
+    // Re-render on the last known state so the card's liveness presentation
+    // follows the connection: a stale card must stop claiming to be live.
+    if (lastState) render(lastState);
   }
 
   async function submit(event) {
@@ -272,22 +413,33 @@
           if (body && body.detail) detail = body.detail;
         } catch (_) { /* non-JSON error body; keep the generic message */ }
         showError(detail);
-        el.button.disabled = false;
+        syncButton();
         return;
       }
 
-      // Draw the accepted state immediately rather than waiting up to two
-      // seconds for the first poll to catch up.
-      render(await response.json());
+      const accepted = await response.json();
+      // Draw the accepted state immediately. The stream will push the same state
+      // within milliseconds, and rendering it here as well means the button
+      // re-enables correctly even if the stream happens to be down -- a run
+      // really is starting, and the operator should be able to submit another
+      // once it finishes. The acknowledgement carries no message field, so one
+      // is supplied; the stream overwrites it moments later.
+      render({
+        status: accepted.status || "recording",
+        course_code: accepted.course_code,
+        message: "Recording started. Waiting for the first update...",
+      });
     } catch (err) {
       showError("Could not reach the server. Is it still running?");
-      el.button.disabled = false;
+      syncButton();
     }
   }
 
   el.form.addEventListener("submit", submit);
-  poll();
-  setInterval(poll, POLL_MS);
+  el.connRetry.addEventListener("click", connect);
+
+  renderConnection();
+  connect();
 })();
 </script>
 

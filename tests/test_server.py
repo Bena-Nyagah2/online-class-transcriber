@@ -6,11 +6,13 @@ The server's job is narrow and mostly about *plumbing correctness* rather than
 pipeline behaviour, which ``test_main.py`` already owns. What is genuinely
 worth testing here:
 
-1. **The API contract** -- shape and status codes of the two endpoints,
-   including the validation and the 409 guard.
+1. **The API contract** -- shape and status codes of the endpoints, including
+   the validation and the 409 guard.
 2. **State mirroring** -- that ``APP_STATE`` tracks the pipeline's own
    callbacks, and that a failure cannot leave it stuck mid-run.
-3. **The boundary decisions** -- course-code sanitisation, and the two
+3. **The push path** -- that a state change actually reaches a connected
+   client, over a real event loop, from a real worker thread.
+4. **The boundary decisions** -- course-code sanitisation, and the two
    non-interactive defaults that keep a browser-initiated run from blocking on
    a prompt nobody can answer.
 
@@ -22,9 +24,29 @@ The ``TestClient`` is built *inside* each test rather than in a module-level
 fixture, because ``APP_STATE`` is global and shared. A session-scoped client
 would leak state between tests and make ordering significant -- the exact
 coupling these tests are meant to be free of.
+
+Why the stream tests bypass ``TestClient``
+------------------------------------------
+``GET /api/stream`` is an endless response by design, and Starlette's
+``TestClient`` cannot consume one: it runs the ASGI app to completion and
+buffers the whole body before returning, so ``client.stream(...)`` blocks
+forever on a body that never ends. (Confirmed by direct experiment, not
+assumed -- the hang is at the ``with client.stream(...)`` line itself.)
+
+So the stream's *logic* is tested by driving ``server._event_stream()``
+directly under ``asyncio.run``, which is the same generator object the route
+returns and therefore the real thing rather than a stand-in. Its *HTTP
+contract* -- media type, headers, route registration -- is tested by calling
+the route function directly and inspecting the returned ``StreamingResponse``.
+Together those cover everything a real client would exercise.
 """
 
 from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
 
 import pytest
 
@@ -32,6 +54,7 @@ pytest.importorskip("fastapi", reason="server.py needs the web extra installed")
 pytest.importorskip("httpx", reason="TestClient is built on httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.responses import StreamingResponse  # noqa: E402
 
 import server  # noqa: E402
 import main as m  # noqa: E402
@@ -45,12 +68,23 @@ def clean_state():
     background thread, so without this a test that starts a run would make the
     next one fail with a 409 for reasons that have nothing to do with the code
     under test.
+
+    The broadcaster is reset too, and that is not tidiness. ``asyncio.run()``
+    closes the loop it was given, so a test that binds one leaves the module
+    pointing at a dead loop; the next test to publish would silently take the
+    ``is_closed()`` early return and assert nothing. The subscriber set is
+    cleared for the same reason a leaked queue would let one test's assertions
+    pass on another's client. Both are private because there is no public reset
+    -- and that is fine, since resetting module-global test state is exactly
+    what this fixture is for.
     """
     server._run_active = False
     server.APP_STATE.update({"status": "idle", "course_code": None, "message": ""})
     yield
     server._run_active = False
     server.APP_STATE.update({"status": "idle", "course_code": None, "message": ""})
+    server._broadcaster._subscribers.clear()
+    server._broadcaster._loop = None
 
 
 @pytest.fixture
@@ -109,8 +143,6 @@ def _start_in_thread(client, code="CRM_1106", language="en"):
     ``slot`` is a two-slot list: the response lands in ``slot[0]`` and any
     exception in ``slot[1]``, so the caller can join and then inspect either.
     """
-    import threading
-
     slot: list = [None, None]
 
     def _worker() -> None:
@@ -124,26 +156,59 @@ def _start_in_thread(client, code="CRM_1106", language="en"):
     return thread, slot
 
 
+def _state():
+    """Read the state exactly as a connected dashboard receives it.
+
+    The SSE first frame is built from :func:`server.get_state`, so for every
+    assertion about "what a client would see", this is that function -- going
+    through the stream would test JSON encoding twice over.
+    """
+    return server.get_state()
+
+
+def _payload(frame: str) -> dict:
+    """Parse one SSE ``data:`` frame into its JSON object."""
+    assert frame.startswith("data: "), f"not a data frame: {frame!r}"
+    assert frame.endswith("\n\n"), f"frame is not SSE-terminated: {frame!r}"
+    return json.loads(frame[len("data: ") : -2])
+
+
+async def _take(gen, count: int, timeout: float = 5.0) -> list[str]:
+    """Pull ``count`` frames off an async generator, failing loudly on a stall.
+
+    The timeout is not paranoia. The generator's normal mode is to sit in
+    ``await queue.get()`` forever, so a broadcast that never arrives looks
+    exactly like one that is working -- without a deadline these tests would
+    hang instead of failing, and a hanging test is a much worse thing to
+    hand someone than a red one.
+    """
+    frames = []
+    for _ in range(count):
+        frames.append(await asyncio.wait_for(anext(gen), timeout=timeout))
+    return frames
+
+
 # ---------------------------------------------------------------------------
 # 1. API contract
 # ---------------------------------------------------------------------------
 
 
-def test_status_starts_idle(client):
+def test_state_starts_idle(client):
     """A fresh server reports idle with no course and no message drift."""
-    body = client.get("/api/status").json()
+    body = _state()
     assert body["status"] == "idle"
     assert body["course_code"] is None
 
 
-def test_status_returns_exactly_the_three_contract_keys(client):
+def test_state_returns_exactly_the_three_contract_keys(client):
     """The payload shape is the dashboard's contract; extra keys leak internals.
 
     The frontend reads ``status``/``course_code``/``message`` and nothing else,
     so a key added for debugging would be a key with no defined behaviour on
-    the client side.
+    the client side. Now doubly load-bearing: the payload is serialised
+    straight into an SSE frame on every single state change.
     """
-    assert set(client.get("/api/status").json()) == {
+    assert set(_state()) == {
         "status",
         "course_code",
         "message",
@@ -215,8 +280,6 @@ def test_second_concurrent_run_is_refused(client):
     duplicate but two recorders opening the same loopback stream and two runs
     writing ``raw_audio.wav`` in the same folder.
     """
-    import threading
-
     hold, release = threading.Event(), threading.Event()
 
     def _blocking(course_code, language, state_callback=None, **kwargs):
@@ -290,7 +353,7 @@ def test_state_follows_the_pipeline_callbacks(client):
     cannot drift apart as the pipeline changes.
     """
     _start(client)
-    body = client.get("/api/status").json()
+    body = _state()
     assert body["status"] == "complete"
     assert body["course_code"] == "CRM_1106"
     assert "complete" in body["message"].lower()
@@ -306,15 +369,13 @@ def test_running_state_is_visible_before_the_run_finishes(client):
         state_callback("complete")
         return "notes.md"
 
-    import threading
-
     hold, release = threading.Event(), threading.Event()
     real = server.run_pipeline
     server.run_pipeline = _slow
     try:
         thread, slot = _start_in_thread(client, "CRM_1106")
         assert hold.wait(timeout=10), "run never reached the recording state"
-        body = client.get("/api/status").json()
+        body = _state()
         assert body["status"] == "recording"
         assert body["course_code"] == "CRM_1106"
         release.set()
@@ -346,7 +407,7 @@ def test_failure_is_reported_as_error_not_left_mid_run(client):
     finally:
         server.run_pipeline = real
 
-    body = client.get("/api/status").json()
+    body = _state()
     assert body["status"] == "error"
     assert "no transcript" in body["message"]
 
@@ -372,7 +433,7 @@ def test_unexpected_exception_is_reported_as_error(client):
     finally:
         server.run_pipeline = real
 
-    assert client.get("/api/status").json()["status"] == "error"
+    assert _state()["status"] == "error"
 
 
 def test_status_snapshot_is_a_copy_not_the_live_dict(client):
@@ -432,7 +493,7 @@ def test_missing_loopback_device_does_not_wedge_the_dashboard(client):
     # The request is still accepted -- the device check happens in the
     # background, after the response.
     assert response.status_code == 200
-    body = client.get("/api/status").json()
+    body = _state()
     assert body["status"] == "error", "dashboard left claiming to be recording"
     assert "loopback" in body["message"].lower()
     # And the server is still usable.
@@ -519,17 +580,37 @@ def test_root_serves_the_dashboard(client):
     assert "text/html" in response.headers["content-type"]
 
 
-def test_api_routes_survive_the_root_static_mount(client):
+def test_api_routes_are_registered_before_the_root_static_mount(client):
     """The ``/`` mount must not shadow the API.
 
     Load-bearing ordering, not a style choice: Starlette matches routes in
     registration order and a mount at ``/`` matches every path, so registering
-    it before the endpoints would make ``/api/status`` return a static 404. The
+    it before the endpoints would make ``/api/stream`` return a static 404. The
     symptom is a dashboard that loads and then silently never updates -- which
     looks exactly like a broken backend.
+
+    Asserted structurally rather than over HTTP because the stream never
+    completes a response body (see the module docstring); what matters is the
+    *order*, and the order is directly readable from ``app.routes``.
     """
-    assert client.get("/api/status").status_code == 200
+    from starlette.routing import Mount
+
+    routes = server.app.routes
+    # Matched by name rather than by path: Starlette rewrites a mount at "/" to
+    # "/{path}", so testing for a literal "/" finds nothing.
+    mount_index = next(
+        i
+        for i, r in enumerate(routes)
+        if isinstance(r, Mount) and r.name == "static"
+    )
+    api = {
+        r.path for r in routes[:mount_index] if getattr(r, "path", "").startswith("/api")
+    }
+    assert api == {"/api/record", "/api/stream"}
+
+    # And the two routes that *can* complete a response still answer normally.
     assert client.get("/healthz").status_code == 200
+    assert client.get("/").status_code == 200
 
 
 def test_healthz_is_independent_of_pipeline_state(client):
@@ -537,18 +618,461 @@ def test_healthz_is_independent_of_pipeline_state(client):
 
     A monitor polling a payload that flips to "transcribing" cannot tell "the
     server is down" from "the server is busy", and will page for the second one.
+    The stream is no substitute: it is a hanging connection, useless as a probe.
     """
     assert client.get("/healthz").json() == {"status": "ok"}
     _start(client)
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
-def test_dashboard_polls_the_status_endpoint(client):
-    """The shell must poll the endpoint the server actually exposes.
+def test_dashboard_streams_instead_of_polling(client):
+    """The shell must consume the endpoint the server actually exposes.
 
     Checked against the shipped HTML rather than a copy, so a rename on either
-    side fails here instead of leaving a UI that polls a 404 forever.
+    side fails here instead of leaving a UI that polls a 404 forever. Asserts the
+    negative too: a leftover ``setInterval`` would mean the dashboard is *also*
+    still polling, and the two together are a defect neither check alone
+    would catch.
     """
     html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    assert "/api/status" in html
-    assert "setInterval" in html
+    assert "/api/stream" in html
+    assert "EventSource" in html
+    assert "setInterval" not in html
+    assert "/api/status" not in html
+
+
+def test_dashboard_reports_a_lost_connection(client):
+    """A dropped stream must be visible, not silently leave a stale card.
+
+    ``EventSource`` reconnects on its own, which is exactly why this needs an
+    explicit test: the recovery is invisible by design, so without an indicator
+    the operator sees an unchanged card and has no way to tell a live lecture
+    from a dashboard that stopped hearing about one minutes ago.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert "es.onerror" in html
+    assert "EventSource.CLOSED" in html
+
+    # The subtle half. EventSource retries transport failures on its own, so
+    # calling close() on a transient error would cancel the browser's own
+    # reconnection and turn a self-healing blip into a permanent outage. The
+    # close() is allowed only on the CLOSED branch.
+    handler = html.split("es.onerror = function () {", 1)[1]
+    handler = handler.split("\n    };", 1)[0]
+    closed_branch, transient_branch = handler.split("} else {", 1)
+    assert "es.readyState === EventSource.CLOSED" in closed_branch
+    assert "close()" in closed_branch
+    assert "close()" not in transient_branch
+    assert "reconnecting" in transient_branch
+
+
+# ---------------------------------------------------------------------------
+# 5. The push path (Server-Sent Events)
+# ---------------------------------------------------------------------------
+# The tests above prove the state machine is right. These prove the state
+# actually *travels* -- a separate question, and the one with a real failure
+# mode: `asyncio.Queue` is not thread-safe, so a broadcast published from the
+# pipeline worker by the obvious means looks fine in development and silently
+# never wakes a connected browser in production.
+
+
+def test_stream_endpoint_returns_an_event_stream(client):
+    """The HTTP contract, checked without consuming the endless body.
+
+    ``TestClient`` blocks forever on a response that never ends, so the route
+    function is called directly and the object it returns inspected. That object
+    *is* what Starlette hands the ASGI layer, so this is the real contract and
+    not a stand-in.
+    """
+    response = server.stream_events()
+    assert isinstance(response, StreamingResponse)
+    assert response.media_type == "text/event-stream"
+
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    assert headers["cache-control"] == "no-cache"
+    # Without this a reverse proxy batches frames, which reinstates exactly the
+    # delay SSE exists to remove -- while the app still looks perfect in dev,
+    # because nothing sits in front of it there.
+    assert headers["x-accel-buffering"] == "no"
+
+
+def test_status_endpoint_is_gone(client):
+    """The polled endpoint was removed, and its absence is a 404, not a hang.
+
+    Worth pinning explicitly: a dashboard still polling ``/api/status`` would now
+    get a fast, plausible-looking 404 forever, and the only symptom would be a
+    status card frozen on "Idle".
+    """
+    assert client.get("/api/status").status_code == 404
+
+
+def test_frames_are_well_formed_sse(client):
+    """Every frame must parse as ``data: <json>`` terminated by a blank line.
+
+    The blank line is not decoration: it is the frame delimiter the browser
+    splits on. Omit it and ``EventSource`` buffers the event forever, so the
+    dashboard would show exactly one state and then nothing at all.
+    """
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        gen = server._event_stream()
+        try:
+            await anext(gen)
+            server._set_state(m.STATE_TRANSCRIBING, course_code="CRM_1106")
+            return (await _take(gen, 1))[0]
+        finally:
+            await gen.aclose()
+
+    frame = asyncio.run(scenario())
+    assert frame.startswith("data: ")
+    assert frame.endswith("\n\n")
+    assert _payload(frame) == {
+        "status": m.STATE_TRANSCRIBING,
+        "course_code": "CRM_1106",
+        "message": server._STATE_MESSAGES[m.STATE_TRANSCRIBING],
+    }
+
+
+def test_a_new_client_is_told_the_current_state_immediately(client):
+    """A client connecting mid-lecture learns the state at once.
+
+    Without the leading snapshot, a dashboard opened during transcription would
+    sit on the markup's hardcoded "Idle" until the *next* transition -- which for
+    a two-hour lecture can be most of an hour. The cost is one extra frame per
+    connection, which is nothing next to that.
+    """
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        server._set_state(m.STATE_SYNTHESIZING, course_code="CRM_3102")
+        gen = server._event_stream()
+        try:
+            return (await _take(gen, 1))[0]
+        finally:
+            await gen.aclose()
+
+    payload = _payload(asyncio.run(scenario()))
+    assert payload["status"] == m.STATE_SYNTHESIZING
+    assert payload["course_code"] == "CRM_3102"
+
+
+def test_state_changes_reach_a_connected_client_from_a_worker_thread(client):
+    """The load-bearing test: a worker-thread publish wakes a parked client.
+
+    This is the entire reason for the ``call_soon_threadsafe`` indirection. The
+    publishing thread has no running event loop -- it is a ``BackgroundTasks``
+    threadpool worker, and ``asyncio.get_running_loop()`` raises there. Calling
+    ``queue.put_nowait()`` straight from it would still update the queue's
+    internal deque, but the waiter is only signalled through ``call_soon``, and
+    ``call_soon`` from a foreign thread does *not* wake the loop's selector, so
+    the frame sits in the ready queue until something else wakes the loop.
+
+    Two details make this test actually able to see that, and both were arrived
+    at by watching it fail to:
+
+    * **Park the loop first.** With the worker racing the loop, the stranded
+      callback often ran while the loop was still spinning, and a mutation
+      swapping ``call_soon_threadsafe`` for a direct call sailed through.
+    * **Assert latency, not arrival.** ``asyncio.wait_for`` installs its own
+      timer, and that timer wakes the loop -- which then flushes the very ready
+      queue the mutation was relying on staying untouched. So the mutant *does*
+      eventually deliver, roughly ``timeout`` seconds late. A pass/fail on
+      "did the frame arrive" therefore cannot distinguish a correct
+      implementation from a broken one; measuring how long it took can, and it
+      matches production, where the loop is idle in ``epoll()`` for minutes
+      between state changes.
+    """
+    states = (m.STATE_TRANSCRIBING, m.STATE_SYNTHESIZING, m.STATE_COMPLETE)
+
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        gen = server._event_stream()
+        await anext(gen)  # drain the snapshot; the subscription is now live
+
+        # Prove the loop has genuinely parked before anything is published.
+        # A timer cannot fire until the loop has sat in its selector, so this is
+        # a receipt rather than a hope. (An earlier version used a blocking
+        # `Event.wait()` here, which froze the loop thread instead of parking
+        # it -- so the worker published into a *blocked* loop, the loop resumed
+        # and drained the stranded callbacks, and the mutant sailed through.)
+        parked = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.2, parked.set)
+        await parked.wait()
+
+        clock: dict[str, float] = {}
+
+        def worker():
+            # Long enough that the loop is certainly back in select() by now.
+            time.sleep(0.15)
+            clock["t0"] = time.perf_counter()
+            for state in states:
+                server._set_state(state, course_code="CRM_1106")
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            # Generous on purpose: the timeout is a deadlock backstop, not the
+            # assertion. Arriving late still arrives, and must be measured.
+            frames = await _take(gen, len(states), timeout=6.0)
+            clock["elapsed"] = time.perf_counter() - clock["t0"]
+            return frames, clock["elapsed"]
+        finally:
+            await gen.aclose()
+            thread.join(timeout=5)
+
+    frames, elapsed = asyncio.run(scenario())
+    assert [_payload(f)["status"] for f in frames] == list(states)
+    assert all(_payload(f)["course_code"] == "CRM_1106" for f in frames)
+    # A correct cross-thread hop wakes the selector, so this is sub-millisecond.
+    # A bare put_nowait from a worker thread leaves the frames waiting for
+    # whatever timer fires next, which is what the timeout above is.
+    assert elapsed < 1.0, (
+        f"frames took {elapsed:.2f}s to reach the client; a cross-thread "
+        f"put_nowait only lands when something else happens to wake the loop"
+    )
+
+
+def test_every_connected_client_receives_the_same_broadcast(client):
+    """Two dashboards, two identical streams.
+
+    The fan-out is a loop over the subscriber set, so a failure while queueing to
+    one departed client must not stop delivery to the rest -- otherwise a
+    browser tab that vanished mid-lecture silently blinds every other tab.
+    """
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        first, second = server._event_stream(), server._event_stream()
+        await anext(first)
+        await anext(second)
+        try:
+            server._set_state(m.STATE_SYNTHESIZING, course_code="CRM_1106")
+            await asyncio.sleep(0)  # let the scheduled delivery land
+            return (
+                await asyncio.wait_for(anext(first), timeout=5.0),
+                await asyncio.wait_for(anext(second), timeout=5.0),
+            )
+        finally:
+            await first.aclose()
+            await second.aclose()
+
+    first_frame, second_frame = asyncio.run(scenario())
+    assert _payload(first_frame) == _payload(second_frame)
+    assert _payload(first_frame)["status"] == m.STATE_SYNTHESIZING
+
+
+def test_closing_a_stream_unsubscribes_it(client):
+    """A departed client must not leak.
+
+    Reached via the generator's ``finally``, so it runs on normal completion and
+    on the ``GeneratorExit`` raised by ``aclose()`` alike. Missing it would grow
+    the subscriber set without bound for the life of the process, and every
+    publish would keep building payloads for a client that is never reading.
+    """
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        gen = server._event_stream()
+        await anext(gen)
+        peak = server._broadcaster.subscriber_count
+        await gen.aclose()
+        return peak, server._broadcaster.subscriber_count
+
+    peak, after = asyncio.run(scenario())
+    assert peak == 1
+    assert after == 0
+
+
+def test_a_slow_client_keeps_the_newest_state_not_a_backlog(client):
+    """A client that stops reading must not accumulate a replay log.
+
+    Bounded per-subscriber queue, oldest dropped when it fills. A lecture emits a
+    handful of states, so this is not about volume; it is about a client that
+    stalls for a minute coming back to report a phase from before the stall. Only
+    the newest state is still true.
+    """
+    flood = server._QUEUE_SIZE + 5
+
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        queue = server._broadcaster.subscribe()
+        try:
+            for i in range(flood):
+                server._broadcaster.publish_threadsafe({"n": i})
+            await asyncio.sleep(0)  # drain the scheduled deliveries
+            seen = []
+            while not queue.empty():
+                seen.append(queue.get_nowait()["n"])
+            return seen
+        finally:
+            server._broadcaster.unsubscribe(queue)
+
+    seen = asyncio.run(scenario())
+    assert len(seen) <= server._QUEUE_SIZE
+    assert seen[-1] == flood - 1, "newest state was not the one that survived"
+
+
+def test_an_idle_stream_emits_a_keepalive(client, monkeypatch):
+    """A connection with no traffic must still say something.
+
+    Proxies close idle connections, usually silently, and the client's next
+    symptom is an ``onerror`` on a dashboard that looks perfectly fine. A comment
+    frame is invisible to ``EventSource`` -- it does not fire ``onmessage`` -- so
+    this costs the UI nothing.
+    """
+    monkeypatch.setattr(server, "SSE_KEEPALIVE_SECONDS", 0.05)
+
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        gen = server._event_stream()
+        try:
+            return await _take(gen, 2)
+        finally:
+            await gen.aclose()
+
+    snapshot, keepalive = asyncio.run(scenario())
+    assert _payload(snapshot)["status"] == "idle"
+    assert keepalive == ": keepalive\n\n"
+    assert not keepalive.startswith("data:"), "keepalive must not look like state"
+
+
+def test_shutdown_releases_every_parked_stream(client):
+    """A client must not be left waiting on a queue nobody will ever fill.
+
+    Without the shutdown sentinel the generators sit in ``await queue.get()``
+    with no pending work, and uvicorn's graceful shutdown waits on them. The
+    deadline here is what makes a missing sentinel fail red instead of hanging
+    the suite.
+    """
+    async def scenario():
+        server._broadcaster.bind_loop(asyncio.get_running_loop())
+        gen = server._event_stream()
+        await anext(gen)
+        parked = asyncio.create_task(anext(gen))
+        await asyncio.sleep(0)  # let it reach queue.get()
+        try:
+            server._broadcaster.shutdown()
+            await asyncio.wait_for(parked, timeout=5.0)
+        except StopAsyncIteration:
+            return "exited"
+        return "still-open"
+
+    assert asyncio.run(scenario()) == "exited"
+
+
+def test_publishing_with_no_loop_bound_is_harmless(client):
+    """A run started before any client connects must not blow up.
+
+    The POST publishes ``recording`` synchronously, and in a deployment with no
+    dashboard open nothing ever binds a loop at all. "Nobody is listening" has
+    to mean a no-op, never an exception that aborts the run itself.
+    """
+    server._broadcaster._loop = None
+    server._set_state(m.STATE_RECORDING, course_code="CRM_1106")
+    assert _state()["status"] == m.STATE_RECORDING
+
+
+def test_publishing_after_the_loop_closes_is_harmless(client):
+    """The final state of a shutting-down server must still be recorded.
+
+    The reverse race of the previous test: a background task finishing while
+    uvicorn is tearing down. ``publish_threadsafe`` sees ``is_closed()`` and
+    returns -- and the state write, which is the durable part, has already
+    happened either way.
+    """
+    holder = {}
+
+    async def bind_and_close():
+        holder["loop"] = asyncio.get_running_loop()
+        server._broadcaster.bind_loop(holder["loop"])
+
+    asyncio.run(bind_and_close())  # the loop is now closed
+    assert holder["loop"].is_closed()
+
+    server._set_state(m.STATE_COMPLETE)
+    assert _state()["status"] == m.STATE_COMPLETE
+
+
+def test_post_publishes_the_whole_run_sequence_to_the_broadcaster(client):
+    """A real POST must push every state the pipeline reports, in order.
+
+    The end-to-end version of the push-path claim: the ``TestClient`` runs the
+    app to completion, so the background task really does fire and really does
+    publish through the loop bound by the app's lifespan. Consecutive duplicates
+    are collapsed before asserting, because the handler sets ``recording``
+    itself and the pipeline then announces ``recording`` again -- both are
+    legitimate, and only the order and the absence of gaps is the contract.
+    """
+    published: list[dict] = []
+    real_deliver = server._broadcaster._deliver
+
+    def _capture(payload):
+        published.append(payload)
+        real_deliver(payload)
+
+    server._broadcaster._deliver = _capture
+    try:
+        _start(client, "CRM_1106", "sw")
+    finally:
+        server._broadcaster._deliver = real_deliver
+
+    seen = [p["status"] for p in published]
+    collapsed = [s for i, s in enumerate(seen) if i == 0 or s != seen[i - 1]]
+    assert collapsed == [
+        m.STATE_RECORDING,
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+    ]
+    # Every published payload is a complete, self-consistent snapshot, not the
+    # bare token -- a client that received only a status would have to guess.
+    for payload in published:
+        assert set(payload) == {"status", "course_code", "message"}
+        assert payload["course_code"] == "CRM_1106"
+        assert payload["message"]
+
+
+def test_publishing_happens_while_the_state_lock_is_held(client):
+    """A state snapshot must be handed to the broadcaster before the lock drops.
+
+    Mutation testing turned this into a real bug rather than a hypothetical one.
+    ``_set_state`` originally wrote under ``_state_lock``, copied, released, and
+    only then called ``publish_threadsafe`` -- which left a window in which the
+    request thread could write and broadcast ``recording``, the pipeline thread
+    could write and broadcast ``transcribing``, and the first thread could then
+    get around to broadcasting ``recording``. A client would watch a lecture go
+    *back* a phase, with nothing in the logs to explain it.
+
+    The fix was to schedule inside the critical section, which is free:
+    ``call_soon_threadsafe`` appends to a deque and pokes the self-pipe, neither
+    of which blocks. The justification that it might block on a slow subscriber
+    was simply wrong -- delivery happens later, on the event loop.
+
+    Asserted by probing the lock at the moment of publication: if publishing
+    happens inside the critical section the lock is held and a non-blocking
+    acquire fails; if it happens after, the lock is free and the acquire
+    succeeds. (The first attempt at this test held the lock from the test thread
+    and checked that a publisher stayed blocked -- which passes either way,
+    because the lock also guards the *write*, so it proved nothing.)
+    """
+    observed: dict[str, bool] = {}
+    real_publish = server._broadcaster.publish_threadsafe
+
+    def _probe(payload):
+        acquired = server._state_lock.acquire(blocking=False)
+        if acquired:
+            server._state_lock.release()
+            observed["lock_held"] = False
+        else:
+            observed["lock_held"] = True
+        real_publish(payload)
+
+    server._broadcaster.publish_threadsafe = _probe
+    try:
+        server._broadcaster.bind_loop(asyncio.new_event_loop())
+        server._set_state(m.STATE_RECORDING, course_code="CRM_1106")
+    finally:
+        server._broadcaster.publish_threadsafe = real_publish
+        server._broadcaster._loop = None
+
+    assert observed.get("lock_held") is True, (
+        "the frame was scheduled after the lock was dropped, so two publishers "
+        "can interleave and a client can see a phase arrive out of order"
+    )
