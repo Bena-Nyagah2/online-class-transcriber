@@ -41,6 +41,7 @@ from typing import Optional
 import openai
 from dotenv import load_dotenv
 from openai import APIConnectionError, APITimeoutError, RateLimitError
+from rich.console import Console
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -57,6 +58,11 @@ from vision import SLIDE_TIMES_FILENAME
 # Load NVIDIA_API_KEY from a local .env (if present) before any client reads
 # the environment. Explicit shell exports still take precedence.
 load_dotenv()
+
+# Warnings from the engine layers that cannot reach main.py's console. Rich
+# resolves ``file`` lazily on every write, so pytest's capture still works on
+# this instance and tests can patch ``summarizer.console`` directly.
+console = Console()
 
 MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 
@@ -101,6 +107,27 @@ MIN_TRANSCRIPT_WORDS = 50
 # signal to raise this number -- or to switch REDUCE_MODEL to a model that
 # does not narrate its planning -- not to remove the check.
 MAX_TOKENS = 4096  # Stage 3: final synthesis over the full transcript + deck
+
+# Stage 1's per-slide budget. Raised from the original 800 because 800 was
+# sized for a title slide, and the decks that overflow it are the dense ones:
+# a statute table, a case-list slide, a full framework diagram. Those are
+# exactly the slides a student most needs extracted, so the cap was failing
+# hardest where it mattered most -- one bad slide cost the whole lecture's notes.
+#
+# 2048 rather than the more modest 1500: the vision model is
+# ``meta/llama-3.2-11b-vision-instruct``, whose output ceiling sits far above
+# this, and Stage 1's prompt is tiny (one image plus a short instruction), so
+# the large-``max_tokens`` ceiling that drops connections in Stage 3 does not
+# apply here. Cost is bounded either way, since generation halts at the model's
+# natural stopping point regardless of what the ceiling permits.
+SLIDE_MAX_TOKENS = 2048
+
+# Appended to an extract that ran out of budget. Stage 3 reads the manifest as
+# ground truth, so a partial extract is otherwise indistinguishable from a
+# complete one -- the marker is what makes the gap visible to the consumer. The
+# wording is deliberately content-free so it cannot be mistaken for something
+# the slide actually said.
+SLIDE_TRUNCATION_NOTE = "\n\n[Note: Extraction truncated due to slide density.]"
 
 # Low temperature keeps the merge extractive rather than inventive, which is
 # what the grounding directive assumes. Applied to both stages: Stage 1 wants
@@ -153,6 +180,9 @@ SYSTEM_PROMPT = textwrap.dedent(
     7. **No Hallucinations, No Fluff.** The STRICT OUTPUT FORMAT DIRECTIVE, the STRICT GROUNDING DIRECTIVE and the SPEAKER IDENTIFICATION directives are all non-negotiable.
 
     STRICT GROUNDING DIRECTIVE: NEVER invent, infer, or hallucinate URLs, code snippets, or fictional narratives. If a slide shows code, transcribe exactly what is visible. If the audio topic entirely mismatches the visual slide, report both facts neutrally.
+
+    TRUNCATED SLIDE HANDLING: A slide extract may end with the literal marker "[Note: Extraction truncated due to slide density.]" That marker is an annotation added by the extraction pipeline, NOT content from the slide. When you see it, that slide's extract is incomplete: cover the material that IS present, never guess at what the cut-off remainder said, and never quote or repeat the marker itself in the notes. Where a truncated slide covers material central to the lecture, say in the relevant section that the slide's detail was only partially captured.
+
 
     SPEAKER IDENTIFICATION: Cross-reference the timestamps of the slides with the timestamps of the audio transcript. If a slide's OCR text reveals a person's name or title (e.g., a lower-third graphic) during the exact time a specific [SPEAKER_XX] is talking, deduce their identity and replace [SPEAKER_XX] with their real name in the final notes.
 
@@ -252,21 +282,27 @@ class LectureSynthesizer:
         """Extract the content of a single slide via a one-image vision call.
 
         NVIDIA's endpoint accepts one image per request, so each slide is
-        mapped independently. ``max_tokens=800`` is a deliberate cap — a
-        single slide's extract is short, and keeping Stage 1 cheap leaves
-        room for the big Stage 3 synthesis. Because that budget is a cap
-        rather than a target, the response is checked for exhaustion and a
-        truncated extract is refused rather than written to the manifest.
+        mapped independently at :data:`SLIDE_MAX_TOKENS` -- kept well below
+        Stage 3's budget, because a 90-slide lecture issues 90 of these calls.
+
+        A slide that exhausts its budget degrades rather than aborts: the
+        partial extract is returned with :data:`SLIDE_TRUNCATION_NOTE`
+        appended, so the remaining slides are still processed and the operator
+        sees one warning per affected slide. The alternative -- raising -- meant
+        a single dense slide destroyed the notes for the entire lecture,
+        including every slide that had already extracted cleanly.
+
+        The marker is what keeps this safe. Stage 3 treats the manifest as
+        ground truth, so an unmarked partial extract reads as "this slide said
+        only this", and the model then reasons confidently from a gap it cannot
+        see. Flagging the gap moves the failure from silent to visible.
 
         Args:
             image_path: Path to one captured slide JPEG.
 
         Returns:
-            The extracted content as concise, fence-free Markdown.
-
-        Raises:
-            RuntimeError: If the model stopped at the token cap for this
-                slide. The partial extract is discarded rather than stored.
+            The extracted content as concise, fence-free Markdown, carrying
+            :data:`SLIDE_TRUNCATION_NOTE` when the token cap was hit.
         """
         content = [
             {"type": "text", "text": SLIDE_EXTRACT_PROMPT},
@@ -279,35 +315,27 @@ class LectureSynthesizer:
             model=MAP_MODEL,
             messages=[{"role": "user", "content": content}],
             temperature=TEMPERATURE,
-            max_tokens=800,
+            max_tokens=SLIDE_MAX_TOKENS,
         )
 
-        # Symmetric to the Stage 3 failsafe, and for the same reason. A slide
-        # that ran out of budget at 800 tokens yields an extract that stops
-        # mid-sentence, and that partial text is about to be written into the
-        # manifest as though it were the whole slide. Stage 3 is then told to
-        # treat the manifest as ground truth -- a truncated extract does not
-        # read as "incomplete", it reads as "this is all the slide said", so
-        # the model will reason from a gap it cannot see. Failing here is the
-        # only honest option; the alternative launders missing content into
-        # confident wrong notes.
-        #
-        # The blast radius is bounded: ``_build_slide_manifest`` persists the
-        # manifest after every slide, so a crash here costs only the in-flight
-        # slide and a re-run resumes from the last good one.
-        #
-        # As in Stage 3, RuntimeError is absent from ``_RETRYABLE_ERRORS`` so
-        # tenacity re-raises immediately instead of spending two more calls to
-        # hit the same wall. The remedy is a larger 800 or a tighter
-        # SLIDE_EXTRACT_PROMPT, not a retry loop.
+        # Cleaning happens *before* the note is appended: _clean_markdown is
+        # built to strip the model's own ``` fences, and the note is our
+        # annotation rather than model output, so it must not be fed through a
+        # parser aimed at the model's formatting habits.
         choice = response.choices[0]
-        if choice.finish_reason == "length":
-            raise RuntimeError(
-                f"Stage 1 hit the token cap on {image_path.name} — "
-                "slide extract would be truncated."
-            )
+        extract = self._clean_markdown(choice.message.content or "")
 
-        return self._clean_markdown(choice.message.content or "")
+        # Truncation is deterministic, so it stays out of the retry path --
+        # tenacity re-raises immediately rather than spending two more vision
+        # calls (the pipeline's most expensive line item) to hit the same wall.
+        if choice.finish_reason == "length":
+            console.print(
+                f"[bold yellow]⚠ Warning: Slide {image_path.name} truncated "
+                f"due to token limits.[/bold yellow]"
+            )
+            return f"{extract}{SLIDE_TRUNCATION_NOTE}"
+
+        return extract
 
     # -- Stage 2 (Accumulate): chronological manifest with resume -----------
 
@@ -348,7 +376,10 @@ class LectureSynthesizer:
         Slides are processed in chronological order (``slide_001.jpg``
         naming sorts lexicographically). Any slide whose ``### Slide:`` header
         already exists in the manifest is skipped — this is the resume
-        checkpoint, so interrupted runs continue and re-runs are free.
+        checkpoint, so interrupted runs continue and re-runs are free. The one
+        exception is an entry carrying :data:`SLIDE_TRUNCATION_NOTE`: a partial
+        extract is not a finished one, so its stale entry is discarded and that
+        slide is re-attempted on the next run.
 
         Each header carries the slide's capture offset from
         ``slide_times.json``::
@@ -383,9 +414,36 @@ class LectureSynthesizer:
         # Filenames already extracted — treat as processed even if a rerun.
         # The regex swallows the optional ``[MM:SS] `` prefix, so a manifest
         # from before this feature (and one from after) both resume correctly.
-        already_have = {
-            match.group(1).strip() for match in _SLIDE_HEADER_RE.finditer(existing)
-        }
+        #
+        # One exception: a slide whose extract was truncated is NOT finished,
+        # so its stale entry is dropped and the slide is re-attempted. Under the
+        # old raise-on-truncation behaviour the failed slide was simply never
+        # written, so a re-run retried it for free. Persisting the partial
+        # extract would silently forfeit that retry — the deck would be stuck
+        # on the truncated text until someone hand-edited the manifest. The
+        # entry is removed rather than skipped so the fresh extract replaces it
+        # instead of appending a second ``### Slide:`` header for the same
+        # image, which would have Stage 3 reading one slide twice.
+        already_have: set[str] = set()
+        headers = list(_SLIDE_HEADER_RE.finditer(existing))
+        if headers:
+            spans: list[tuple[int, int]] = [(0, headers[0].start())]
+            for index, match in enumerate(headers):
+                start = match.end()
+                end = (
+                    headers[index + 1].start()
+                    if index + 1 < len(headers)
+                    else len(existing)
+                )
+                if SLIDE_TRUNCATION_NOTE.strip() in existing[start:end]:
+                    continue
+                spans.append((match.start(), end))
+                already_have.add(match.group(1).strip())
+            kept = "".join(existing[begin:stop] for begin, stop in spans)
+            if kept != existing:
+                existing = kept
+                manifest_path.write_text(existing, encoding="utf-8")
+
         pending = [slide for slide in slide_paths if slide.name not in already_have]
 
         total = len(slide_paths)
