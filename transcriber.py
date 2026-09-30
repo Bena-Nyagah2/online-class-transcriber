@@ -38,11 +38,13 @@ Configuration
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import whisperx
+import numpy as np
 # The diarization classes are imported from their defining module rather than
 # reached through the root ``whisperx`` namespace. That namespace is not
 # stable across releases: v3.2.0 re-exports both names, while current main
@@ -72,6 +74,120 @@ from recorder import SAMPLE_RATE
 load_dotenv()
 
 TRANSCRIPT_FILENAME = "raw_transcript.txt"
+
+# -- resume checkpoints ------------------------------------------------------
+# One file per expensive phase boundary, written the moment the phase finishes
+# so a crash costs at most the phase in flight. See LocalTranscriber.transcribe,
+# .align and .diarize, which are deliberately separate methods: a single
+# transcribe_audio() would give the pipeline no seam to checkpoint at, and
+# "resume after the crash" would degrade to "start over".
+#
+# ``alignment.json`` is not in the original two-stage sketch but is kept anyway:
+# forced alignment is a genuine wav2vec2 pass over the whole lecture, so without
+# it a crash during diarization would still re-run alignment and the promise of
+# resuming "exactly where it left off" would be only half kept.
+TRANSCRIPTION_CHECKPOINT: str = "transcription.json"
+ALIGNMENT_CHECKPOINT: str = "alignment.json"
+DIARIZATION_CHECKPOINT: str = "diarization.json"
+
+CHECKPOINT_FILENAMES: tuple[str, ...] = (
+    TRANSCRIPTION_CHECKPOINT,
+    ALIGNMENT_CHECKPOINT,
+    DIARIZATION_CHECKPOINT,
+)
+"""Every checkpoint, ordered so a later one implies the earlier ones succeeded."""
+
+
+def _json_default(obj: Any) -> Any:
+    """Coerce NumPy scalars and arrays so segment data can be JSON-encoded.
+
+    WhisperX returns segment timings and scores as NumPy types, and
+    ``json.dump`` refuses them with ``TypeError: Object of type float32 is not
+    JSON serializable``. Converting at the checkpoint boundary means the
+    in-memory pipeline keeps full precision while the on-disk form degrades to
+    plain Python floats -- which is all the transcript needs and all a resumed
+    run reads back.
+
+    The coerced value is then checked for being JSON-native. This guard is not
+    paranoia about input shape, it prevents an unbounded failure mode:
+    ``json`` feeds the return value of this function straight back into its own
+    encoder, so a type whose ``item()``/``tolist()`` yields another exotic
+    object recurses until the process exhausts memory. During a 90-minute
+    lecture that trade is obvious -- a ``TypeError`` here means "recompute this
+    stage", while the runaway means a wedged machine and a lost take.
+
+    Raises:
+        TypeError: For anything NumPy-like it is not, and for any coercion that
+            did not actually produce a JSON-native value.
+    """
+    # ``tolist`` is tried first because it is the only one that works for a
+    # *multi-element* array: ``item()`` raises ``ValueError: can only convert an
+    # array of size 1 to a Python scalar``. NumPy scalars implement both, so this
+    # ordering covers scalars and arrays with one code path. ``item`` remains as
+    # the fallback for objects that expose only that method.
+    for attribute in ("tolist", "item"):
+        converter = getattr(obj, attribute, None)
+        if callable(converter):
+            return _as_json_native(converter())
+    raise TypeError(
+        f"cannot checkpoint a value of type {type(obj).__name__!r}"
+    )
+
+
+_JSON_NATIVE = (str, int, float, bool, type(None))
+
+
+def _as_json_native(value: Any) -> Any:
+    """Return ``value`` if JSON can encode it, else raise ``TypeError``."""
+    if isinstance(value, _JSON_NATIVE):
+        return value
+    if isinstance(value, list):
+        return [_as_json_native(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _as_json_native(item) for key, item in value.items()}
+    raise TypeError(
+        f"checkpoint value of type {type(value).__name__!r} is not JSON-encodable"
+    )
+
+
+def write_checkpoint(path: Path, payload: Any) -> Path:
+    """Atomically write ``payload`` as JSON to ``path``.
+
+    Atomicity is the whole point. A checkpoint written in place can be observed
+    half-finished by the very next run, and a truncated JSON file is worse than
+    a missing one: the missing file means "recompute this phase", while the
+    truncated one means loading garbage and reporting a resume that silently
+    produced the wrong transcript. Writing to a sibling and ``os.replace``-ing
+    means a reader sees either the old file or the new one.
+    """
+    temp = path.with_name(f"{path.name}.partial")
+    temp.write_text(
+        json.dumps(payload, default=_json_default, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(temp, path)
+    return path
+
+
+def read_checkpoint(path: Path) -> Optional[Any]:
+    """Load a checkpoint, or return ``None`` if it is absent or unusable.
+
+    ``None`` deliberately means three different things -- not written yet, not
+    valid JSON, or not the expected shape -- because all three lead to the same
+    correct action: recompute the phase. Callers only ever branch on
+    "is there a usable checkpoint", so collapsing the cases costs nothing and
+    removes any chance of a corrupt file being treated as a valid resume.
+    """
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(
+            f"  -> checkpoint {path.name} is unreadable ({exc}); "
+            "recomputing this stage"
+        )
+        return None
 
 HF_TOKEN_ENV: str = "HF_TOKEN"
 """Environment variable holding the Hugging Face access token."""
@@ -385,33 +501,63 @@ class LocalTranscriber:
         self.compute_type = compute_type or resolve_compute_type()
         self.batch_size = batch_size or resolve_batch_size()
 
-    # -- public entry point ------------------------------------------------
+        # Decoded-audio memo. Keyed on identity *and* mtime/size so a resumed
+        # run cannot serve a stale decode of a WAV that has since been
+        # re-recorded, which would silently pair old audio with new segments.
+        self._audio_cache: Optional[np.ndarray] = None
+        self._audio_key: Optional[tuple[str, int, int]] = None
 
-    def transcribe_audio(
-        self, wav_path: Union[str, Path], language: str = DEFAULT_LANGUAGE
-    ) -> Path:
-        """Transcribe and diarize a WAV, writing ``raw_transcript.txt`` beside it.
+    # -- audio ---------------------------------------------------------------
 
-        Args:
-            wav_path: Path to the lecture WAV.
-            language: ISO-639-1 code of the spoken language. Supplied to both
-                the ASR and the forced-alignment stage — see the note in the
-                body on why this is pinned rather than auto-detected.
+    def _load_audio(self, wav_path: Path) -> np.ndarray:
+        """Decode and resample a WAV once, memoised across phases.
 
-        Returns:
-            Path to the saved ``raw_transcript.txt``.
+        Every phase needs the full 16 kHz mono array, and on a 90-minute lecture
+        the decode is not free. The phases run back to back in one process, so
+        memoising turns three decodes into one; a resumed run decodes only for
+        the phases it actually has to run.
 
-        Raises:
-            FileNotFoundError: ``wav_path`` does not exist.
+        The key includes size and mtime because the memo is per-instance and a
+        long-lived caller could record, transcribe, re-record and transcribe
+        again on the same transcriber.
         """
+        stat = wav_path.stat()
+        key = (str(wav_path), stat.st_size, stat.st_mtime_ns)
+        if self._audio_key != key or self._audio_cache is None:
+            # load_audio resamples to the 16 kHz mono float32 array every
+            # WhisperX stage expects, which is exactly the format recorder.py
+            # writes.
+            self._audio_cache = whisperx.load_audio(str(wav_path))
+            self._audio_key = key
+        return self._audio_cache
+
+    def _require_audio(self, wav_path: Union[str, Path]) -> Path:
+        """Validate a WAV path, returning it as a ``Path``."""
         audio_path = Path(wav_path)
         if not audio_path.is_file():
             raise FileNotFoundError(f"audio file not found: {audio_path}")
+        return audio_path
 
-        # One decode, shared by all three stages. load_audio resamples to the
-        # 16 kHz mono float32 array every WhisperX stage expects, which is
-        # exactly the format recorder.py writes.
-        audio = whisperx.load_audio(str(audio_path))
+    # -- phase 1: speech recognition ----------------------------------------
+
+    def transcribe(self, wav_path: Union[str, Path], language: str) -> list[dict[str, Any]]:
+        """Run base WhisperX ASR and return the raw segments.
+
+        This is :data:`TRANSCRIPTION_CHECKPOINT`'s boundary: everything before
+        it is audio decoding, everything after it is post-processing. Split out
+        from :meth:`transcribe_audio` specifically so a caller can checkpoint
+        the result and skip the decode on a resume -- the decode plus ASR is the
+        single most expensive thing the pipeline does.
+
+        Args:
+            wav_path: Path to the lecture WAV.
+            language: ISO-639-1 code, forwarded to the decoder.
+
+        Returns:
+            The segment list, pre-alignment and pre-diarization.
+        """
+        audio_path = self._require_audio(wav_path)
+        audio = self._load_audio(audio_path)
         duration = len(audio) / SAMPLE_RATE
         print(
             f"  -> transcribing {audio_path.name} locally "
@@ -419,7 +565,6 @@ class LocalTranscriber:
             f"compute_type={self.compute_type}, batch_size={self.batch_size})"
         )
 
-        # -- Stage A: transcribe ------------------------------------------
         # The Swahili/English priming prompt was removed (prompt lobotomy).
         # Passing an initial_prompt to Whisper biases the decoder toward
         # fluent, confident hallucinations — the very thing we are trying to
@@ -483,8 +628,26 @@ class LocalTranscriber:
         )
         segments: list[dict[str, Any]] = result["segments"]
         print(f"  -> transcribed {len(segments)} segments; aligning words...")
+        return segments
 
-        # -- Stage B: forced alignment (word-level timestamps) -------------
+    # -- phase 2: forced alignment ------------------------------------------
+
+    def align(
+        self,
+        wav_path: Union[str, Path],
+        segments: list[dict[str, Any]],
+        language: str,
+    ) -> list[dict[str, Any]]:
+        """Add word-level timestamps to ``segments`` (wav2vec2 alignment pass).
+
+        Split from :meth:`transcribe_audio` and separately checkpointed
+        (:data:`ALIGNMENT_CHECKPOINT`) because this is a full second model pass
+        over the whole lecture; folding it in with diarization would make a
+        crash in the last phase re-run it.
+        """
+        audio_path = self._require_audio(wav_path)
+        audio = self._load_audio(audio_path)
+
         # Alignment models are language-specific, so this selects the right
         # wav2vec2 pipeline. It reads the caller's ``language`` rather than
         # ``result["language"]``: WhisperX echoes the *requested* code back
@@ -497,9 +660,24 @@ class LocalTranscriber:
             segments, align_model, metadata, audio, DEVICE,
             return_char_alignments=False,
         )
-        segments = result["segments"]
+        return result["segments"]
 
-        # -- Stage C: speaker diarization ----------------------------------
+    # -- phase 3: speaker diarization ---------------------------------------
+
+    def diarize(
+        self,
+        wav_path: Union[str, Path],
+        segments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Assign speaker labels to ``segments`` via pyannote.
+
+        The final :data:`DIARIZATION_CHECKPOINT` boundary. Its output is the
+        last expensive computation in the pipeline, so everything downstream
+        (transcript rendering, LLM synthesis) is cheap by comparison.
+        """
+        audio_path = self._require_audio(wav_path)
+        audio = self._load_audio(audio_path)
+
         # The speaker-count bounds are arguments to the pyannote *invocation*,
         # not to assign_word_speakers (whose signature is
         # ``(diarize_df, transcript_result, speaker_embeddings, fill_nearest)``).
@@ -511,13 +689,53 @@ class LocalTranscriber:
         diarize_segments = diarize_pipeline(
             audio, min_speakers=1, max_speakers=10
         )
-        result = assign_word_speakers(diarize_segments, result)
-        segments = result["segments"]
+        result = assign_word_speakers(diarize_segments, {"segments": segments})
+        return result["segments"]
 
-        transcript = _format_turns(segments)
+    # -- rendering -----------------------------------------------------------
 
+    def render_transcript(self, segments: list[dict[str, Any]]) -> str:
+        """Render diarized segments to the human-readable transcript text."""
+        return _format_turns(segments)
+
+    def write_transcript(
+        self, wav_path: Union[str, Path], segments: list[dict[str, Any]]
+    ) -> Path:
+        """Render and save ``raw_transcript.txt`` beside the WAV."""
+        audio_path = self._require_audio(wav_path)
+        transcript = self.render_transcript(segments)
         transcript_path = audio_path.parent / TRANSCRIPT_FILENAME
         transcript_path.write_text(transcript, encoding="utf-8")
         print(f"Transcript saved to {transcript_path}")
-
         return transcript_path
+
+    # -- public entry point ------------------------------------------------
+
+    def transcribe_audio(
+        self, wav_path: Union[str, Path], language: str = DEFAULT_LANGUAGE
+    ) -> Path:
+        """Transcribe and diarize a WAV, writing ``raw_transcript.txt`` beside it.
+
+        The all-in-one form, kept for callers that do not want checkpoints. It is
+        exactly the three phases above run in sequence with no persistence, so
+        there is one implementation of the work and this is a convenience
+        wrapper rather than a second code path.
+
+        Args:
+            wav_path: Path to the lecture WAV.
+            language: ISO-639-1 code of the spoken language. Supplied to both
+                the ASR and the forced-alignment stage — see the note in
+                :meth:`transcribe` on why this is pinned rather than
+                auto-detected.
+
+        Returns:
+            Path to the saved ``raw_transcript.txt``.
+
+        Raises:
+            FileNotFoundError: ``wav_path`` does not exist.
+        """
+        segments = self.transcribe(wav_path, language)
+        segments = self.align(wav_path, segments, language)
+        segments = self.diarize(wav_path, segments)
+        return self.write_transcript(wav_path, segments)
+

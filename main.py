@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import signal
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date
@@ -27,9 +28,15 @@ from typing import Any, Callable, Iterator
 
 from recorder import AudioRecorder
 from transcriber import (
+    ALIGNMENT_CHECKPOINT,
+    CHECKPOINT_FILENAMES,
     DEFAULT_LANGUAGE,
+    DIARIZATION_CHECKPOINT,
     LocalTranscriber,
+    TRANSCRIPTION_CHECKPOINT,
     TRANSCRIPT_FILENAME,
+    read_checkpoint,
+    write_checkpoint,
 )
 from summarizer import LectureSynthesizer
 from vision import SlideCatcher
@@ -74,6 +81,12 @@ STATE_TRANSCRIBING = "transcribing"
 STATE_SYNTHESIZING = "synthesizing"
 STATE_COMPLETE = "complete"
 STATE_ERROR = "error"
+
+# Name of the captured audio inside an output directory. A constant rather than
+# a literal at each use because ``server.py`` has to name the same file to check
+# whether a previous take exists before it starts a run, and two hard-coded
+# strings that must agree are two strings that eventually will not.
+WAV_FILENAME = "raw_audio.wav"
 
 # How the terminal renders each state. A state with no entry here would print
 # its own token as a bare heading, so the mapping is exhaustive by construction.
@@ -388,37 +401,87 @@ def resolve_device_index(recorder: AudioRecorder | None = None) -> int:
     return 0
 
 
-def run_status_loop(recorder: AudioRecorder) -> None:
+def run_status_loop(
+    recorder: AudioRecorder, stop_event: threading.Event | None = None
+) -> None:
     """Refresh the status line once per second until recording ends.
 
     Returns when the user presses Ctrl+C (KeyboardInterrupt propagates to
-    the caller) or when the capture thread stops on its own after a device
-    failure.
+    the caller), when the capture thread stops on its own after a device
+    failure, or when ``stop_event`` is set.
 
     Args:
         recorder: The active recorder; its ``is_recording`` event gates
             the loop.
+        stop_event: Optional external "stop now" signal. Setting it ends the
+            loop *without* raising, which is what lets a non-interactive caller
+            -- the web server's ``POST /api/stop`` -- end the recording phase
+            and fall through into the same hand-off that a Ctrl+C produces.
+            Defaults to ``None``, which restores the CLI's Ctrl+C-only
+            behaviour exactly.
     """
     started = time.monotonic()
     try:
         while recorder.is_recording.is_set():
             elapsed = int(time.monotonic() - started)
             minutes, seconds = divmod(elapsed, 60)
+            # "Press Ctrl+C to stop" is only true for the CLI. Telling a
+            # browser-driven run to press a key it has no keyboard for is
+            # worse than saying nothing.
+            hint = "Press [bold]Ctrl+C[/bold] to stop  " if stop_event is None else ""
             # Written in place with a carriage return. Deliberately a plain
             # console.print rather than a ``Status`` spinner: the Live display
             # would repaint the line on its own refresh timer and fight this
             # one-second tick, and a Live display started here would have to be
             # torn down before every later print in the pipeline.
             console.print(
-                "\r[bold yellow]●[/bold yellow] Recording in progress... "
-                "Press [bold]Ctrl+C[/bold] to stop  "
+                f"\r[bold yellow]●[/bold yellow] Recording in progress... "
+                f"{hint}"
                 f"[bold cyan]{minutes:02d}:{seconds:02d}[/bold cyan]",
                 end="",
                 highlight=False,
             )
-            time.sleep(1.0)
+            if stop_event is None:
+                time.sleep(1.0)
+            elif stop_event.wait(timeout=1.0):
+                # Waited on the event rather than slept on a timer, so an
+                # operator pressing "Finish Class" ends the loop in
+                # milliseconds instead of up to a full tick later. The timeout
+                # keeps the timer the same for the un-signal case.
+                break
     finally:
         console.print()  # terminate the \r line before further output
+
+
+@contextmanager
+def _suppress_sigint() -> Iterator[None]:
+    """Ignore SIGINT for the duration of the block, where that is possible.
+
+    Guards the WAV flush so a panicked double Ctrl+C cannot land mid-write and
+    truncate the file.
+
+    The thread check is load-bearing, not defensive padding. ``signal.signal``
+    only works on the main thread and raises ``ValueError: signal only works in
+    main thread of the main interpreter`` anywhere else -- so a bare call would
+    turn every clean stop of a web-initiated run (which executes this pipeline
+    in a Starlette threadpool worker) into a crash *at the moment the recording
+    was being saved*. Off the main thread there is nothing to suppress anyway:
+    SIGINT is delivered to the main thread only, so the worker could never
+    receive the interrupt this is guarding against.
+
+    The previous handler is restored rather than ``SIG_DFL`` hard-coded, so an
+    embedding application that installed its own SIGINT handler keeps it. For
+    the CLI the two are identical, because the default handler *is* ``SIG_DFL``.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +515,156 @@ def _interrupt_protected(label: str, fn: Callable[[], Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# resume checkpoints
+# ---------------------------------------------------------------------------
+# A checkpoint marks "this expensive phase finished, and here is its output".
+# The pipeline is check-before-compute: ask for the checkpoint first, and only
+# run the phase when there isn't a usable one. The alternative -- computing and
+# then noticing the file exists -- throws away the entire point, since the
+# compute is the expensive part.
+#
+# The three checkpoints map onto the three expensive phases in ``transcriber``,
+# in pipeline order, so a crash costs at most the phase that was in flight.
+
+
+def _load_segments(output_dir: Path, filename: str) -> list[dict] | None:
+    """Return a checkpointed segment list, or ``None`` if there isn't a usable one.
+
+    A checkpoint that exists but holds something other than a list of segments
+    is treated as absent. That check is not paranoia: the file is a cache, and
+    a resume path that trusts it blindly will hand a malformed value straight
+    into the next phase, turning a recoverable "recompute" into a confusing
+    crash deep inside alignment.
+    """
+    payload = read_checkpoint(output_dir / filename)
+    if payload is None:
+        return None
+    if not isinstance(payload, list) or not all(
+        isinstance(segment, dict) for segment in payload
+    ):
+        console.print(
+            f"[bold yellow]⚠️  Checkpoint {filename} has an unexpected shape "
+            f"({type(payload).__name__}); recomputing this stage.[/bold yellow]"
+        )
+        return None
+    return payload
+
+
+def _resume_skip(output_dir: Path, filename: str, what: str) -> None:
+    """Announce a skipped phase.
+
+    Silently skipping is the failure mode here. An operator who asked for a
+    two-hour transcription job and sees it finish in four seconds has no way to
+    tell a resume from a run that did nothing, so every skip is stated.
+    """
+    console.print(
+        f"[bold cyan]⏭  Resuming:[/bold cyan] {what} already done "
+        f"([bold cyan]{filename}[/bold cyan]) — skipping.",
+        soft_wrap=True,
+    )
+
+
+def _invalidate_checkpoints(output_dir: Path) -> list[str]:
+    """Delete every checkpoint in ``output_dir``; return the names removed.
+
+    Called whenever *fresh* audio is recorded. This is the correctness hinge of
+    the whole feature: checkpoints are keyed only by directory, so re-recording
+    into a directory that still holds an old ``transcription.json`` would pair
+    this lecture's audio with the previous lecture's words and produce a
+    confident, entirely wrong transcript. Stale checkpoints are therefore more
+    dangerous than none at all, which is why this runs on the record path
+    unconditionally rather than only when the operator asks to resume.
+    """
+    removed: list[str] = []
+    for filename in CHECKPOINT_FILENAMES:
+        path = output_dir / filename
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            console.print(
+                f"[bold yellow]⚠️  Could not remove stale checkpoint "
+                f"{filename} ({exc}).[/bold yellow]"
+            )
+            continue
+        if not path.exists():
+            removed.append(filename)
+    return removed
+
+
+def _transcribe_with_checkpoints(
+    transcriber: Any,
+    wav_path: Path,
+    language: str,
+    output_dir: Path,
+    resume: bool,
+) -> list[dict]:
+    """Run the three expensive phases, skipping any with a usable checkpoint.
+
+    The phases are strictly ordered and each one's checkpoint is written the
+    moment it finishes, so an interrupted run always has a valid prefix to
+    resume from. ``alignment.json`` sits between the two named in the original
+    design because forced alignment is a full second model pass; without it a
+    crash during diarization would redo the alignment too and "resume exactly
+    where it left off" would only be half true.
+
+    Args:
+        transcriber: The transcriber, already constructed.
+        wav_path: The captured audio.
+        language: Spoken-language code for the ASR and alignment stages.
+        output_dir: Where the checkpoints live.
+        resume: When ``False``, every phase runs regardless of any checkpoint
+            present. The checkpoints are still written, so a crash during this
+            call is resumable -- which is the asymmetry that matters: opting out
+            of *reading* checkpoints must not opt out of *writing* them.
+
+    Returns:
+        The diarized segment list.
+    """
+    # -- phase 1: base ASR ---------------------------------------------------
+    segments = _load_segments(output_dir, TRANSCRIPTION_CHECKPOINT) if resume else None
+    if segments is not None:
+        _resume_skip(output_dir, TRANSCRIPTION_CHECKPOINT, "Speech recognition")
+    else:
+        with _spinner("[bold yellow]Transcribing...[/bold yellow]"):
+            segments = _interrupt_protected(
+                "transcription",
+                lambda: transcriber.transcribe(wav_path, language=language),
+            )
+        write_checkpoint(output_dir / TRANSCRIPTION_CHECKPOINT, segments)
+        console.print(
+            f"[bold green]✓[/bold green] Transcribed "
+            f"[bold]{len(segments)}[/bold] segment(s) → "
+            f"[bold cyan]{TRANSCRIPTION_CHECKPOINT}[/bold cyan]"
+        )
+
+    # -- phase 2: forced alignment ------------------------------------------
+    aligned = _load_segments(output_dir, ALIGNMENT_CHECKPOINT) if resume else None
+    if aligned is not None:
+        _resume_skip(output_dir, ALIGNMENT_CHECKPOINT, "Word-level alignment")
+    else:
+        with _spinner("[bold yellow]Aligning words...[/bold yellow]"):
+            aligned = _interrupt_protected(
+                "alignment",
+                lambda: transcriber.align(wav_path, segments, language=language),
+            )
+        write_checkpoint(output_dir / ALIGNMENT_CHECKPOINT, aligned)
+    segments = aligned
+
+    # -- phase 3: speaker diarization ---------------------------------------
+    diarized = _load_segments(output_dir, DIARIZATION_CHECKPOINT) if resume else None
+    if diarized is not None:
+        _resume_skip(output_dir, DIARIZATION_CHECKPOINT, "Speaker diarization")
+    else:
+        with _spinner("[bold yellow]Assigning speakers...[/bold yellow]"):
+            diarized = _interrupt_protected(
+                "diarization",
+                lambda: transcriber.diarize(wav_path, segments),
+            )
+        write_checkpoint(output_dir / DIARIZATION_CHECKPOINT, diarized)
+    return diarized
+
+
+# ---------------------------------------------------------------------------
 # Programmatic entry point
 # ---------------------------------------------------------------------------
 
@@ -463,6 +676,8 @@ def run_pipeline(
     *,
     device_id: int | None = None,
     confirm_overwrite: bool | None = None,
+    stop_event: threading.Event | None = None,
+    resume: bool = False,
 ) -> str:
     """Run record → transcribe → synthesize and return the study-notes path.
 
@@ -484,13 +699,50 @@ def run_pipeline(
             for progress display: a consumer that only watched the three
             in-progress states could never tell a finished run from a wedged
             one.
+
+            A stage that is *skipped* on a resume emits no state, because no
+            such stage begins. The sequence is therefore a truthful account of
+            the work done, and a run resumed from a complete transcript emits
+            only ``[STATE_SYNTHESIZING, STATE_COMPLETE]`` — which is the
+            intended fast-forward, not a missing update. Consumers that key
+            off the token rather than a fixed list (the dashboard does) handle
+            this naturally.
         device_id: Loopback device index. ``None`` (the default) prompts via
             :func:`select_device`, which is what the CLI wants. A caller with no
             terminal must pass a real index -- see
-            :func:`resolve_device_index`.
+            :func:`resolve_device_index`. Not consulted at all when resuming
+            past the recording phase, which is what lets a resume succeed on a
+            machine with no capture device.
         confirm_overwrite: ``None`` (the default) prompts before clobbering an
             existing ``raw_audio.wav``. Pass a bool to decide in advance; a
             non-interactive caller has no way to ask.
+        stop_event: Optional "stop recording" signal for the capture phase.
+            Setting it ends :func:`run_status_loop` and lets the pipeline fall
+            through to the same clean hand-off a Ctrl+C produces -- the audio
+            is flushed to disk and transcription begins, rather than the run
+            being abandoned. This is the non-interactive equivalent of the
+            first Ctrl+C: a caller that has no terminal (the web dashboard's
+            "Finish Class" button) uses it instead of a signal it cannot send.
+            ``None`` (the default) leaves the CLI's Ctrl+C-only behaviour
+            untouched. It is only consulted while recording; setting it during
+            transcription or synthesis has no effect, because those phases
+            already treat an interrupt as a warning and a retry.
+        resume: Continue an interrupted run instead of starting a new one.
+            Each expensive phase first checks for its checkpoint
+            (``transcription.json``, ``alignment.json``,
+            ``diarization.json``) and is skipped when one is present and
+            usable; recording is skipped when ``raw_audio.wav`` is already
+            there.
+
+            Defaults to ``False``, and that default is a deliberate safety
+            choice rather than an oversight. The output directory is keyed by
+            course code and *date*, so a same-day re-run of the same course
+            finds the previous take's audio sitting right there. Auto-resuming
+            would silently skip recording and transcribe yesterday's lecture
+            instead of the one being taught now — a data-loss bug that looks
+            like a feature. Opting in also keeps the prompt for a genuinely new
+            take meaningful. A caller recovering from a crash wants
+            ``resume=True``; a caller starting a class wants the default.
 
     Returns:
         The path to the generated study notes, as a string.
@@ -502,7 +754,7 @@ def run_pipeline(
     """
     # -- setup ---------------------------------------------------------------
     output_dir = create_output_dir(course_code)
-    wav_path = output_dir / "raw_audio.wav"
+    wav_path = output_dir / WAV_FILENAME
     backup_path = output_dir / "emergency_backup.wav"
     console.print(
         f"[bold blue]ℹ[/bold blue] Output directory : {output_dir}",
@@ -519,77 +771,115 @@ def run_pipeline(
         _emit(state_callback, STATE_ERROR)
         raise PipelineError(f"overwrite declined for {wav_path}", 1)
 
-    # -- instantiate the three components ------------------------------------
-    recorder = AudioRecorder(emergency_backup_path=backup_path)
+    # -- instantiate the AI components ---------------------------------------
+    # The transcriber and synthesizer are always needed. The recorder is NOT:
+    # a resumed run that already has its audio has no use for capture hardware,
+    # and instantiating it eagerly would make recovery fail on a machine with
+    # no input device -- the exact machine most likely to need to resume.
     transcriber = LocalTranscriber()
     synthesizer = LectureSynthesizer()
 
-    if device_id is None:
-        device_id = select_device(recorder)
+    # -- Phase A: recording (1st Ctrl+C, or stop_event, = clean stop) ---------
+    # ``has_audio`` alone is NOT enough to skip capture -- ``resume`` gates it.
+    # The existence of a WAV is only evidence that *some* take happened; without
+    # the caller's opt-in it is far more likely to be yesterday's lecture than
+    # the one about to be taught, and skipping capture would then record nothing
+    # at all while reporting a clean run.
+    has_audio = wav_path.exists() and wav_path.stat().st_size > 0
+    if resume and has_audio:
+        _resume_skip(output_dir, WAV_FILENAME, "Audio capture")
+        captured_slides: list = []
+        slide_catcher = None
     else:
-        # Validated rather than trusted. An out-of-range index from a web client
-        # would otherwise fail deep inside soundcard, after the output directory
-        # had already been created, with an error that names no slide and no
-        # device list.
-        devices = recorder.get_loopback_devices()
-        if not 0 <= device_id < len(devices):
-            _emit(state_callback, STATE_ERROR)
-            raise PipelineError(
-                f"device_id {device_id} out of range "
-                f"(0..{len(devices) - 1 if devices else 0})"
+        # Check-before-compute for the capture phase. Any checkpoint left in
+        # this directory describes audio that is about to be replaced, so it is
+        # dropped before the new take rather than after -- a crash during the
+        # re-record must not leave stale-but-plausible checkpoints behind for
+        # the next run to trust.
+        if resume:
+            console.print(
+                "[bold cyan]⏭  Resuming:[/bold cyan] no usable "
+                f"[bold cyan]{WAV_FILENAME}[/bold cyan] — recording from scratch."
             )
-    # Same cached list as the selection, so the index still points at this
-    # device:
-    device_name = recorder.get_loopback_devices()[device_id].name
+        stale = _invalidate_checkpoints(output_dir)
+        if stale:
+            console.print(
+                "[bold blue]ℹ[/bold blue] Discarded stale checkpoint(s): "
+                + ", ".join(stale)
+            )
 
-    _emit(state_callback, STATE_RECORDING)
-    console.print(f"[bold blue]ℹ[/bold blue] Recording from  : {device_name}")
-    console.print(f"[bold blue]ℹ[/bold blue] Emergency backup: {backup_path}\n",
-                  soft_wrap=True, highlight=False)
+        recorder = AudioRecorder(emergency_backup_path=backup_path)
+        if device_id is None:
+            device_id = select_device(recorder)
+        else:
+            # Validated rather than trusted. An out-of-range index from a web
+            # client would otherwise fail deep inside soundcard, after the
+            # output directory had already been created, with an error that
+            # names no slide and no device list.
+            devices = recorder.get_loopback_devices()
+            if not 0 <= device_id < len(devices):
+                _emit(state_callback, STATE_ERROR)
+                raise PipelineError(
+                    f"device_id {device_id} out of range "
+                    f"(0..{len(devices) - 1 if devices else 0})"
+                )
+        # Same cached list as the selection, so the index still points at this
+        # device:
+        device_name = recorder.get_loopback_devices()[device_id].name
 
-    # -- Phase A: recording (1st Ctrl+C = clean stop) -------------------------
-    # Phase 5: visual capture runs alongside the audio recording loop.
-    slide_catcher = SlideCatcher(output_dir=output_dir)
-    slide_catcher.start()
+        _emit(state_callback, STATE_RECORDING)
+        console.print(f"[bold blue]ℹ[/bold blue] Recording from  : {device_name}")
+        console.print(
+            f"[bold blue]ℹ[/bold blue] Emergency backup: {backup_path}\n",
+            soft_wrap=True, highlight=False,
+        )
 
-    try:
-        recorder.start_recording(device_id)
-        run_status_loop(recorder)
-    except KeyboardInterrupt:
-        # First Ctrl+C — stop cleanly, then hand off to the AI pipeline.
-        # Suppress further interrupts during the WAV flush so a panicked
-        # double Ctrl+C cannot corrupt the file (Phase 1 behaviour).
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # Phase 5: visual capture runs alongside the audio recording loop.
+        slide_catcher = SlideCatcher(output_dir=output_dir)
+        slide_catcher.start()
+
+        # Why every clean exit funnels through one flush below: there are three
+        # ways out of the capture loop and all of them owe the operator the same
+        # thing -- the audio that was captured must reach disk. Duplicating the
+        # flush per branch is how one of them ends up skipping it, and a run
+        # that reports "Recording stopped" while ``raw_audio.wav`` does not
+        # exist is worse than a crash.
+        stop_cause = "dropped"
         try:
-            recorder.stop_recording(wav_path)
-        finally:
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-        console.print(
-            "[bold green]🛑  Recording stopped.[/bold green] "
-            "Initiating AI Transcription..."
-        )
-        captured_slides = slide_catcher.stop()
-        console.print(
-            f"[bold green]🛑[/bold green] Slide capture stopped. "
-            f"Captured [bold]{len(captured_slides)}[/bold] unique slide(s)."
-        )
-    except (RuntimeError, OSError) as exc:
-        slide_catcher.stop()
-        console_err.print(f"\n[bold red]✗ Error:[/bold red] {exc}")
-        _emit(state_callback, STATE_ERROR)
-        raise PipelineError(f"capture failed: {exc}") from exc
-    else:
-        # Loop ended without Ctrl+C: the device dropped and the capture
-        # thread stopped itself — flush whatever audio was buffered.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            recorder.stop_recording(wav_path)
-        finally:
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-        console.print(
-            "[bold yellow]⚠️  Recording ended on its own "
-            "(possible device drop).[/bold yellow]"
-        )
+            recorder.start_recording(device_id)
+            run_status_loop(recorder, stop_event=stop_event)
+        except KeyboardInterrupt:
+            # First Ctrl+C — stop cleanly, then hand off to the AI pipeline.
+            with _suppress_sigint():
+                recorder.stop_recording(wav_path)
+            stop_cause = "interrupt"
+        except (RuntimeError, OSError) as exc:
+            slide_catcher.stop()
+            console_err.print(f"\n[bold red]✗ Error:[/bold red] {exc}")
+            _emit(state_callback, STATE_ERROR)
+            raise PipelineError(f"capture failed: {exc}") from exc
+        else:
+            # The loop returned without a Ctrl+C, for one of two very different
+            # reasons. Distinguishing them is not cosmetic: the operator has to
+            # know whether the lecture ended because the machine lost the device
+            # or because they pressed "Finish Class", because only the first one
+            # is a fault worth investigating. Note that the audio is flushed
+            # either way.
+            requested = stop_event is not None and stop_event.is_set()
+            with _suppress_sigint():
+                recorder.stop_recording(wav_path)
+            stop_cause = "requested" if requested else "dropped"
+
+        if stop_cause == "dropped":
+            console.print(
+                "[bold yellow]⚠️  Recording ended on its own "
+                "(possible device drop).[/bold yellow]"
+            )
+        else:
+            console.print(
+                "[bold green]🛑  Recording stopped.[/bold green] "
+                "Initiating AI Transcription..."
+            )
         captured_slides = slide_catcher.stop()
         console.print(
             f"[bold green]🛑[/bold green] Slide capture stopped. "
@@ -609,20 +899,47 @@ def run_pipeline(
     slides_dir = output_dir / "slides"
 
     try:
-        # -- Transcription & Diarization -----------------------------------
-        # The longest silent stretch in the pipeline (tens of minutes on CPU),
-        # so it is the one that most needs a visible "still working" signal.
-        # The spinner sits *inside* _interrupt_protected, not around it, so the
-        # deliberate single-Ctrl+C retry re-enters a live spinner rather than
-        # dropping to a frozen prompt.
-        _emit(state_callback, STATE_TRANSCRIBING)
-        with _spinner("[bold yellow]Transcribing and diarizing...[/bold yellow]"):
-            _interrupt_protected(
-                "transcription",
-                lambda: transcriber.transcribe_audio(wav_path, language=language),
+        # -- Transcription, Alignment & Diarization ------------------------
+        # Three expensive phases, three checkpoints, in pipeline order. Each one
+        # checks for its own checkpoint and runs only when there isn't a usable
+        # one, so a crash in the last phase costs one phase rather than all
+        # three.
+        #
+        # ``STATE_TRANSCRIBING`` is emitted only when at least one phase
+        # actually runs. A run resumed from a complete diarization checkpoint
+        # goes straight to synthesis, and saying "transcribing" first would
+        # report work that is not happening.
+        #
+        # The checkpoint is only *consulted* when resuming; on a fresh run the
+        # answer is known to be "run everything", and reading the file would
+        # only risk acting on a stale one. The ``resume`` flag is therefore the
+        # sole authority on whether a checkpoint may be trusted -- it is what
+        # stops a same-day re-run from transcribing yesterday's lecture.
+        segments = (
+            _load_segments(output_dir, DIARIZATION_CHECKPOINT) if resume else None
+        )
+        if segments is not None:
+            _resume_skip(
+                output_dir, DIARIZATION_CHECKPOINT, "Transcription & diarization"
             )
+        else:
+            _emit(state_callback, STATE_TRANSCRIBING)
+            # The longest silent stretch in the pipeline (tens of minutes on
+            # CPU), so it is the one that most needs a visible "still working"
+            # signal. The spinner sits *inside* _interrupt_protected, not around
+            # it, so the deliberate single-Ctrl+C retry re-enters a live spinner
+            # rather than dropping to a frozen prompt.
+            segments = _transcribe_with_checkpoints(
+                transcriber, wav_path, language, output_dir, resume
+            )
+
+        # The transcript is cheap to render and is what synthesis consumes, so
+        # it is (re)written even on a fully-resumed run. Regenerating it from
+        # the checkpointed segments is what makes "resume" mean the same thing
+        # as "the pipeline finished", rather than "a file is missing".
+        transcript_path = transcriber.write_transcript(wav_path, segments)
         console.print(
-            "[bold green]✓[/bold green] Transcription complete → "
+            f"[bold green]✓[/bold green] Transcript ready → "
             f"[bold cyan]{transcript_path.name}[/bold cyan]"
         )
 
@@ -658,7 +975,13 @@ def run_pipeline(
     console.print(f"[bold green]✅  All stages completed.[/bold green]\n")
     _kv("Audio      :", wav_path)
     _kv("Transcript :", transcript_path)
-    _kv("Slides     :", f"{len(captured_slides)} saved in {slide_catcher.slides_dir}")
+    # ``slide_catcher`` is None on a resumed capture, so the slides directory
+    # name comes from the module constant rather than the (absent) object.
+    _kv(
+        "Slides     :",
+        f"{len(captured_slides)} saved in "
+        f"{slide_catcher.slides_dir if slide_catcher else slides_dir.name}",
+    )
     _kv("Study Notes:", f"[bold]{notes_path}[/bold]")
     return str(notes_path)
 

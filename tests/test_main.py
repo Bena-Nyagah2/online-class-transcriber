@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -129,6 +131,66 @@ class SilentRecorder(FakeRecorder):
         wav_path.write_bytes(b"")
 
 
+class EndlessRecorder(FakeRecorder):
+    """Keeps recording until something other than the device stops it.
+
+    The base fake's ``is_recording`` is permanently False, so
+    ``run_status_loop`` ends on its first poll -- the device-drop branch. A
+    stop-event test needs the opposite: a loop that stays alive, so the *only*
+    available exit is the caller's event. That is the situation the web
+    dashboard is in, and it is not reachable with the base fake.
+    """
+
+    # Set by the test before the run; ``start_recording`` fires it to stand in
+    # for the operator pressing "Finish Class" a moment after capture began.
+    # Firing it from inside the recorder keeps the test deterministic: no
+    # sleep, no race against a background timer.
+    stop_event: threading.Event | None = None
+
+    def __init__(self, emergency_backup_path=None, **kwargs):
+        super().__init__(emergency_backup_path, **kwargs)
+        self.is_recording = types.SimpleNamespace(is_set=lambda: True)
+
+    def start_recording(self, device_id):
+        if self.stop_event is not None:
+            self.stop_event.set()
+        return None
+
+
+class OneTickRecorder(FakeRecorder):
+    """Reports ``is_recording`` true exactly once, then false.
+
+    The CLI-hint test needs both halves at once: the loop body must run so
+    something is printed, *and* the loop must return without a stop event --
+    which means ``is_recording`` has to clear by itself. Neither existing fake
+    does both. ``FakeRecorder`` never reports recording, so the body never runs
+    and nothing is printed; ``EndlessRecorder`` never stops, so the loop spins
+    forever. This is the only combination that terminates with output.
+    """
+
+    def __init__(self, emergency_backup_path=None, **kwargs):
+        super().__init__(emergency_backup_path, **kwargs)
+        ticks = 0
+
+        def _is_set():
+            nonlocal ticks
+            ticks += 1
+            return ticks == 1
+
+        self.is_recording = types.SimpleNamespace(is_set=_is_set)
+
+
+def _stoppable(stop_event: threading.Event) -> type[EndlessRecorder]:
+    """An :class:`EndlessRecorder` that fires ``stop_event`` as capture begins.
+
+    Built with ``type(...)`` rather than a ``class`` statement because a class
+    body cannot read a name it is also assigning -- ``class C(Base): stop_event
+    = stop_event`` raises ``NameError``, since the assignment makes it a
+    class-local and the enclosing local is not in scope for that lookup.
+    """
+    return type("StoppableRecorder", (EndlessRecorder,), {"stop_event": stop_event})
+
+
 class FakeCatcher:
     """Stand-in for ``SlideCatcher`` that reports three unique slides."""
 
@@ -165,6 +227,45 @@ def session(tmp_path, monkeypatch):
     return tmp_path
 
 
+SEGMENTS_STUB = [
+    {"start": 0.0, "end": 5.0, "text": "mock lecture", "words": []}
+]
+
+
+def _transcriber_stub(segments=None):
+    """A LocalTranscriber stand-in wired to the three-phase API.
+
+    Returns ``(patcher, stub)`` so a test can assert on ``stub.mock`` -- the
+    class-level mock -- and therefore on ``LocalTranscriber``'s own construction
+    arguments. Stubbing only ``mock.patch.object(m, "LocalTranscriber", ...)``
+    hides those, which is how the language-routing tests lost their assertion.
+
+    The phases are wired as a pass-through chain so ordering assertions see a
+    real sequence (``transcribe`` then ``align`` then ``diarize``) rather than
+    three disconnected calls.
+    """
+    segments = list(SEGMENTS_STUB if segments is None else segments)
+    instance = mock.MagicMock()
+    instance.transcribe.side_effect = lambda wav_path, language=None: list(segments)
+    instance.align.side_effect = (
+        lambda wav_path, segs, language=None: list(segs)
+    )
+    instance.diarize.side_effect = lambda wav_path, segs: list(segs)
+    instance.write_transcript.side_effect = (
+        lambda wav_path, segs=None: Path(wav_path).parent / m.TRANSCRIPT_FILENAME
+    )
+    instance.render_transcript.side_effect = lambda segs=None: "mock transcript"
+    cls = mock.MagicMock(return_value=instance)
+    patcher = mock.patch.object(m, "LocalTranscriber", cls)
+    # The handle goes on the *patcher*, because that is what ``with t`` yields
+    # and therefore what a test still holds after the block. Attaching it to the
+    # mock instead is the easy mistake here: ``mock.patch.object`` returns a
+    # ``_patch``, so ``t.mock`` is an AttributeError, and the patcher only grows
+    # a ``.mock`` while it is entered -- by which point the ``with`` has it.
+    patcher.instance = instance
+    return patcher, cls
+
+
 def _stub_engines(slow: float | None = None):
     """Patch both AI engines; optionally make them block for ``slow`` seconds."""
 
@@ -173,15 +274,33 @@ def _stub_engines(slow: float | None = None):
             time.sleep(slow)
 
     transcriber = mock.MagicMock()
-    # Accepts the ``language=`` keyword that main() now forwards; a bare
-    # positional lambda would fail here the moment routing is added.
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: (_block(), p)[1]
+    instance = transcriber.return_value
+    # Accepts the ``language=`` keyword that main() forwards to both the ASR
+    # and the alignment stage; a bare positional lambda would fail the moment
+    # routing is added. Each phase passes the previous one's segments through so
+    # the chain is connected, and the block happens inside the phase so a
+    # Ctrl+C test still lands mid-transcription.
+    instance.transcribe.side_effect = lambda wav_path, language=None: (
+        (_block(), list(SEGMENTS_STUB))[1]
     )
+    instance.align.side_effect = lambda wav_path, segs, language=None: (
+        (_block(), list(segs))[1]
+    )
+    instance.diarize.side_effect = lambda wav_path, segs: (
+        (_block(), list(segs))[1]
+    )
+    instance.write_transcript.side_effect = (
+        lambda wav_path, segs=None: Path(wav_path).parent / m.TRANSCRIPT_FILENAME
+    )
+    instance.render_transcript.side_effect = lambda segs=None: "mock transcript"
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = lambda *a: _block()
+    transcriber_patcher = mock.patch.object(m, "LocalTranscriber", transcriber)
+    # Exposed for tests that need to ask which phases ran; see _transcriber_stub
+    # for why the handle lives on the patcher rather than the mock.
+    transcriber_patcher.instance = instance
     return (
-        mock.patch.object(m, "LocalTranscriber", transcriber),
+        transcriber_patcher,
         mock.patch.object(m, "LectureSynthesizer", synthesizer),
     )
 
@@ -424,8 +543,17 @@ def test_transcription_runs_before_synthesis(consoles, session):
     """
     order: list[str] = []
     transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: order.append("t")
+    transcriber.return_value.transcribe.side_effect = (
+        lambda p, language=None: (order.append("t"), list(SEGMENTS_STUB))[1]
+    )
+    transcriber.return_value.align.side_effect = (
+        lambda p, segs, language=None: (order.append("a"), list(segs))[1]
+    )
+    transcriber.return_value.diarize.side_effect = (
+        lambda p, segs: (order.append("d"), list(segs))[1]
+    )
+    transcriber.return_value.write_transcript.side_effect = (
+        lambda p, segs=None: Path(p).parent / m.TRANSCRIPT_FILENAME
     )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = lambda *a: order.append("s")
@@ -434,7 +562,7 @@ def test_transcription_runs_before_synthesis(consoles, session):
          mock.patch.object(m, "LocalTranscriber", transcriber), \
          mock.patch.object(m, "LectureSynthesizer", synthesizer):
         m.main()
-    assert order == ["t", "s"]
+    assert order == ["t", "a", "d", "s"]
 
 
 def test_synthesis_receives_the_three_artifact_paths(consoles, session):
@@ -475,29 +603,29 @@ def test_synthesis_value_error_reports_transcript_path(consoles, session):
 
 
 def test_main_forwards_language_to_the_transcriber(consoles, session):
-    """The CLI's language choice must reach ``transcribe_audio``.
+    """The CLI's language choice must reach the ASR *and* alignment stages.
 
     Routing regression guard: ``main()`` takes the code and ``transcriber``
     consumes it, and nothing in between re-derives or drops it. A wrong code
     does not crash the decoder — it returns fluent text in the wrong language.
+
+    Both consuming stages are asserted. Alignment models are
+    language-specific, so a code that reached the ASR but not the aligner would
+    fail there in a way this test would otherwise miss entirely.
     """
     # NOTE: ``_stub_engines`` also patches LocalTranscriber, and because that
     # patcher is applied *after* the one under test it would silently win --
     # leaving ``transcriber.call_args`` as None. Only the synthesizer is stubbed.
     synth = mock.MagicMock()
     synth.return_value.generate_notes.return_value = True
-    transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: p
-    )
+    t, s = _transcriber_stub(list(SEGMENTS_STUB))
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
-         mock.patch.object(m, "LocalTranscriber", transcriber), \
-         mock.patch.object(m, "LectureSynthesizer", synth):
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
         assert m.main(language="sw") == 0
-    assert transcriber.return_value.transcribe_audio.call_args.kwargs == {
-        "language": "sw"
-    }
+    instance = s.return_value
+    assert instance.transcribe.call_args.kwargs == {"language": "sw"}
+    assert instance.align.call_args.kwargs == {"language": "sw"}
 
 
 def test_main_prompts_and_falls_back_to_english_on_empty_answer(
@@ -513,20 +641,16 @@ def test_main_prompts_and_falls_back_to_english_on_empty_answer(
     # See the note in test_main_forwards_language_to_the_transcriber: stubbing
     # LocalTranscriber twice would let the later patcher win.
     monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
-    transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: p
-    )
+    t, _ = _transcriber_stub()
     synth = mock.MagicMock()
     synth.return_value.generate_notes.return_value = True
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
-         mock.patch.object(m, "LocalTranscriber", transcriber), \
-         mock.patch.object(m, "LectureSynthesizer", synth):
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
         m.main()
-    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
-        "language"
-    ] == DEFAULT_LANGUAGE
+    instance = t.instance
+    assert instance.transcribe.call_args.kwargs["language"] == DEFAULT_LANGUAGE
+    assert instance.align.call_args.kwargs["language"] == DEFAULT_LANGUAGE
 
 
 def test_explicit_language_skips_the_prompt_entirely(consoles, session, mocker):
@@ -539,21 +663,17 @@ def test_explicit_language_skips_the_prompt_entirely(consoles, session, mocker):
     question nobody is there to answer.
     """
     ask = mocker.patch.object(m, "prompt_language")
-    transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: p
-    )
+    t, _ = _transcriber_stub()
     synth = mock.MagicMock()
     synth.return_value.generate_notes.return_value = True
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
-         mock.patch.object(m, "LocalTranscriber", transcriber), \
-         mock.patch.object(m, "LectureSynthesizer", synth):
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
         assert m.main(language="sw") == 0
     ask.assert_not_called()
-    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
-        "language"
-    ] == "sw"
+    instance = t.instance
+    assert instance.transcribe.call_args.kwargs["language"] == "sw"
+    assert instance.align.call_args.kwargs["language"] == "sw"
 
 
 def test_double_ctrl_c_during_synthesis_returns_130(consoles, session):
@@ -587,10 +707,20 @@ def test_single_ctrl_c_retries_the_phase_once(consoles, session):
         attempts.append(1)
         if len(attempts) == 1:
             raise KeyboardInterrupt
-        return _path
+        return list(SEGMENTS_STUB)
 
     transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = flaky
+    # The interrupt is raised from the *first* expensive phase. Align and
+    # diarize stay wired to pass segments through so the retry, once it
+    # succeeds, still has a real chain to feed.
+    transcriber.return_value.transcribe.side_effect = flaky
+    transcriber.return_value.align.side_effect = (
+        lambda p, segs, language=None: list(segs)
+    )
+    transcriber.return_value.diarize.side_effect = lambda p, segs: list(segs)
+    transcriber.return_value.write_transcript.side_effect = (
+        lambda p, segs=None: Path(p).parent / m.TRANSCRIPT_FILENAME
+    )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.return_value = True
     out, _ = consoles
@@ -620,7 +750,12 @@ def test_empty_wav_skips_ai_phases(consoles, tmp_path, monkeypatch):
          mock.patch.object(m, "LectureSynthesizer", synthesizer):
         assert m.main() == 1
     assert "No audio captured" in out.getvalue()
-    transcriber.return_value.transcribe_audio.assert_not_called()
+    # Every phase of the transcriber, not just the old combined entry point.
+    # Checking only one would let a phase leak through while the test stayed
+    # green -- the phases were split precisely so each could be skipped
+    # independently on a resume.
+    for phase in ("transcribe", "align", "diarize", "write_transcript"):
+        getattr(transcriber.return_value, phase).assert_not_called()
     synthesizer.return_value.generate_notes.assert_not_called()
 
 
@@ -642,16 +777,21 @@ def recorded_states():
     return []
 
 
-def _drive_run(course_code="CRM_1106", **kwargs):
+def _drive_run(course_code="CRM_1106", recorder_cls=FakeRecorder, **kwargs):
     """Run the pipeline with every dependency faked; return ``(result, states)``.
 
     Shared by the ``run_pipeline`` tests so each one states only what it is
     actually asserting. ``_stub_engines`` supplies the two AI engines;
     ``session`` (used by the caller) has already stubbed the interactive bits.
+
+    ``recorder_cls`` exists for the stop-event tests: the default
+    :class:`FakeRecorder` drops out of the capture loop immediately, which is
+    the device-drop branch, so a test that needs the loop to stay alive has to
+    ask for a different recorder.
     """
     states: list[str] = []
     t, s = _stub_engines()
-    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+    with mock.patch.object(m, "AudioRecorder", recorder_cls), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
          t, s:
         result = m.run_pipeline(
@@ -705,10 +845,22 @@ def test_states_are_emitted_at_stage_start_not_at_the_end(consoles, session):
     def record_state(state):
         timeline.append(f"state:{state}")
 
-    t, s = _stub_engines()
     transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: timeline.append("transcribe")
+    # The three phases are recorded individually, because the assertion below
+    # is that STATE_TRANSCRIBING brackets *all* of them: it fires once, before
+    # the first phase, and synthesis is not announced until the last has
+    # finished.
+    transcriber.return_value.transcribe.side_effect = (
+        lambda p, language=None: (timeline.append("transcribe"), list(SEGMENTS_STUB))[1]
+    )
+    transcriber.return_value.align.side_effect = (
+        lambda p, segs, language=None: (timeline.append("align"), list(segs))[1]
+    )
+    transcriber.return_value.diarize.side_effect = (
+        lambda p, segs: (timeline.append("diarize"), list(segs))[1]
+    )
+    transcriber.return_value.write_transcript.side_effect = (
+        lambda p, segs=None: Path(p).parent / m.TRANSCRIPT_FILENAME
     )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = (
@@ -724,6 +876,8 @@ def test_states_are_emitted_at_stage_start_not_at_the_end(consoles, session):
         f"state:{m.STATE_RECORDING}",
         f"state:{m.STATE_TRANSCRIBING}",
         "transcribe",
+        "align",
+        "diarize",
         f"state:{m.STATE_SYNTHESIZING}",
         "synthesize",
         f"state:{m.STATE_COMPLETE}",
@@ -795,12 +949,18 @@ def test_pipeline_error_carries_the_cancellation_exit_code(consoles, session):
     would make a scheduled run's cancellation indistinguishable from a genuine
     engine failure in whatever consumes its exit status.
     """
-    t, s = _stub_engines()
+    # Both the retry and the re-raise must be interrupted, otherwise the
+    # single-press retry would swallow the second Ctrl+C and the run would
+    # complete instead of reporting 130.
     interrupting = mock.MagicMock()
-    interrupting.return_value.transcribe_audio.side_effect = [KeyboardInterrupt, KeyboardInterrupt]
-    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+    interrupting.return_value.transcribe.side_effect = [
+        KeyboardInterrupt, KeyboardInterrupt
+    ]
+    synth = mock.patch.object(m, "LectureSynthesizer", mock.MagicMock())
+    with synth, \
+         mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
-         t, mock.patch.object(m, "LocalTranscriber", interrupting):
+         mock.patch.object(m, "LocalTranscriber", interrupting):
         with pytest.raises(m.PipelineError) as excinfo:
             m.run_pipeline("CRM_1106")
     assert excinfo.value.exit_code == 130
@@ -1041,22 +1201,16 @@ def test_course_code_is_asked_before_the_language(consoles, tmp_path, mocker):
     mocker.patch.object(m, "prompt_course_code", _course)
     mocker.patch.object(m, "prompt_language", _language)
 
-    transcriber = mock.MagicMock()
-    transcriber.return_value.transcribe_audio.side_effect = (
-        lambda p, language=None: p
-    )
+    t, _ = _transcriber_stub()
     synth = mock.MagicMock()
     synth.return_value.generate_notes.return_value = True
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
-         mock.patch.object(m, "LocalTranscriber", transcriber), \
-         mock.patch.object(m, "LectureSynthesizer", synth):
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
         assert m.main() == 0
 
     assert asked == ["course", "language"]
-    assert transcriber.return_value.transcribe_audio.call_args.kwargs[
-        "language"
-    ] == "sw"
+    assert t.instance.transcribe.call_args.kwargs["language"] == "sw"
 
 
 def test_cli_entrypoint_prompts_and_forwards_the_language(tmp_path):
@@ -1106,13 +1260,24 @@ class C:
     def start(self): pass
     def stop(self): return ["a.jpg"]
 
+SEGS = [{{"start": 0.0, "end": 1.0, "text": "mock", "words": []}}]
 captured = {{}}
-def cap(p, language=None):
+def cap_asr(wav_path, language=None):
     captured["language"] = language
-    return p
+    return list(SEGS)
+def cap_align(wav_path, segs, language=None):
+    captured["align_language"] = language
+    return list(segs)
 
 T = mock.MagicMock()
-T.return_value.transcribe_audio.side_effect = cap
+T.return_value.transcribe.side_effect = cap_asr
+T.return_value.align.side_effect = cap_align
+T.return_value.diarize.side_effect = lambda p, segs: list(segs)
+T.return_value.write_transcript.side_effect = (
+    lambda wav_path, segs=None: types.SimpleNamespace(
+        name="raw_transcript.txt", parent=wav_path.parent, __str__=lambda s: str(wav_path.parent / s.name)
+    )
+)
 S = mock.MagicMock()
 S.return_value.generate_notes.return_value = True
 
@@ -1134,16 +1299,19 @@ try:
 except SystemExit:
     pass
 print("CAPTURED_LANG=" + repr(captured.get("language")))
+print("CAPTURED_ALIGN_LANG=" + repr(captured.get("align_language")))
 '''
 
     proc = subprocess.run(
         [sys.executable, "-c", script],
         cwd=str(ROOT), capture_output=True, text=True, env={**os.environ},
     )
-    assert "CAPTURED_LANG='sw'" in proc.stdout, (
-        f"language not forwarded from the CLI prompt.\n"
-        f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
-    )
+    # Both consuming phases, for the same reason as the in-process routing test.
+    for marker in ("CAPTURED_LANG='sw'", "CAPTURED_ALIGN_LANG='sw'"):
+        assert marker in proc.stdout, (
+            f"{marker} not forwarded from the CLI prompt.\n"
+            f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
+        )
 
 
 def test_module_defines_no_bare_print_calls():
@@ -1176,3 +1344,638 @@ def test_status_is_imported_from_rich_status():
     import rich.console
 
     assert not hasattr(rich.console, "Status")
+
+
+# ---------------------------------------------------------------------------
+# 8. Caller-driven stop (the web dashboard's "Finish Class")
+# ---------------------------------------------------------------------------
+# The CLI ends a recording with Ctrl+C, which raises KeyboardInterrupt on
+# whichever thread owns the terminal. ``server.py`` has no terminal, so the
+# same outcome is driven by a ``threading.Event`` the pipeline watches.
+#
+# The contract is deliberately narrow: setting the event must make the capture
+# loop *return*, not raise, so the pipeline falls through into transcription
+# exactly as it does after a Ctrl+C. A stop that unwound the run would discard
+# the lecture the operator just recorded -- the opposite of what they asked for.
+
+
+def test_a_set_stop_event_ends_the_recording_phase(consoles, session):
+    """The loop must return rather than raise.
+
+    Returning is the whole point. ``run_status_loop`` returning is what lets
+    ``run_pipeline`` continue into transcription; if it raised instead, the
+    event would abort the run and the audio that was already captured would be
+    thrown away.
+    """
+    stop_event = threading.Event()
+
+    result, states = _drive_run(
+        device_id=0,
+        recorder_cls=_stoppable(stop_event),
+        stop_event=stop_event,
+        # True, not False: the session fixture pre-seeds a non-empty WAV so the
+        # AI phases will run, and `False` means "refuse to overwrite", which
+        # aborts before the recording phase is ever reached.
+        confirm_overwrite=True,
+    )
+
+    assert result.endswith(".md"), "a stopped recording must still produce notes"
+    assert states == [
+        m.STATE_RECORDING,
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+    ]
+
+
+def test_a_requested_stop_is_not_reported_as_a_device_drop(consoles, session):
+    """The operator has to be able to tell "I stopped it" from "it broke".
+
+    Both land in the same place in the code, so they are told apart by whether
+    ``stop_event`` is set. Conflating them is not a cosmetic slip: a lecturer
+    whose laptop lost the audio device needs to know the recording is suspect
+    and re-take it, and "possible device drop" on every deliberate stop trains
+    them to ignore the one warning that matters.
+    """
+    stop_event = threading.Event()
+    out, _ = consoles
+
+    _drive_run(
+        device_id=0,
+        recorder_cls=_stoppable(stop_event),
+        stop_event=stop_event,
+        confirm_overwrite=True,
+    )
+    text = out.getvalue()
+
+    assert "Recording stopped" in text
+    assert "device drop" not in text
+
+
+def test_an_unstopped_device_drop_is_still_reported_as_one(consoles, session):
+    """The other half of the same distinction, so the fix above is not a blunt one.
+
+    ``FakeRecorder`` never records, so the capture loop ends on its own with no
+    stop event set. That must keep warning about a dropped device -- otherwise
+    the previous test would pass just because the message was deleted.
+    """
+    out, _ = consoles
+
+    _drive_run(device_id=0, confirm_overwrite=True)
+    text = out.getvalue()
+
+    assert "device drop" in text
+    assert "Recording stopped" not in text
+
+
+def test_a_stop_set_while_the_loop_is_waiting_ends_it_promptly(consoles):
+    """Finish Class must feel immediate, not lag by up to a full second.
+
+    The loop repaints once a second. If it slept on a timer between repaints,
+    a stop would go unnoticed until the next tick -- up to a second of the
+    button looking dead. It waits on the event itself instead, so the latency
+    is however long the event takes, which is microseconds.
+
+    The 0.5s ceiling is chosen to separate the two implementations rather than
+    to be tight: a ``time.sleep(1.0)`` loop notices the event at ~0.85s, while
+    an event-driven one returns in well under 10ms. Anything in between would
+    be a machine problem, not a design one.
+    """
+    stop_event = threading.Event()
+    recorder = EndlessRecorder()
+
+    worker = threading.Thread(
+        target=m.run_status_loop, args=(recorder, stop_event), daemon=True
+    )
+    worker.start()
+    # Let the loop reach its wait, so the measurement covers waking it rather
+    # than merely noticing an already-set event.
+    time.sleep(0.15)
+
+    started = time.monotonic()
+    stop_event.set()
+    worker.join(timeout=5)
+    elapsed = time.monotonic() - started
+
+    assert not worker.is_alive(), "the loop ignored the stop event"
+    assert elapsed < 0.5, f"the loop took {elapsed:.2f}s to notice the stop"
+
+
+def test_a_stop_ends_the_loop_even_though_nobody_pressed_a_key(consoles):
+    """The loop is gated on two things and must react to the one it is given.
+
+    ``recorder.is_recording`` stays set forever in this fake, so the event is
+    the only exit available. A regression that made the loop watch only the
+    recorder -- the pre-existing single-source behaviour -- would hang here
+    rather than fail, so the join is given a deadline and the thread is a
+    daemon so a genuine hang fails the test instead of wedging the suite.
+    """
+    stop_event = threading.Event()
+    recorder = EndlessRecorder()  # is_recording stays True
+    outcome: list[str] = []
+
+    def _run() -> None:
+        try:
+            m.run_status_loop(recorder, stop_event)
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            outcome.append(f"{type(exc).__name__}: {exc}")
+        else:
+            outcome.append("returned")
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    time.sleep(0.15)
+    stop_event.set()
+    worker.join(timeout=5)
+
+    assert outcome == ["returned"], outcome or "the loop never returned"
+
+
+def test_run_pipeline_works_off_the_main_thread(consoles, session):
+    """Regression test: the web server runs this pipeline in a worker thread.
+
+    ``signal.signal`` raises ``ValueError: signal only works in main thread of
+    the main interpreter`` anywhere but the main thread, and the recording
+    phase used to call it unconditionally while flushing the WAV. Every other
+    test in this file runs on the main thread, so none of them could catch
+    that -- the failure only ever appeared under uvicorn, at the exact moment a
+    finished recording was being written to disk.
+
+    The whole pipeline is driven from a worker thread here and must complete
+    normally. This also covers the deliberate-stop path off-thread, since the
+    dashboard is the only caller that ever takes it.
+    """
+    stop_event = threading.Event()
+    outcome: list = []
+
+    def _run() -> None:
+        try:
+            outcome.extend(
+                _drive_run(
+                    device_id=0,
+                    recorder_cls=_stoppable(stop_event),
+                    stop_event=stop_event,
+                    confirm_overwrite=True,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            outcome.append(f"{type(exc).__name__}: {exc}")
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=60)
+
+    assert not worker.is_alive(), "run_pipeline hung off the main thread"
+    assert len(outcome) == 2, f"the run failed off-thread: {outcome}"
+    assert outcome[0].endswith(".md"), outcome[0]
+    assert outcome[1][-1] == m.STATE_COMPLETE, outcome[1]
+
+
+def test_suppress_sigint_is_a_no_op_off_the_main_thread():
+    """The guard must degrade to nothing rather than raise where it cannot apply.
+
+    There is nothing to suppress in a worker thread anyway: SIGINT is delivered
+    to the main thread only, so the worker could never receive the interrupt
+    this exists to defend against.
+    """
+    errors: list[str] = []
+
+    def _run() -> None:
+        try:
+            with m._suppress_sigint():
+                pass
+        except BaseException as exc:  # noqa: BLE001 - reported to the caller
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == [], errors[0]
+
+
+def test_suppress_sigint_restores_the_previous_handler_on_the_main_thread():
+    """The CLI still needs its guard, and must hand the handler back.
+
+    Asserted with a sentinel rather than ``SIG_DFL`` because the real contract
+    is "put back what was there": a program that installed its own SIGINT
+    handler must still have it after the WAV flush. The previous code
+    hard-coded ``SIG_DFL``, which silently discarded such a handler.
+    """
+    sentinel = lambda *a: None  # noqa: E731 - a signal handler is a plain callable
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, sentinel)
+    try:
+        with m._suppress_sigint():
+            assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+        assert signal.getsignal(signal.SIGINT) is sentinel
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def test_suppress_sigint_restores_the_handler_even_when_the_body_raises():
+    """A failed flush must not leave SIGINT ignored for the rest of the session.
+
+    Otherwise one failed ``stop_recording`` would silently disarm Ctrl+C, and
+    the operator's next attempt to abort a runaway transcription would do
+    nothing at all.
+    """
+
+    def _boom() -> None:
+        raise RuntimeError("flush failed")
+
+    previous = signal.getsignal(signal.SIGINT)
+    with pytest.raises(RuntimeError, match="flush failed"):
+        with m._suppress_sigint():
+            _boom()
+
+    assert signal.getsignal(signal.SIGINT) is not signal.SIG_IGN
+    assert signal.getsignal(signal.SIGINT) is previous
+
+
+def test_the_prompt_omits_the_ctrl_c_hint_when_a_stop_event_is_supplied(consoles):
+    """Telling a browser-driven run to press a key it has no keyboard for.
+
+    The status line says "Press Ctrl+C to stop" because that is the only way to
+    stop a CLI run. With a ``stop_event`` the caller has a different verb --
+    the dashboard's button -- so the advice is simply wrong.
+
+    ``EndlessRecorder`` is required so the loop body runs at least once (the
+    base fake would exit before printing anything), and the event is set up
+    front so the loop is guaranteed to terminate on its first wait.
+    """
+    out, _ = consoles
+    stop_event = threading.Event()
+    stop_event.set()  # end after a single repaint
+
+    m.run_status_loop(EndlessRecorder(), stop_event)
+
+    assert "Recording in progress" in out.getvalue()
+    assert "Ctrl+C" not in out.getvalue()
+
+
+def test_the_prompt_still_mentions_ctrl_c_without_a_stop_event(consoles):
+    """The CLI is the default caller and its hint must survive the change.
+
+    Guards against the hint being removed outright rather than made
+    conditional, which would pass the previous test.
+
+    ``OneTickRecorder`` because with no stop event the loop can only end on its
+    own -- so the fake has to both print once and then stop, which is a
+    combination neither other fake provides.
+    """
+    out, _ = consoles
+
+    m.run_status_loop(OneTickRecorder())  # no stop_event: the CLI path
+
+    assert "Ctrl+C" in out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# 9. Idempotent checkpointing (resume after a crash)
+# ---------------------------------------------------------------------------
+# The pipeline is check-before-compute against three files that sit at the three
+# expensive phase boundaries. The tests below hold two separate contracts:
+#
+#   * a *resumed* run must not re-run a phase whose checkpoint exists, because
+#     not re-running it is the entire feature; and
+#   * a *fresh* run must not trust a checkpoint whose audio it has just
+#     replaced, because that would pair this lecture's audio with the previous
+#     lecture's words -- a silent, confident corruption.
+#
+# The second contract is why ``resume`` is opt-in: the output directory is keyed
+# by course *and date*, so a same-day re-run finds the earlier take's audio
+# already in place, and auto-resuming would quietly skip the new recording.
+
+
+def _write_checkpoint(output_dir, filename, payload=None):
+    """Drop a checkpoint file into ``output_dir`` and return its path."""
+    path = output_dir / filename
+    if payload is None:
+        payload = [{"start": 0.0, "end": 1.0, "text": "from checkpoint", "words": []}]
+    m.write_checkpoint(path, payload)
+    return path
+
+
+def _drive_resumable(session, course_code="CRM_1106", **kwargs):
+    """Run the pipeline against stubbed engines; return ``(result, states, transcriber)``.
+
+    ``transcriber`` is the *instance* the pipeline built, so a test can assert
+    which phases were reached -- the whole question a resume test is asking.
+    """
+    states: list[str] = []
+    t, s = _stub_engines()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, s:
+        result = m.run_pipeline(
+            course_code, state_callback=states.append, **kwargs
+        )
+    return result, states, t.instance
+
+
+def test_a_fresh_run_writes_every_checkpoint(consoles, session):
+    """The checkpoints must be produced by the normal path, not just consumed.
+
+    A writer that only ever reads is how this feature would look if it were
+    implemented backwards -- every test that pre-seeds a file would still pass
+    while a real crash had nothing to resume from.
+    """
+    _drive_resumable(session, confirm_overwrite=True)
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        assert (session / filename).is_file(), f"{filename} was never written"
+
+
+def test_resume_skips_every_completed_phase(consoles, session):
+    """All three checkpoints present means no heavy compute at all.
+
+    This is the fast-forward: the run should go straight to synthesis. The
+    transcript is still rendered from the checkpointed segments, because that is
+    what synthesis consumes and regenerating it is what makes a resume end in
+    the same state as an uninterrupted run.
+    """
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        _write_checkpoint(session, filename)
+
+    result, states, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    # The point of the whole feature: the expensive calls never happen.
+    transcriber.transcribe.assert_not_called()
+    transcriber.align.assert_not_called()
+    transcriber.diarize.assert_not_called()
+    # But synthesis does, and the transcript is rebuilt from the checkpoint.
+    transcriber.write_transcript.assert_called_once()
+    assert result.endswith(".md")
+    # Recording is skipped too, so STATE_RECORDING is never emitted;
+    # STATE_TRANSCRIBING is skipped because no transcribing phase runs.
+    assert states == [m.STATE_SYNTHESIZING, m.STATE_COMPLETE]
+
+
+def test_resume_skips_recording_but_still_transcribes(consoles, session):
+    """Audio present, no checkpoints: skip capture, run all three AI phases.
+
+    The state sequence is the assertion that capture was skipped. It is also
+    the practical payoff: the resumed run never touches capture hardware, so it
+    works on a machine whose audio device is the thing that failed.
+    """
+    result, states, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    assert states == [
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+    ]
+    transcriber.transcribe.assert_called_once()
+    transcriber.align.assert_called_once()
+    transcriber.diarize.assert_called_once()
+    assert result.endswith(".md")
+
+
+def test_resume_after_the_asr_phase_skips_only_transcription(consoles, session):
+    """One checkpoint present must skip exactly one phase.
+
+    Asserting that the later phases still ran is what separates "resumed
+    correctly" from "skipped everything because the resume flag was read as
+    'nothing left to do'".
+    """
+    _write_checkpoint(session, m.TRANSCRIPTION_CHECKPOINT)
+
+    _, states, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    transcriber.transcribe.assert_not_called()
+    transcriber.align.assert_called_once()
+    transcriber.diarize.assert_called_once()
+    assert states[0] == m.STATE_TRANSCRIBING
+
+
+def test_resume_after_alignment_skips_two_phases(consoles, session):
+    """The mid-pipeline boundary, which is the one most likely to be missed.
+
+    ``alignment.json`` is not one of the two checkpoints in the original
+    sketch, so it is the one a regression would drop. Without it a crash during
+    diarization would redo the alignment pass as well.
+    """
+    _write_checkpoint(session, m.TRANSCRIPTION_CHECKPOINT)
+    _write_checkpoint(session, m.ALIGNMENT_CHECKPOINT)
+
+    _, _, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    transcriber.transcribe.assert_not_called()
+    transcriber.align.assert_not_called()
+    transcriber.diarize.assert_called_once()
+
+
+def test_resume_reuses_the_checkpointed_segments_verbatim(consoles, session):
+    """The resumed transcript must come from the file, not from a fresh run.
+
+    Guards the failure mode where the checkpoint is consulted but its *content*
+    is discarded -- the phase is skipped and then handed empty input.
+    """
+    marker = "the exact words that were checkpointed"
+    _write_checkpoint(
+        session, m.DIARIZATION_CHECKPOINT,
+        [{"start": 0.0, "end": 1.0, "text": marker, "words": []}],
+    )
+
+    _, _, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    (args, _kwargs) = transcriber.write_transcript.call_args
+    _wav_path, segments = args
+    assert segments[0]["text"] == marker
+
+
+def test_a_run_that_is_not_resuming_ignores_existing_checkpoints(consoles, session):
+    """Opting out of resume must opt out of *reading*, not of writing.
+
+    This is the safety half of the feature. The output directory is keyed by
+    course and date, so a same-day re-run would otherwise find the earlier
+    take's checkpoints and transcribe those instead of the new lecture.
+
+    Asserted with a *complete* checkpoint set -- transcription, alignment and
+    diarization -- because a partial one is not a discriminator: with only
+    ``transcription.json`` present, running the ASR and skipping it produce the
+    same set of phase calls. Every phase must run for this test to distinguish
+    "ignored the checkpoints" from "resumed them".
+    """
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        _write_checkpoint(session, filename)
+
+    _, states, transcriber = _drive_resumable(session, confirm_overwrite=True)
+
+    # Recording happened, so the checkpoints were discarded and all three
+    # phases recomputed from the new take.
+    assert m.STATE_RECORDING in states
+    transcriber.transcribe.assert_called_once()
+    transcriber.align.assert_called_once()
+    transcriber.diarize.assert_called_once()
+
+
+def test_fresh_audio_invalidates_the_previous_take_s_checkpoints(consoles, session):
+    """Stale checkpoints must be cleared before replacement audio is used.
+
+    Deleting is not housekeeping. A checkpoint is keyed only by directory, so
+    one left behind after a re-record belongs to different audio entirely; the
+    next resume would then splice yesterday's transcript onto today's lecture.
+
+    Asserted on *content*, not existence: the fresh run writes its own
+    checkpoints a moment later, so "the file is gone" is true only for an
+    instant and proves nothing. What must hold is that the previous take's words
+    are nowhere on disk.
+    """
+    marker = "STALE LECTURE FROM A PREVIOUS TAKE"
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        _write_checkpoint(
+            session, filename,
+            [{"start": 0.0, "end": 1.0, "text": marker, "words": []}],
+        )
+
+    with mock.patch.object(
+        m, "_invalidate_checkpoints", wraps=m._invalidate_checkpoints
+    ) as invalidate:
+        _drive_resumable(session, confirm_overwrite=True)
+
+    assert invalidate.call_count == 1, "the stale checkpoints were never cleared"
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        assert marker not in (session / filename).read_text(encoding="utf-8"), (
+            f"{filename} still holds the previous take's content"
+        )
+
+
+def test_a_corrupt_checkpoint_is_recomputed_rather_than_trusted(consoles, session):
+    """Garbage on disk must mean "recompute", never "load and continue".
+
+    A truncated checkpoint is the expected artefact of exactly the crash this
+    feature exists to survive, so it is a case the happy path must handle
+    without special prompting. Treating it as valid would feed nonsense into
+    the transcript and report success.
+    """
+    path = session / m.TRANSCRIPTION_CHECKPOINT
+    path.write_text("[{'start': 0.0, 'text': 'half a',", encoding="utf-8")
+
+    _, _, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    transcriber.transcribe.assert_called_once()
+
+
+def test_a_checkpoint_of_the_wrong_shape_is_recomputed(consoles, session):
+    """Well-formed JSON of the wrong shape is still not a usable checkpoint.
+
+    ``{"segments": []}`` parses cleanly, so a resume path that only checked
+    "did the JSON load" would hand a dict to code expecting a list and fail
+    deep inside the next phase, where the error names nothing useful.
+    """
+    _write_checkpoint(session, m.TRANSCRIPTION_CHECKPOINT, {"segments": []})
+
+    _, _, transcriber = _drive_resumable(
+        session, confirm_overwrite=True, resume=True
+    )
+
+    transcriber.transcribe.assert_called_once()
+
+
+def test_a_run_that_is_not_resuming_never_reads_a_checkpoint(consoles, session):
+    """No checkpoint is even *opened* unless the caller asked to resume.
+
+    Narrower than the phase assertions above, and it is the one that holds the
+    ``resume`` guard itself. Those other tests pass either way here, because
+    Phase A invalidates the stale checkpoints before this point -- so by the time
+    the transcription phase looks, there is nothing left to find and reading is
+    indistinguishable from not reading. Asserting that the read never happens
+    removes the masking.
+
+    Read-versus-not is the whole safety property: a resumed flag that consults
+    checkpoints on a fresh run is one refactor away from serving stale audio.
+    """
+    for filename in (
+        m.TRANSCRIPTION_CHECKPOINT,
+        m.ALIGNMENT_CHECKPOINT,
+        m.DIARIZATION_CHECKPOINT,
+    ):
+        _write_checkpoint(session, filename)
+
+    with mock.patch.object(
+        m, "_load_segments", wraps=m._load_segments
+    ) as load_segments:
+        _drive_resumable(session, confirm_overwrite=True)
+
+    assert not load_segments.called, (
+        "a non-resuming run consulted a checkpoint; the resume flag is the only "
+        "thing standing between a same-day re-run and the previous lecture"
+    )
+
+
+def test_a_default_run_records_even_though_an_earlier_take_exists(
+    consoles, session
+):
+    """No ``resume`` means record, even when a WAV from an earlier take is there.
+
+    The output directory is named for the course *and the date*, so a second run
+    of the same course on the same day always finds yesterday's-or-this-morning's
+    take sitting in it. If the mere existence of that file skipped capture, the
+    second class of every day would silently record nothing -- and then
+    transcribe the previous lecture as though it were today's. That is a data
+    loss bug wearing the costume of a feature, which is why ``resume`` is opt-in.
+    """
+    # ``session`` pre-seeds a non-empty raw_audio.wav, i.e. exactly this case.
+    assert (session / m.WAV_FILENAME).stat().st_size > 0
+
+    _, states, transcriber = _drive_resumable(session, confirm_overwrite=True)
+
+    assert m.STATE_RECORDING in states, (
+        "an existing WAV silently suppressed capture without resume=True"
+    )
+    transcriber.transcribe.assert_called_once()
+
+
+def test_resume_without_audio_records_normally(consoles, tmp_path, monkeypatch):
+    """``resume=True`` is a hint, not an instruction to skip capture.
+
+    A crash *during* the recording leaves no audio to resume from, and that is
+    the case where the operator most wants a normal run. The flag must degrade
+    to a full run rather than erroring or skipping to a transcript that does not
+    exist.
+    """
+    monkeypatch.setattr(m, "create_output_dir", lambda code: tmp_path)
+    monkeypatch.setattr(m, "prompt_course_code", lambda: "CRM_1106")
+    monkeypatch.setattr(m, "prompt_language", lambda *a, **k: DEFAULT_LANGUAGE)
+    monkeypatch.setattr(m, "select_device", lambda recorder: 0)
+    monkeypatch.setattr(m, "_confirm_overwrite", lambda path: True)
+
+    _, states, transcriber = _drive_resumable(tmp_path, resume=True)
+
+    assert m.STATE_RECORDING in states
+    transcriber.transcribe.assert_called_once()
+

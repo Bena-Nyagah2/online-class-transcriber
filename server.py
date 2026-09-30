@@ -10,6 +10,8 @@ Endpoints
 ``POST /api/record``
     Accepts ``{"course_code": ..., "language": ...}``, returns immediately, and
     runs the pipeline in the background.
+``POST /api/stop``
+    Ends the recording phase and lets the pipeline proceed to transcription.
 ``GET /api/stream``
     A Server-Sent Events stream of every state change.
 ``GET /``
@@ -38,6 +40,14 @@ open tab, forever, to be told things that change roughly five times per lecture.
 Worse, it is *late by up to two seconds* precisely when the operator wants to
 know what is happening. Pushing state changes means zero requests while idle
 and no lag while busy.
+
+**Why stopping is an Event and not a signal.** The CLI ends a recording with
+Ctrl+C, which raises ``KeyboardInterrupt`` in whichever thread owns the
+terminal. A browser has no terminal and cannot send a signal, so the recording
+loop is instead handed a ``threading.Event`` that ``run_status_loop`` watches.
+Setting it ends the loop and drops the pipeline into the same hand-off path a
+Ctrl+C takes, including flushing the audio to disk. ``run_pipeline`` stays the
+single implementation of "stop recording": this module only supplies the signal.
 
 **Why a lock.** :data:`APP_STATE` is mutated from the background thread and
 read from request handlers on the event loop. A dict assignment is atomic under
@@ -68,8 +78,10 @@ from main import (
     STATE_RECORDING,
     STATE_SYNTHESIZING,
     STATE_TRANSCRIBING,
+    WAV_FILENAME,
     PipelineError,
     _sanitize_course_code,
+    create_output_dir,
     resolve_device_index,
     run_pipeline,
 )
@@ -101,11 +113,28 @@ _state_lock = threading.Lock()
 _run_lock = threading.Lock()
 _run_active = False
 
+# The "end the recording phase" signal for the run in flight, or None when no
+# run is recording. Set by POST /api/record and consumed by POST /api/stop.
+#
+# Created in the request handler rather than inside the background task, and
+# that is not a style preference. BackgroundTasks do not start until the
+# response has been returned, so an event minted inside the task would leave a
+# window in which /api/stop correctly refuses a stop that the operator could
+# legitimately have requested. Minting it here means it exists before the 200
+# does.
+#
+# Reading and writing a single module global needs no lock of its own (the
+# assignment is atomic under the GIL), and the one genuinely two-field
+# question -- "is a recording actually in progress?" -- is answered by the
+# status token, which _set_state does lock. See _request_stop for how the two
+# are combined and why the residual window is harmless.
+_stop_event: threading.Event | None = None
+
 # What each state means in a sentence a human can act on. The wire format stays
 # the bare token; only the presentation is added.
 _STATE_MESSAGES: dict[str, str] = {
     "idle": "Ready. Submit a course code to begin a recording.",
-    STATE_RECORDING: "Recording loopback audio. Press Ctrl+C in the terminal to stop.",
+    STATE_RECORDING: "Recording loopback audio. Press Finish Class when the lecture ends.",
     STATE_TRANSCRIBING: "Transcribing and diarizing. This is the longest phase.",
     STATE_SYNTHESIZING: "Synthesizing study notes from the transcript and slides.",
     STATE_COMPLETE: "Pipeline complete. Study notes written to disk.",
@@ -373,7 +402,9 @@ def _make_state_callback() -> Callable[[str], None]:
     return on_state
 
 
-def _run_in_background(course_code: str, language: str) -> None:
+def _run_in_background(
+    course_code: str, language: str, stop_event: threading.Event
+) -> None:
     """Execute the pipeline, recording its outcome into :data:`APP_STATE`.
 
     Runs on Starlette's threadpool because it is a plain synchronous function:
@@ -386,20 +417,39 @@ def _run_in_background(course_code: str, language: str) -> None:
     marshals onto the event loop itself, so this thread never has to know a loop
     exists.
 
+    Args:
+        course_code: Sanitised course unit code.
+        language: Two-letter spoken-language code.
+        stop_event: The event ``POST /api/stop`` sets to end the recording
+            phase. Passed in rather than read from the module global so that
+            this run can only ever be stopped by the request that started it --
+            a stale event from a previous run cannot be re-armed into a new one.
+
     Every exit path releases ``_run_lock``; a run that raised while holding it
-    would leave the server permanently refusing new requests.
+    would leave the server permanently refusing new requests. The same applies
+    to the stop event: leaving a *set* event published would make the next
+    recording end the instant it started.
+
+    ``confirm_overwrite`` is ``True`` and that is not a reversal of the safe
+    default it looks like. The decision was already made, in the request
+    handler, which refuses outright when a previous take exists -- so by the
+    time this runs there is nothing left to clobber. Passing ``False`` here
+    instead (as this originally did) made ``run_pipeline`` abort on *every*
+    request, existing file or not, so ``/api/record`` could never begin a
+    lecture at all.
     """
-    global _run_active
+    global _run_active, _stop_event
     try:
         notes_path = run_pipeline(
             course_code,
             language,
             _make_state_callback(),
             # No terminal to prompt on, so both interactive decisions are made
-            # here instead. Refusing to overwrite is the safe default: a
-            # browser has no way to ask the operator.
+            # here instead. The device is auto-selected and the overwrite has
+            # already been vetted by the handler.
             device_id=resolve_device_index(),
-            confirm_overwrite=False,
+            confirm_overwrite=True,
+            stop_event=stop_event,
         )
     except PipelineError as exc:
         # Expected failure, already reported to the terminal by run_pipeline.
@@ -418,6 +468,12 @@ def _run_in_background(course_code: str, language: str) -> None:
     finally:
         with _run_lock:
             _run_active = False
+        # Cleared, never reset: a fresh Event is minted per run, so an aborted
+        # run's stop signal cannot leak into the next one and instantly end a
+        # recording the operator just started. The identity check keeps a slow
+        # teardown from clearing the event of a run that has already replaced it.
+        if _stop_event is stop_event:
+            _stop_event = None
 
 
 # ---------------------------------------------------------------------------
@@ -510,12 +566,16 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
         even built.
 
     Raises:
-        HTTPException: 409 if a run is already in progress. Starting a second
-            pipeline would open a second capture stream on the same loopback
-            device, and two concurrent runs would interleave writes to
-            ``raw_audio.wav`` and race on the same output directory.
+        HTTPException: 409 if a run is already in progress, or if this course
+            already has a recording from an earlier take today. Starting a
+            second pipeline would open a second capture stream on the same
+            loopback device, and two concurrent runs would interleave writes to
+            ``raw_audio.wav`` and race on the same output directory. The
+            overwrite case is refused rather than confirmed because a browser
+            has no way to ask the operator, and an existing ``raw_audio.wav``
+            is a previous lecture's only copy.
     """
-    global _run_active
+    global _run_active, _stop_event
     with _run_lock:
         if _run_active:
             raise HTTPException(
@@ -538,9 +598,124 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
             detail="Course code contained no usable characters.",
         )
 
+    # Refuse a clobber *only when there is something to clobber*. Checking
+    # here rather than delegating to run_pipeline's confirm_overwrite is what
+    # makes the rule legible: a caller gets 409 with a reason, instead of a run
+    # that starts, records nothing, and reports an opaque "overwrite declined"
+    # failure. The output directory is derived rather than created twice --
+    # create_output_dir is an idempotent mkdir, and run_pipeline will call it
+    # again itself.
+    output_dir = create_output_dir(course_code)
+    existing_take = output_dir / WAV_FILENAME
+    if existing_take.exists():
+        with _run_lock:
+            _run_active = False
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A recording for {course_code} already exists at "
+                f"{existing_take.name} from an earlier take today, and it is "
+                "the only copy of that lecture. Move or rename the output "
+                "directory before recording a new take."
+            ),
+        )
+
+    # Published before the state flips to "recording" on purpose. The reverse
+    # order would admit a window where a client is told it is recording but
+    # /api/stop finds no event to set, so a legitimate Finish Class press would
+    # be answered with 400.
+    stop_event = threading.Event()
+    _stop_event = stop_event
+
     _set_state(STATE_RECORDING, course_code=course_code)
-    background.add_task(_run_in_background, course_code, payload.language.lower())
+    background.add_task(
+        _run_in_background, course_code, payload.language.lower(), stop_event
+    )
     return {"accepted": True, "course_code": course_code, "status": STATE_RECORDING}
+
+
+def _request_stop() -> threading.Event:
+    """Set the recording phase's stop event and return it.
+
+    Raises:
+        HTTPException: 400 if no recording is in progress.
+
+    **Why the status token is the gate and not the event.** The event alone
+    cannot answer "is a recording happening?", because it is also briefly set
+    while the run is past recording: the pipeline only reports ``transcribing``
+    *after* the audio has been flushed to disk, which takes real time. Gating on
+    the status means a stop is refused the instant the recording phase is
+    genuinely over, instead of silently setting an event nobody will read again.
+
+    The two reads are not atomic, and the residual window is harmless in only
+    one direction. The event is always published before the state says
+    ``recording``, so "recording but no event" is unreachable. The other order --
+    event published, state not yet ``recording`` -- answers 400, which is
+    defensible: the recording phase genuinely has not started, and the operator's
+    click arrived within microseconds of the Start Capture that caused it.
+    """
+    if get_state()["status"] != STATE_RECORDING:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No recording is in progress. There is nothing to finish; the "
+                "recording phase is already over or never started."
+            ),
+        )
+    event = _stop_event
+    if event is None:
+        # Unreachable while the status is "recording" (see the module-level
+        # note on _stop_event), but the 400 is the right answer if a future
+        # change ever breaks that ordering.
+        raise HTTPException(
+            status_code=400,
+            detail="No recording is in progress. Nothing to finish.",
+        )
+    # Idempotent by nature: setting an already-set event is a no-op, so a
+    # double-click cannot fail or corrupt anything. The 200 below is a
+    # confirmation of intent, not a promise that the phase ended instantly --
+    # the audio still has to be flushed, and the client learns that from the
+    # stream.
+    event.set()
+    return event
+
+
+@app.post("/api/stop")
+def stop_recording() -> dict[str, Any]:
+    """End the recording phase; transcription begins from the captured audio.
+
+    This is the web equivalent of the CLI's first Ctrl+C, and it deliberately
+    does the same thing rather than aborting the run: the recorded audio is
+    flushed to ``raw_audio.wav`` and the pipeline continues into transcription
+    and synthesis. Stopping a capture is the normal end of a lecture, not a
+    failure, so the run is not abandoned.
+
+    Idempotent while the recording phase lasts. The event is a level-triggered
+    flag, so pressing the button twice is harmless; what changes is that once
+    the phase is over the endpoint answers 400, which is how a client learns
+    that "Finish Class" is no longer the right verb.
+
+    Returns:
+        An acknowledgement. The client should wait for the next state change on
+        ``/api/stream`` rather than treating this as "the run is finished" --
+        the flush and slide-capture teardown happen after the 200.
+
+    Raises:
+        HTTPException: 400 if no recording is in progress.
+    """
+    event = _request_stop()
+    return {
+        "stopped": True,
+        "status": STATE_RECORDING,
+        "message": (
+            "Stop requested. Finishing the recording, then transcribing. "
+            "The audio is saved to raw_audio.wav before transcription begins."
+        ),
+        # Echoed so a client can correlate its request with this run without
+        # inventing its own correlation scheme.
+        "course_code": get_state()["course_code"],
+        "event": id(event),
+    }
 
 
 @app.get("/healthz")

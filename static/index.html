@@ -10,7 +10,7 @@
 <!--
   Dashboard shell for the lecture pipeline.
 
-  Three constraints shaped this file.
+  Four constraints shaped this file.
 
   1. The backend is authoritative. The UI never infers progress from elapsed
      time or from a local countdown; it renders exactly what the SSE stream
@@ -20,12 +20,19 @@
 
   2. The pipeline has three long phases and no progress reporting inside them.
      Transcription in particular takes tens of minutes and emits nothing. So the
-     UI has to make "still working" legible, which is why the active state is a
-     labelled, animated status card rather than a line of text.
+     UI has to make "still working" legible, which is why the stage tracker and
+     the active state are a labelled, animated status card rather than a line of
+     text.
 
   3. Push, not poll. The stream pushes the current state on connect and every
      change after it, so there are no requests at all while a dashboard sits
      idle, and no up-to-two-second lag on a phase change.
+
+  4. The control deck mirrors the server's rules rather than approximating them.
+     The backend refuses a second POST /api/record with 409 and refuses
+     POST /api/stop with 400 unless a recording is in flight, so the buttons
+     enable and disable themselves off the state the stream reports. The
+     operator is never left to discover a rule by hitting an error.
 
   No framework and no build step: the shell is a placeholder, and a bundler
   would be a maintenance cost with nothing to amortise it against yet.
@@ -44,16 +51,27 @@
     </header>
 
     <!--
-      Start form. Disabled while a run is in flight: the backend answers 409 for
-      a second POST, so the button reflects the server's rule instead of letting
-      the operator discover it via an error.
+      Stage tracker. Every pill below is a function of the reported status and
+      nothing else -- no timers, no interpolation. That is deliberate: the
+      backend reports phase *transitions* only, so anything the UI showed
+      between two transitions would be a fabrication. A stage that is neither
+      done nor active is genuinely not known yet, and is drawn as such.
+    -->
+    <ol id="stage-tracker" class="mb-8 flex items-center gap-2 sm:gap-3">
+      <!-- Populated by renderStages() below. -->
+    </ol>
+
+    <!--
+      Capture form. Disabled while a run is in flight: the backend answers 409
+      for a second POST, so the controls reflect the server's rule instead of
+      letting the operator discover it via an error.
     -->
     <section class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-xl">
       <form id="record-form" class="space-y-5">
 
         <div>
           <label for="course_code" class="mb-1.5 block text-sm font-medium text-slate-300">
-            Course Unit Code
+            Course Code
           </label>
           <input
             id="course_code"
@@ -61,45 +79,105 @@
             type="text"
             required
             maxlength="64"
-            placeholder="CRM_1106"
+            placeholder="e.g., CRM_3102"
             autocomplete="off"
             class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
                    text-slate-100 placeholder-slate-600 outline-none
-                   focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40"
+                   focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40
+                   disabled:cursor-not-allowed disabled:bg-slate-900 disabled:text-slate-600"
           />
         </div>
 
         <div>
           <label for="language" class="mb-1.5 block text-sm font-medium text-slate-300">
-            Language Code
+            Language
           </label>
-          <input
+          <!--
+            A select rather than a free-text field, so an unsupported code
+            cannot be typed at all. That is a real narrowing of what the API
+            accepts (it takes any two-letter code), so the list is deliberately
+            broad rather than the three most obvious ones -- a lecturer whose
+            language is missing from this list cannot record their own class.
+            The API's own validation remains the backstop; this is a first line
+            of defence, not the only one.
+          -->
+          <select
             id="language"
             name="language"
-            type="text"
-            value="en"
-            maxlength="2"
-            autocomplete="off"
-            class="w-28 rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
                    text-slate-100 outline-none
-                   focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40"
-          />
-          <p class="mt-1.5 text-xs text-slate-500">
-            Two-letter ISO-639-1 code, e.g. <code class="text-slate-400">en</code> or
-            <code class="text-slate-400">sw</code>.
-          </p>
+                   focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40
+                   disabled:cursor-not-allowed disabled:bg-slate-900 disabled:text-slate-600"
+          >
+            <option value="en">English (en)</option>
+            <option value="fr">French (fr)</option>
+            <option value="sw">Swahili (sw)</option>
+            <option value="es">Spanish (es)</option>
+            <option value="pt">Portuguese (pt)</option>
+            <option value="ar">Arabic (ar)</option>
+            <option value="am">Amharic (am)</option>
+            <option value="yo">Yoruba (yo)</option>
+            <option value="ha">Hausa (ha)</option>
+            <option value="zu">Zulu (zu)</option>
+            <option value="zh">Chinese (zh)</option>
+            <option value="de">German (de)</option>
+          </select>
         </div>
 
-        <button
-          id="record-button"
-          type="submit"
-          class="w-full rounded-lg bg-blue-600 px-4 py-2.5 font-semibold text-white
-                 transition hover:bg-blue-500
-                 focus:outline-none focus:ring-2 focus:ring-blue-400
-                 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-500"
+        <!--
+          Control deck. Both buttons are always in the DOM and toggled with
+          `hidden` rather than removed and re-created: a re-created button
+          loses focus, and losing focus mid-run is exactly the moment the
+          operator is least able to spare the attention to find it again.
+        -->
+        <div class="flex flex-col gap-3 sm:flex-row">
+          <button
+            id="record-button"
+            type="submit"
+            class="w-full rounded-lg bg-blue-600 px-4 py-3 font-semibold text-white
+                   transition hover:bg-blue-500
+                   focus:outline-none focus:ring-2 focus:ring-blue-400
+                   disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-500"
+          >
+            Start Capture
+          </button>
+
+          <!--
+            type="button" and not submit: this lives inside the form, and a
+            submit here would fire a second POST /api/record instead of the
+            stop the operator asked for.
+          -->
+          <button
+            id="stop-button"
+            type="button"
+            class="w-full rounded-lg border border-red-900/70 bg-red-950/40 px-4 py-3
+                   font-semibold text-red-300 transition hover:bg-red-900/40
+                   focus:outline-none focus:ring-2 focus:ring-red-400
+                   disabled:cursor-not-allowed disabled:border-slate-800
+                   disabled:bg-slate-900 disabled:text-slate-600"
+          >
+            Finish Class
+          </button>
+        </div>
+
+        <!--
+          A disabled processing state, distinct from both buttons. During
+          transcription the deck shows neither a stop nor a start -- the operator
+          has nothing useful to click, and offering a "Finish Class" that the
+          backend would answer with 400 would be worse than showing nothing.
+        -->
+        <p
+          id="processing-state"
+          class="hidden items-center justify-center gap-2.5 rounded-lg border
+                 border-slate-800 bg-slate-900 px-4 py-3 text-sm text-slate-400"
+          role="status"
         >
-          Start Recording
-        </button>
+          <span
+            class="h-2 w-2 shrink-0 rounded-full bg-blue-400 animate-pulse"
+            aria-hidden="true"
+          ></span>
+          <span id="processing-text">Processing the lecture...</span>
+        </p>
       </form>
     </section>
 
@@ -190,6 +268,8 @@
 (() => {
   "use strict";
 
+  const RECORD_URL = "/api/record";
+  const STOP_URL = "/api/stop";
   const STREAM_URL = "/api/stream";
 
   // Backend status tokens -> what the operator sees. Kept as a lookup rather
@@ -210,6 +290,33 @@
   // operator cannot queue a second recording the backend will reject anyway.
   const ACTIVE = new Set(["recording", "transcribing", "synthesizing"]);
 
+  // States in which the capture phase itself is still open, i.e. the only
+  // moment "Finish Class" is meaningful. The server's gate is exactly this:
+  // it answers POST /api/stop with 400 unless the status is "recording".
+  const RECORDING = "recording";
+
+  // The pipeline's stages, in order, with the statuses in which each one has
+  // necessarily *finished*. Derived rendering only -- see the comment on <ol>
+  // above. A stage is done when the status is one it could not still be in, so
+  // capture is done from `transcribing` onward but not during `recording`: at
+  // that point the audio is still being written and calling it finished would
+  // be a lie told to a lecturer mid-lecture.
+  const STAGES = [
+    { id: "capture",    label: "Capture",    doneIn: ["transcribing", "synthesizing", "complete"] },
+    { id: "transcribe", label: "Transcribe", doneIn: ["synthesizing", "complete"] },
+    { id: "synthesize", label: "Synthesize", doneIn: ["complete"] },
+    { id: "notes",      label: "Notes",      doneIn: ["complete"] },
+  ];
+
+  const STAGE_STYLES = {
+    done:    "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
+    active:  "border-blue-500/50 bg-blue-500/10 text-blue-200 animate-pulse",
+    failed:  "border-red-500/50 bg-red-500/10 text-red-300",
+    pending: "border-slate-800 bg-slate-900/60 text-slate-600",
+  };
+
+  const STAGE_MARKS = { done: "✓", active: "●", failed: "✕", pending: "○" };
+
   // Connection presentation. "stale" is the one that matters: it marks the
   // card below as showing the last known state rather than a live one.
   const CONNECTION = {
@@ -227,22 +334,26 @@
   const TONE_DOT = { amber: "bg-amber-400", red: "bg-red-400", ok: "bg-emerald-400" };
 
   const el = {
-    form:       document.getElementById("record-form"),
-    button:     document.getElementById("record-button"),
-    courseIn:   document.getElementById("course_code"),
-    langIn:     document.getElementById("language"),
-    card:       document.getElementById("status-card"),
-    dot:        document.getElementById("status-dot"),
-    label:      document.getElementById("status-label"),
-    badge:      document.getElementById("status-badge"),
-    message:    document.getElementById("status-message"),
-    courseRow:  document.getElementById("status-course"),
-    courseVal:  document.getElementById("status-course-value"),
-    error:      document.getElementById("form-error"),
-    connBox:    document.getElementById("connection-banner"),
-    connDot:    document.getElementById("connection-dot"),
-    connText:   document.getElementById("connection-text"),
-    connRetry:  document.getElementById("connection-retry"),
+    form:           document.getElementById("record-form"),
+    button:         document.getElementById("record-button"),
+    stopButton:     document.getElementById("stop-button"),
+    courseIn:       document.getElementById("course_code"),
+    langIn:         document.getElementById("language"),
+    tracker:        document.getElementById("stage-tracker"),
+    processing:     document.getElementById("processing-state"),
+    processingText: document.getElementById("processing-text"),
+    card:           document.getElementById("status-card"),
+    dot:            document.getElementById("status-dot"),
+    label:          document.getElementById("status-label"),
+    badge:          document.getElementById("status-badge"),
+    message:        document.getElementById("status-message"),
+    courseRow:      document.getElementById("status-course"),
+    courseVal:      document.getElementById("status-course-value"),
+    error:          document.getElementById("form-error"),
+    connBox:        document.getElementById("connection-banner"),
+    connDot:        document.getElementById("connection-dot"),
+    connText:       document.getElementById("connection-text"),
+    connRetry:      document.getElementById("connection-retry"),
   };
 
   // Last state the server told us, and whether it is still current. Kept so a
@@ -251,6 +362,20 @@
   let lastStatus = "idle";
   let connection = "connecting";
   let source = null;
+
+  // Set when the operator presses Finish Class, cleared as soon as the server
+  // reports a state that is no longer "recording". It is a UI acknowledgement
+  // only: the stop is acknowledged by an HTTP 200, but the recording phase
+  // genuinely continues until the audio has been flushed, and the server will
+  // keep reporting "recording" throughout. Without this flag the button would
+  // look inert for the length of the flush.
+  let stopRequested = false;
+
+  // True only while a stop request is on the wire. Distinct from
+  // ``stopRequested``, which persists after the response: this one guards
+  // against a double-submit racing two POSTs, whereas the phase is still
+  // legitimately stoppable afterwards.
+  let stopInFlight = false;
 
   function showError(text) {
     el.error.textContent = text;
@@ -262,14 +387,81 @@
     el.error.classList.add("hidden");
   }
 
+  /**
+   * Draw the stage tracker for a status.
+   *
+   * Each stage is done if the status is one in which it has necessarily
+   * finished, and the first stage that is not done is the active or failed one.
+   * Deriving it this way -- rather than tracking "which stage is current" in
+   * a variable -- means an out-of-order or repeated frame cannot leave the
+   * tracker disagreeing with the status card. Both read the same token, so
+   * they cannot drift apart.
+   */
+  function renderStages(status) {
+    const firstOpen = STAGES.findIndex((s) => !s.doneIn.includes(status));
+
+    // A failure is attributed to the stage that was open when it happened.
+    // With nothing open -- a run that failed before capture even began -- no
+    // stage is marked failed, because claiming one did would be a guess.
+    const failedAt = status === "error" && firstOpen >= 0 && lastWasActive
+      ? firstOpen
+      : -1;
+
+    el.tracker.innerHTML = "";
+    STAGES.forEach((stage, index) => {
+      const item = document.createElement("li");
+      let kind;
+      if (stage.doneIn.includes(status)) {
+        kind = "done";
+      } else if (index === failedAt) {
+        kind = "failed";
+      } else if (index === firstOpen && ACTIVE.has(status)) {
+        kind = "active";
+      } else {
+        kind = "pending";
+      }
+
+      const pill = document.createElement("span");
+      pill.id = "stage-" + stage.id;
+      pill.dataset.state = kind;
+      pill.className =
+        "flex flex-1 items-center justify-center gap-1.5 rounded-full border " +
+        "px-2.5 py-1.5 text-xs font-medium transition " + STAGE_STYLES[kind];
+
+      // The mark is decorative: the pill text already carries the meaning, and
+      // a screen reader announcing "check mark" before "Capture" helps nobody.
+      const mark = document.createElement("span");
+      mark.setAttribute("aria-hidden", "true");
+      mark.className = "font-mono";
+      mark.textContent = STAGE_MARKS[kind];
+
+      const text = document.createElement("span");
+      text.textContent = stage.label;
+
+      pill.appendChild(mark);
+      pill.appendChild(text);
+      item.appendChild(pill);
+      el.tracker.appendChild(item);
+    });
+  }
+
+  // Whether a run was in flight the last time a state was rendered. Read by
+  // renderStages() to decide if a failure belongs to a stage, and saved before
+  // it is updated.
+  let lastWasActive = false;
+
   /** Render one state payload. Total function: unknown states are safe. */
   function render(state) {
     const status = (state && state.status) || "idle";
     const view = LABELS[status] || UNKNOWN;
     const active = ACTIVE.has(status);
 
-    lastState = state;
-    lastStatus = status;
+    // The pending stop is only meaningful while the capture phase is open. Any
+    // other status means the server has moved past it, so the flag is dropped
+    // and the button returns to its ordinary "you may press this" state.
+    if (status !== RECORDING) {
+      stopRequested = false;
+    }
 
     el.label.textContent = view.label;
     el.badge.textContent = status;
@@ -291,7 +483,12 @@
       el.courseVal.textContent = course;
     }
 
-    syncButton();
+    renderStages(status);
+    lastWasActive = active;
+    lastState = state;
+    lastStatus = status;
+
+    syncDeck();
   }
 
   function isLive() {
@@ -299,22 +496,63 @@
   }
 
   /**
-   * The start button is disabled for two independent reasons, and conflating
-   * them would mislead: a run is in flight (the backend would answer 409), or
-   * the connection is terminally dead (the request would go nowhere). A
-   * *transient* reconnect does not disable it -- the server is often reachable
-   * again before the stream is, and blocking on a cosmetic signal is worse than
-   * letting the POST report its own failure.
+   * The control deck reflects the backend's own rules, which is why it needs
+   * three independent inputs rather than one flag.
+   *
+   * A run in flight decides which button exists: only Start Capture while
+   * idle/complete/error, only Finish Class while recording, and neither while
+   * transcribing or synthesizing. A dead connection disables whatever is
+   * showing, because the POST would go nowhere. A pending stop is not a
+   * disabling condition -- the endpoint is idempotent while the phase lasts, so
+   * a second press is a harmless no-op and leaving the button live is honest
+   * about the flush still being in progress.
    */
-  function syncButton() {
-    const blocked = ACTIVE.has(lastStatus) || connection === "offline";
-    el.button.disabled = blocked;
-    if (ACTIVE.has(lastStatus)) {
-      el.button.textContent = "Recording in progress...";
-    } else if (connection === "offline") {
+  function syncDeck() {
+    const recording = lastStatus === RECORDING;
+    const working = ACTIVE.has(lastStatus);
+    const unreachable = connection === "offline";
+    const showStart = !working;
+    const showStop = recording;
+
+    el.button.classList.toggle("hidden", !showStart);
+    el.stopButton.classList.toggle("hidden", !showStop);
+
+    el.button.disabled = unreachable;
+    el.stopButton.disabled = unreachable || stopInFlight;
+
+    // The pulse is the operator's cue that capture is *live* and this is the
+    // control that ends it. It is suppressed while the connection is down --
+    // a button throbbing at a server that is not there would be an invitation
+    // to press it and watch nothing happen.
+    el.stopButton.classList.toggle(
+      "animate-pulse", recording && !unreachable
+    );
+
+    el.stopButton.textContent = stopRequested ? "Finishing..." : "Finish Class";
+
+    // The processing strip is the "neither button applies" state. It is shown
+    // only for the phases that follow recording, where the run is genuinely
+    // un-interruptible from the browser.
+    const processing = lastStatus === "transcribing" || lastStatus === "synthesizing";
+    el.processing.classList.toggle("hidden", !processing);
+    el.processing.classList.toggle("flex", processing);
+    if (processing) {
+      el.processingText.textContent =
+        lastStatus === "transcribing"
+          ? "Transcribing the lecture. This is the longest phase..."
+          : "Synthesizing your study notes...";
+    }
+
+    // Inputs are locked for the whole run, not just while recording: a course
+    // code cannot be edited mid-transcription any more than mid-capture, and
+    // the value has already been accepted by the server either way.
+    el.courseIn.disabled = working;
+    el.langIn.disabled = working;
+
+    if (el.button.disabled) {
       el.button.textContent = "Server unreachable";
     } else {
-      el.button.textContent = "Start Recording";
+      el.button.textContent = "Start Capture";
     }
   }
 
@@ -329,7 +567,7 @@
     // transient error would disable the browser's own reconnection, so the
     // button is the deliberate escape hatch, not part of the normal path.
     el.connRetry.classList.toggle("hidden", connection !== "offline");
-    syncButton();
+    syncDeck();
   }
 
   function connect() {
@@ -389,53 +627,111 @@
     if (lastState) render(lastState);
   }
 
+  /**
+   * Report a rejected request using the backend's own detail.
+   *
+   * The server explains 409 ("already in progress") and 400 ("no recording is
+   * in progress") far better than any generic failure string could, and those
+   * two are exactly the responses a racing or stale client will get.
+   *
+   * ``await`` inside the ``try`` is load-bearing: ``response.json()`` rejects
+   * a promise rather than raising, so a synchronous try/catch around the call
+   * would let a non-JSON error body escape as a rejection -- which the caller's
+   * catch would then report as "could not reach the server", telling the
+   * operator their network is down when in fact the server answered fine and
+   * simply did not send JSON.
+   */
+  async function reportFailure(response) {
+    let detail = "Request failed (" + response.status + ").";
+    try {
+      const body = await response.json();
+      if (body && body.detail) detail = body.detail;
+    } catch (_) {
+      // Non-JSON error body; the status line is all that is available.
+    }
+    showError(detail);
+  }
+
   async function submit(event) {
     event.preventDefault();
     clearError();
     el.button.disabled = true;
 
     try {
-      const response = await fetch("/api/record", {
+      const response = await fetch(RECORD_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           course_code: el.courseIn.value.trim(),
-          language: (el.langIn.value.trim() || "en").toLowerCase(),
+          language: el.langIn.value.trim().toLowerCase(),
         }),
       });
 
       if (!response.ok) {
-        // Surface the backend's own detail -- it explains 409 ("already in
-        // progress") far better than a generic failure string would.
-        let detail = "Request failed (" + response.status + ").";
-        try {
-          const body = await response.json();
-          if (body && body.detail) detail = body.detail;
-        } catch (_) { /* non-JSON error body; keep the generic message */ }
-        showError(detail);
-        syncButton();
+        await reportFailure(response);
+        syncDeck();
         return;
       }
 
       const accepted = await response.json();
       // Draw the accepted state immediately. The stream will push the same state
-      // within milliseconds, and rendering it here as well means the button
+      // within milliseconds, and rendering it here as well means the deck
       // re-enables correctly even if the stream happens to be down -- a run
       // really is starting, and the operator should be able to submit another
       // once it finishes. The acknowledgement carries no message field, so one
       // is supplied; the stream overwrites it moments later.
       render({
-        status: accepted.status || "recording",
+        status: accepted.status || RECORDING,
         course_code: accepted.course_code,
         message: "Recording started. Waiting for the first update...",
       });
     } catch (err) {
       showError("Could not reach the server. Is it still running?");
-      syncButton();
+      syncDeck();
+    }
+  }
+
+  /**
+   * "Finish Class": end the capture phase and let transcription begin.
+   *
+   * The button is not disabled on success, because the server will keep
+   * reporting "recording" until the audio is flushed and the endpoint is
+   * idempotent while that is true. Pressing again is a harmless no-op, and
+   * the server's 400 -- which can only arrive if the phase already ended --
+   * is surfaced rather than swallowed, since it means the operator's view of
+   * the world is behind the server's.
+   */
+  async function requestStop() {
+    clearError();
+    stopInFlight = true;
+    stopRequested = true;
+    syncDeck();
+
+    try {
+      const response = await fetch(STOP_URL, { method: "POST" });
+
+      if (!response.ok) {
+        stopRequested = false;
+        await reportFailure(response);
+        return;
+      }
+
+      // The 200 means the stop was accepted, not that the lecture is finished:
+      // the server is still flushing audio. Keep the button showing "Finishing"
+      // and let the stream say when the phase actually ended.
+    } catch (err) {
+      stopRequested = false;
+      showError("Could not reach the server. Is it still running?");
+    } finally {
+      // Re-enables the button in every case, including the failure paths where
+      // the phase is still recording and pressing again is the right move.
+      stopInFlight = false;
+      syncDeck();
     }
   }
 
   el.form.addEventListener("submit", submit);
+  el.stopButton.addEventListener("click", requestStop);
   el.connRetry.addEventListener("click", connect);
 
   renderConnection();

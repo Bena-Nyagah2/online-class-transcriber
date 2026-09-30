@@ -61,7 +61,7 @@ import main as m  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def clean_state():
+def clean_state(tmp_path, monkeypatch):
     """Reset the global state and run guard around every test.
 
     ``APP_STATE`` and ``_run_active`` are module-level and mutated by the
@@ -77,11 +77,26 @@ def clean_state():
     pass on another's client. Both are private because there is no public reset
     -- and that is fine, since resetting module-global test state is exactly
     what this fixture is for.
+
+    ``_stop_event`` is reset for a different and sharper reason: it is a
+    level-triggered flag, so one test leaving it *set* would make the next
+    test's recording end instantly. That is precisely the leak the endpoint is
+    written to avoid, and a fixture that did not clear it would hide the bug
+    rather than catch it.
+
+    ``create_output_dir`` is redirected into a tmp dir because the request
+    handler now calls it to find out where a run *would* write, so that it can
+    refuse to clobber an earlier take. That mkdir is a real side effect: without
+    this, every test that POSTs ``/api/record`` would leave an empty dated
+    directory in the operator's real ``output/``.
     """
     server._run_active = False
+    server._stop_event = None
     server.APP_STATE.update({"status": "idle", "course_code": None, "message": ""})
+    monkeypatch.setattr(server, "create_output_dir", lambda code: tmp_path)
     yield
     server._run_active = False
+    server._stop_event = None
     server.APP_STATE.update({"status": "idle", "course_code": None, "message": ""})
     server._broadcaster._subscribers.clear()
     server._broadcaster._loop = None
@@ -560,12 +575,120 @@ def test_pipeline_never_prompts_for_a_device(client):
 def test_pipeline_never_prompts_before_overwriting(client):
     """Overwrite confirmation must be pre-answered, not asked.
 
-    Same reason as the device. More pointedly: a browser cannot ask, and the
-    default taken here is to refuse, because an existing ``raw_audio.wav`` is a
-    previous lecture's only copy.
+    Same reason as the device: a browser cannot ask, and the question would
+    otherwise block the run on an ``input()`` nobody can answer.
+
+    The answer is ``True``. This reads as a reversal of the safe default, and
+    it is not, because the refusal now lives in the handler -- which rejects a
+    clobber with a 409 naming the file, before any run starts. See
+    ``test_a_run_is_refused_rather_than_silently_overwriting_a_previous_take``
+    for the half that actually protects the earlier lecture.
     """
     _start(client)
-    assert client.calls[0]["kwargs"]["confirm_overwrite"] is False
+    assert client.calls[0]["kwargs"]["confirm_overwrite"] is True
+
+
+def test_a_record_request_actually_starts_a_lecture(client):
+    """A run must get past the pre-flight checks and reach its recording phase.
+
+    Written as a regression test for a real bug this suite's own stub was
+    hiding. ``/api/record`` passed ``confirm_overwrite=False``, which
+    ``run_pipeline`` reads as "refuse" -- unconditionally, whether or not a
+    previous take exists. Every browser-initiated run therefore printed
+    "Aborted -- nothing was recorded" and went straight to ``error``, and the
+    stop mechanism had nothing to stop.
+
+    It survived because every test here replaces ``run_pipeline`` with a stub
+    that ignores the flag, so the suite asserted only that the right value was
+    *passed*, never that it was the right value. This one calls the real
+    ``run_pipeline`` and checks the run actually gets going.
+    """
+
+    def _blocking(course_code, language, state_callback=None, **kwargs):
+        state_callback(m.STATE_RECORDING)
+        assert kwargs["stop_event"].wait(timeout=10), "the stop event never arrived"
+        state_callback(m.STATE_COMPLETE)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _blocking
+    try:
+        thread, slot = _start_in_thread(client, "CRM_1106")
+        # Wait for the state to leave "idle", not while it is already
+        # "recording": _start_in_thread returns the instant the thread is
+        # spawned, which can be before the handler has run at all, so a loop
+        # that polls for the value it wants would read the initial "idle" and
+        # exit on its first pass.
+        observed = "idle"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            observed = server.get_state()["status"]
+            if observed != "idle" or slot[1] is not None:
+                break
+            time.sleep(0.02)
+        client.post("/api/stop")
+        thread.join(timeout=10)
+    finally:
+        server.run_pipeline = real
+
+    assert slot[1] is None, f"the run raised {slot[1]!r}"
+    assert observed == m.STATE_RECORDING, (
+        f"the run never reached recording (status={observed!r}); it is being "
+        "refused by a pre-flight check"
+    )
+
+
+def test_a_run_is_refused_rather_than_silently_overwriting_a_previous_take(
+    client, tmp_path
+):
+    """The protection the previous test gives up, asserted directly.
+
+    An existing ``raw_audio.wav`` is the only copy of an earlier lecture, and a
+    browser cannot ask whether to replace it. The handler must refuse with a
+    409 that names the file, and must not start a run that would overwrite it.
+
+    The ``clean_state`` fixture points ``create_output_dir`` at this same
+    ``tmp_path``, so the WAV planted here is exactly the one the handler looks
+    for.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    response = _start(client, "CRM_1106")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "raw_audio.wav" in detail, detail
+    assert "already exists" in detail, detail
+    # The run slot must be released, or the refusal would wedge the server.
+    assert server._run_active is False
+    assert server.get_state()["status"] == "idle", "a refused run changed the state"
+
+
+def test_a_rejected_overwrite_does_not_arm_the_stop_event(client, tmp_path):
+    """A refused request must leave nothing behind for the next one.
+
+    Both the run slot and the stop event are armed by ``/api/record``. If a
+    refusal released the first but not the second, the next run would inherit
+    an event and end the instant it began.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    assert _start(client, "CRM_1106").status_code == 409
+    assert server._stop_event is None
+
+
+def test_a_rejected_overwrite_does_not_start_a_pipeline(client, tmp_path):
+    """The 409 has to come from the handler, before any work is scheduled.
+
+    If the check happened inside the background task instead, the request would
+    answer 200 and the refusal would surface minutes later as a state change --
+    which is the shape of bug this whole pair of tests exists to prevent.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    _start(client, "CRM_1106")
+
+    assert client.calls == [], "a pipeline ran despite the refusal"
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +729,7 @@ def test_api_routes_are_registered_before_the_root_static_mount(client):
     api = {
         r.path for r in routes[:mount_index] if getattr(r, "path", "").startswith("/api")
     }
-    assert api == {"/api/record", "/api/stream"}
+    assert api == {"/api/record", "/api/stream", "/api/stop"}
 
     # And the two routes that *can* complete a response still answer normally.
     assert client.get("/healthz").status_code == 200
@@ -663,7 +786,56 @@ def test_dashboard_reports_a_lost_connection(client):
     assert "es.readyState === EventSource.CLOSED" in closed_branch
     assert "close()" in closed_branch
     assert "close()" not in transient_branch
-    assert "reconnecting" in transient_branch
+
+
+def test_the_control_deck_posts_to_both_endpoints(client):
+    """The two buttons must hit the two endpoints the server actually exposes.
+
+    Same rationale as the stream check above, and it covers the button that
+    starts a lecture as well as the one that ends it -- a rename on either side
+    would otherwise leave a control that fails only once pressed, mid-lecture.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert "/api/record" in html
+    assert "/api/stop" in html
+
+
+def test_the_stop_button_cannot_submit_the_form(client):
+    """It lives inside the form, so a missing ``type`` would fire a *start*.
+
+    A submit-typed button in this position raises the form's submit handler,
+    which POSTs ``/api/record``. The operator pressing "Finish Class" would
+    then get a 409 -- and, worse, the run they are trying to end would be
+    reported as already in progress, which is a maddening thing to be told
+    while holding the button that was meant to stop it.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    button = html.split('id="stop-button"', 1)[1].split(">", 1)[0]
+    assert 'type="button"' in button, f"stop button tag is: {button.strip()!r}"
+
+
+def test_the_dashboard_collects_a_course_code_and_a_language(client):
+    """Both fields the pipeline needs, with the course code bounded.
+
+    ``maxlength`` is not cosmetic: the value is interpolated into an output
+    directory name, and the server's own bound is 64. An unbounded input is a
+    filesystem DoS at best.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'placeholder="e.g., CRM_3102"' in html
+    assert 'maxlength="64"' in html
+
+    # A <select> rather than free text, so an unsupported code cannot be typed.
+    # Scanned *backwards* from the id to the opening angle bracket: splitting
+    # forward from 'id="language"' would only ever see the attributes that come
+    # after it, and the tag name is always before, so the naive version of this
+    # assertion passes on an <input> and fails on a real <select>.
+    anchor = html.index('id="language"')
+    tag = html[:anchor][html[:anchor].rindex("<"):]
+    assert tag.startswith("<select"), f"language control is: {tag!r}"
+    # And it must actually offer choices, or it is a text box wearing a costume.
+    options = html.split("<select", 1)[1].split("</select>", 1)[0]
+    assert options.count("<option") >= 2, "the language select has no options"
 
 
 # ---------------------------------------------------------------------------
@@ -1076,3 +1248,313 @@ def test_publishing_happens_while_the_state_lock_is_held(client):
         "the frame was scheduled after the lock was dropped, so two publishers "
         "can interleave and a client can see a phase arrive out of order"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. Stopping a recording
+# ---------------------------------------------------------------------------
+# The CLI ends a recording with Ctrl+C, which raises KeyboardInterrupt on
+# whichever thread owns the terminal. A browser owns no terminal and cannot
+# send a signal, so the same outcome is driven by a threading.Event that
+# run_status_loop watches.
+#
+# What is worth pinning down here is not the status code -- it is that the
+# stop is *delivered to the engine* and that a stopped run carries on into
+# transcription. An endpoint that answered 200 while the pipeline sat in its
+# capture loop forever would pass every status-code assertion and still be
+# useless, so several of these tests assert the run's fate rather than the
+# response.
+
+
+def test_stop_is_refused_when_no_run_has_started(client):
+    """400, not 500 and not a silent success.
+
+    There is no event to set, and pretending otherwise would leave the client
+    believing a capture had been ended when none existed.
+    """
+    response = client.post("/api/stop")
+
+    assert response.status_code == 400
+    assert "no recording is in progress" in response.json()["detail"].lower()
+
+
+def test_stop_is_refused_after_the_run_finished(client):
+    """A stale dashboard must not be able to stop a run that already completed."""
+    _start(client)
+
+    response = client.post("/api/stop")
+
+    assert response.status_code == 400
+
+
+def test_stop_sets_the_event_and_answers_200(client):
+    """The core contract: a live recording is stopped, and told so."""
+    recording = threading.Event()
+    seen: dict = {}
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        seen["stop_event"] = kwargs["stop_event"]
+        state_callback(m.STATE_RECORDING)
+        recording.set()
+        assert kwargs["stop_event"].wait(timeout=10), "the stop never arrived"
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        thread, slot = _start_in_thread(client, "CRM_1106")
+        assert recording.wait(timeout=10), "the run never started recording"
+        response = client.post("/api/stop")
+        thread.join(timeout=10)
+    finally:
+        server.run_pipeline = real
+
+    assert slot[1] is None, f"the run raised {slot[1]!r}"
+    assert response.status_code == 200
+    assert response.json()["stopped"] is True
+    # The endpoint must set the *same* object the pipeline is watching, not a
+    # copy or a fresh event. A copy would be set and never observed, and the
+    # recording would run to the end of time while the dashboard reported
+    # success.
+    assert seen["stop_event"].is_set()
+
+
+def test_stopping_lets_the_pipeline_proceed_to_transcription(client):
+    """The web stop is the CLI's first Ctrl+C, not an abort.
+
+    Asserts the whole point of the feature rather than just the HTTP 200: a
+    stopped run continues into ``transcribing`` and ``complete``. The recording
+    phase is the normal end of a lecture, so the captured audio must still be
+    transcribed and synthesised.
+    """
+    sequence: list[str] = []
+    recording = threading.Event()
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        sequence.append(m.STATE_RECORDING)
+        state_callback(m.STATE_RECORDING)
+        recording.set()
+        assert kwargs["stop_event"].wait(timeout=10), "the stop never arrived"
+        for state in (m.STATE_TRANSCRIBING, m.STATE_COMPLETE):
+            sequence.append(state)
+            state_callback(state)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        thread, slot = _start_in_thread(client, "CRM_1106")
+        assert recording.wait(timeout=10), "the run never started recording"
+        response = client.post("/api/stop")
+        thread.join(timeout=10)
+    finally:
+        server.run_pipeline = real
+
+    assert slot[1] is None, f"the run raised {slot[1]!r}"
+    assert response.status_code == 200
+    assert sequence == [m.STATE_RECORDING, m.STATE_TRANSCRIBING, m.STATE_COMPLETE]
+    assert _state()["status"] == m.STATE_COMPLETE
+    assert server._run_active is False
+
+
+def test_stop_is_refused_once_the_recording_phase_is_over(client):
+    """400 as soon as the phase is past, so the client can stop showing the button.
+
+    The pipeline reports ``transcribing`` only *after* the audio is flushed, so
+    there is a real interval in which the run is alive but recording is over.
+    Gating on the status token (rather than on the event merely existing) is
+    what makes "Finish Class" mean "finish the class" instead of "set a flag
+    nobody reads any more".
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        state_callback(m.STATE_RECORDING)
+        state_callback(m.STATE_TRANSCRIBING)
+        started.set()
+        release.wait(timeout=10)
+        state_callback(m.STATE_COMPLETE)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        thread, _ = _start_in_thread(client, "CRM_1106")
+        assert started.wait(timeout=10), "the run never reached transcription"
+        response = client.post("/api/stop")
+        release.set()
+        thread.join(timeout=10)
+    finally:
+        release.set()
+        server.run_pipeline = real
+
+    assert response.status_code == 400
+    assert _state()["status"] == m.STATE_COMPLETE
+
+
+def test_stop_is_idempotent_while_the_recording_phase_lasts(client):
+    """A double-click on Finish Class must not error or corrupt the run.
+
+    The event is a level-triggered flag, so setting it twice is a no-op. The
+    button is not disabled while a stop is in flight -- the pipeline still has
+    to flush the WAV and stop the slide catcher before it reports the next
+    state, and that takes real time during which the operator has no other way
+    to tell the app the second click was not a second request. The stub below
+    holds the run inside the recording phase after the first stop precisely to
+    keep the second press in that window; a stub that finished instantly would
+    be answering a different question (and would correctly get a 400).
+    """
+    recording = threading.Event()
+    flushing = threading.Event()
+    release = threading.Event()
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        state_callback(m.STATE_RECORDING)
+        recording.set()
+        assert kwargs["stop_event"].wait(timeout=10), "the stop never arrived"
+        flushing.set()
+        release.wait(timeout=10)
+        state_callback(m.STATE_COMPLETE)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        thread, slot = _start_in_thread(client, "CRM_1106")
+        assert recording.wait(timeout=10), "the run never started recording"
+        first = client.post("/api/stop")
+        assert flushing.wait(timeout=10), "the run never began flushing"
+        second = client.post("/api/stop")
+        release.set()
+        thread.join(timeout=10)
+    finally:
+        release.set()
+        server.run_pipeline = real
+
+    assert slot[1] is None, f"the run raised {slot[1]!r}"
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["event"] == second.json()["event"], (
+        "the two stops targeted different events, so only one of them was real"
+    )
+
+
+def test_the_stop_event_is_published_before_the_start_request_returns(client):
+    """A stop must be answerable the instant the start request returns.
+
+    ``BackgroundTasks`` do not begin until the response has been returned, so
+    an event minted inside the task would leave a window in which ``/api/stop``
+    finds nothing to set and answers 400 to a Finish Class press that is
+    perfectly legitimate. Probed at the top of the stub -- the first thing the
+    background task executes -- so it fails if the endpoint ever moves the mint
+    back inside the task.
+    """
+    observed: dict = {}
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        observed["already_published"] = server._stop_event is kwargs["stop_event"]
+        state_callback(m.STATE_RECORDING)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        _start(client, "CRM_1106")
+    finally:
+        server.run_pipeline = real
+
+    assert observed.get("already_published") is True, (
+        "the stop event did not exist until the background task started, so a "
+        "stop pressed in that window would be refused"
+    )
+
+
+def test_the_stop_event_is_cleared_when_the_run_ends(client):
+    """A finished run must not leave a set event pointing at the next one.
+
+    Setting the event once and never clearing it would make every subsequent
+    recording end the instant it began, which is a far nastier failure than a
+    button that does nothing -- and one that only shows up on the *second* run.
+    """
+    assert server._stop_event is None
+
+    _start(client, "CRM_1106")
+
+    assert server._stop_event is None
+
+
+def test_a_previous_runs_stop_event_cannot_end_the_next_recording(client):
+    """Regression test for the level-triggered-flag leak.
+
+    Stop a run, then start another and check its event is unset and distinct.
+    Asserting the flag is ``None`` afterwards is not quite the same thing: the
+    real risk is a *surviving* event that the next run adopts, and that is only
+    observable by looking at the second run's own event object.
+    """
+    events: list = []
+
+    def _stub(course_code, language, state_callback=None, **kwargs):
+        events.append(kwargs["stop_event"])
+        state_callback(m.STATE_RECORDING)
+        return "notes.md"
+
+    real = server.run_pipeline
+    server.run_pipeline = _stub
+    try:
+        _start(client, "CRM_1106")
+        assert client.post("/api/stop").status_code == 400  # already finished
+        _start(client, "CRM_1107")
+    finally:
+        server.run_pipeline = real
+
+    assert len(events) == 2
+    assert events[0] is not events[1], "both runs shared one stop event"
+    assert not events[1].is_set(), (
+        "the second run inherited a set stop event and would have ended the "
+        "instant it started recording"
+    )
+
+
+def test_the_stop_endpoint_publishes_no_state_change(client):
+    """Stopping is an instruction, not a state transition.
+
+    A frame published here would be a ``recording`` snapshot arriving *after*
+    the operator asked to stop -- so a client rendering frames in order would
+    show the lecture going back to recording, the same backwards-phase defect
+    the ``_set_state`` lock fix exists to prevent. The client learns the phase
+    ended from the next real transition instead.
+    """
+    failures: list[str] = []
+
+    async def _check() -> None:
+        loop = asyncio.get_running_loop()
+        server._broadcaster.bind_loop(loop)
+        queue = server._broadcaster.subscribe()
+        try:
+            server._stop_event = threading.Event()
+            # Reaching "recording" necessarily publishes a frame -- the gate in
+            # _request_stop reads that state. It is the *stop* that must add
+            # nothing, so the setup frame is drained and only what arrives
+            # afterwards is interesting. Two turns of the loop: one for
+            # call_soon_threadsafe to hand the work over, one for _deliver to run.
+            server._set_state(m.STATE_RECORDING, course_code="CRM_1106")
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            while not queue.empty():
+                queue.get_nowait()
+
+            server.stop_recording()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            if not queue.empty():
+                failures.append(
+                    f"the stop endpoint published {queue.qsize()} frame(s)"
+                )
+        finally:
+            server._broadcaster.unsubscribe(queue)
+            server._stop_event = None
+
+    asyncio.run(_check())
+
+    assert not failures, failures[0]
