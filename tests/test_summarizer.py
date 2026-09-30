@@ -200,7 +200,7 @@ def test_extract_slide_data_sends_single_image(mocker, tmp_path) -> None:
 
     call = synthesizer.client.chat.completions.create.call_args
     assert call.kwargs["model"] == MAP_MODEL
-    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["max_tokens"] == summarizer.SLIDE_MAX_TOKENS
 
     messages = call.kwargs["messages"]
     assert len(messages) == 1  # no system prompt for the map stage
@@ -223,42 +223,48 @@ def test_extract_slide_data_sends_single_image(mocker, tmp_path) -> None:
     assert result == "## Statutory\n- Theft Act 1968"  # fence-free extract
 
 
-def test_stage_one_raises_rather_than_storing_a_truncated_extract(
+def test_stage_one_returns_the_partial_extract_with_a_truncation_note(
     mocker, tmp_path
 ) -> None:
-    """A slide that exhausted the 800-token budget is refused, not stored.
+    """A slide that exhausts its budget degrades instead of aborting the deck.
 
-    The manifest is Stage 3's ground truth. A partial extract written into it
-    does not announce itself as partial — Stage 3 reads "the extract stopped
-    here" as "the slide ended here" and reasons confidently from the gap. The
-    message must name the offending slide, because in a 90-slide deck the
-    filename is the only thing that tells an operator where to look.
+    The manifest is Stage 3's ground truth, so a partial extract must announce
+    itself as partial -- otherwise Stage 3 reads "the extract stopped here" as
+    "the slide ended here" and reasons confidently from a gap it cannot see.
+    The returned text therefore keeps what the model did produce *and* carries
+    the marker.
+
+    Previously this raised, which meant one dense statute-table slide destroyed
+    the notes for an entire lecture, including the ~89 slides that had already
+    extracted cleanly.
     """
     synthesizer = _make_synthesizer(mocker)
     synthesizer.client.chat.completions.create.return_value = _make_response(
-        mocker, "## Framework\n- Mens Rea\n- Actus Reus\n- Dolus Eventualis and then",
+        mocker,
+        "## Framework\n- Mens Rea\n- Actus Reus\n- Dolus Eventualis and then",
         finish_reason="length",
     )
     _neutralise_backoff(mocker)
 
     slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
 
-    with pytest.raises(RuntimeError) as excinfo:
-        synthesizer._extract_slide_data(slide_path)
+    result = synthesizer._extract_slide_data(slide_path)
 
-    message = str(excinfo.value)
-    assert "Stage 1 hit the token cap" in message
-    assert "slide_001.jpg" in message
-    assert "would be truncated" in message
+    # The partial content survives -- degrading must not mean discarding.
+    assert "## Framework" in result
+    assert "Mens Rea" in result
+    assert "Dolus Eventualis and then" in result
+    # And it is explicitly flagged, exactly once, at the end.
+    assert result.endswith(summarizer.SLIDE_TRUNCATION_NOTE)
+    assert result.count("Extraction truncated due to slide density") == 1
 
 
-def test_stage_one_guard_does_not_disturb_the_request_budget(mocker, tmp_path) -> None:
-    """The guard is a pure check: the outgoing request is untouched.
+def test_truncated_slide_warning_names_the_offending_file(mocker, tmp_path) -> None:
+    """The console warning must identify the slide, not just report a count.
 
-    Guards the requirement that adding the failsafe must not quietly relax the
-    budget to "stop the crash" or inherit Stage 3's 4096. The same 800/0.2 pair
-    has to go out on the request that trips the guard as on the one that
-    doesn't.
+    In a 90-slide deck the filename is the only thing that tells an operator
+    where to look, and by the time Stage 3's notes exist the truncation has
+    scrolled far off screen.
     """
     synthesizer = _make_synthesizer(mocker)
     synthesizer.client.chat.completions.create.return_value = _make_response(
@@ -267,11 +273,38 @@ def test_stage_one_guard_does_not_disturb_the_request_budget(mocker, tmp_path) -
     _neutralise_backoff(mocker)
 
     slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
-    with pytest.raises(RuntimeError):
-        synthesizer._extract_slide_data(slide_path)
+    printed = mocker.patch.object(summarizer, "console")
+
+    synthesizer._extract_slide_data(slide_path)
+
+    printed.print.assert_called_once()
+    message = printed.print.call_args.args[0]
+    assert "slide_001.jpg" in message
+    assert "truncated" in message
+    # Rendered as a rich warning, and marked up rather than pre-rendered so
+    # rich controls the styling.
+    assert "[bold yellow]" in message
+
+
+def test_stage_one_guard_does_not_disturb_the_request_budget(mocker, tmp_path) -> None:
+    """The guard is a pure check: the outgoing request is untouched.
+
+    Guards the requirement that the graceful path must not quietly relax the
+    budget to "stop the crash" or inherit Stage 3's 4096. The same
+    SLIDE_MAX_TOKENS/0.2 pair has to go out on the request that gets truncated
+    as on the one that does not.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "cut off", finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    synthesizer._extract_slide_data(slide_path)
 
     call = synthesizer.client.chat.completions.create.call_args
-    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["max_tokens"] == summarizer.SLIDE_MAX_TOKENS
     assert call.kwargs["temperature"] == 0.2
     assert call.kwargs["model"] == MAP_MODEL
     # Still exactly one image, and no system prompt added for the map stage.
@@ -284,7 +317,9 @@ def test_stage_one_truncation_is_not_retried(mocker, tmp_path) -> None:
 
     Vision calls are the most expensive thing in the pipeline — 90 of them on a
     full lecture. Retrying a deterministic cap hit triples the bill to produce
-    the identical failure.
+    the identical failure. This matters more now that truncation no longer
+    aborts the run: without this, the pipeline would loop over the same dense
+    slide three times and then carry on having paid for all of them.
     """
     synthesizer = _make_synthesizer(mocker)
     synthesizer.client.chat.completions.create.return_value = _make_response(
@@ -293,8 +328,7 @@ def test_stage_one_truncation_is_not_retried(mocker, tmp_path) -> None:
     _neutralise_backoff(mocker)
 
     slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
-    with pytest.raises(RuntimeError):
-        synthesizer._extract_slide_data(slide_path)
+    synthesizer._extract_slide_data(slide_path)
 
     assert synthesizer.client.chat.completions.create.call_count == 1
 
@@ -307,7 +341,7 @@ def test_stage_one_guard_holds_against_the_real_openai_response_shape(
     Same reasoning as the Stage 3 equivalent. Every other test in this file
     fabricates responses, and ``MagicMock`` invents any attribute — so a suite
     built only on mocks stays green even if the SDK moves ``finish_reason``,
-    while production quietly stops guarding.
+    while production quietly stops flagging truncated slides.
     """
     chat_completion = ChatCompletion.model_validate(
         {
@@ -333,22 +367,108 @@ def test_stage_one_guard_holds_against_the_real_openai_response_shape(
     synthesizer.client.chat.completions.create.return_value = chat_completion
 
     slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
-    with pytest.raises(RuntimeError) as excinfo:
-        synthesizer._extract_slide_data(slide_path)
+    result = synthesizer._extract_slide_data(slide_path)
 
-    assert "slide_001.jpg" in str(excinfo.value)
+    # Reading a real ``finish_reason`` off a real pydantic model, the guard
+    # still fires: the partial text is kept and explicitly marked.
+    assert "Mens Rea and then it stops" in result
+    assert result.endswith(summarizer.SLIDE_TRUNCATION_NOTE)
 
 
-def test_truncated_stage_one_preserves_the_slides_already_extracted(
+def test_untruncated_slide_carries_no_truncation_note(mocker, tmp_path) -> None:
+    """A clean extract must be returned verbatim.
+
+    The marker is only meaningful if it stays rare. Emitting it unconditionally
+    would teach Stage 3 that a truncated slide is the normal case, and the
+    TRUNCATED SLIDE HANDLING instruction would stop discriminating.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker, "## Framework\n- Mens Rea"
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    result = synthesizer._extract_slide_data(slide_path)
+
+    assert result == "## Framework\n- Mens Rea"
+    assert "truncated" not in result.lower()
+
+
+def test_truncation_note_survives_fence_stripping(mocker, tmp_path) -> None:
+    """The note is appended after cleaning, so it is never mangled.
+
+    ``_clean_markdown`` unwraps ```markdown fences the model tends to emit. If
+    the note were appended *first* it would sit outside the fence the regex
+    anchors on, the whole string would fail to match, and the extract would be
+    handed on with its fences and the marker attached as one run-on blob.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.return_value = _make_response(
+        mocker,
+        "```markdown\n## Framework\n- Mens Rea and then\n```",
+        finish_reason="length",
+    )
+    _neutralise_backoff(mocker)
+
+    slide_path = _write_slides(tmp_path, 1) / "slide_001.jpg"
+    result = synthesizer._extract_slide_data(slide_path)
+
+    assert "```" not in result
+    assert result.startswith("## Framework")
+    assert result.endswith(summarizer.SLIDE_TRUNCATION_NOTE)
+
+
+def test_slide_budget_was_actually_raised() -> None:
+    """Pin the *value*, not just that the constant is threaded through.
+
+    Every other budget test asserts ``max_tokens == SLIDE_MAX_TOKENS``, which is
+    a tautology: set the constant back to 800 and all of them still pass while
+    the dense slides that motivated this change start truncating again. A
+    mutation run confirmed that gap -- the "revert to 800" mutant survived.
+
+    2048 is the deliberate choice over the more modest 1500: the vision model
+    supports it, and Stage 1's prompt is small enough that the large
+    ``max_tokens`` ceilings which break Stage 3 do not apply here.
+    """
+    assert summarizer.SLIDE_MAX_TOKENS == 2048
+    assert summarizer.SLIDE_MAX_TOKENS > 800
+    # Still a separate budget from Stage 3 -- this is a per-slide extract, not
+    # a whole document.
+    assert summarizer.SLIDE_MAX_TOKENS < summarizer.MAX_TOKENS
+
+
+def test_stage_three_is_told_what_the_truncation_marker_means() -> None:
+    """The prompt must explain the marker, or the mitigation is cosmetic.
+
+    Stage 3 is handed the manifest as ground truth. Without an instruction
+    describing the marker it has two failure modes and one good one: it may
+    ignore the note and treat the partial extract as complete -- the exact
+    failure the old hard-fail existed to prevent -- or it may quote the marker
+    into the notes as though the slide had said it. This paragraph is what makes
+    the graceful path safe rather than merely quiet.
+
+    A mutation run confirmed the gap: deleting it passed the whole suite.
+    """
+    assert summarizer.SLIDE_TRUNCATION_NOTE.strip() in summarizer.SYSTEM_PROMPT
+    # Framed as an annotation rather than slide content, so the model does not
+    # transcribe the marker into the notes.
+    assert "NOT content from the slide" in summarizer.SYSTEM_PROMPT
+    assert "never quote or repeat the marker itself" in summarizer.SYSTEM_PROMPT
+
+
+def test_truncated_slide_does_not_stop_the_rest_of_the_deck(
     mocker, tmp_path
 ) -> None:
-    """A mid-deck crash keeps every completed slide on disk and resumable.
+    """A dense slide must not cost the lecture its other 89 slides.
 
-    This is what makes raising the right call at Stage 1. ``_build_slide_manifest``
-    flushes after each slide, so aborting on slide 2 of 3 must leave slide 1
-    written and must not write a partial entry for the slide that failed. A
-    re-run then resumes from slide 2 for the price of one vision call, not a
-    full re-extraction of the deck.
+    This was the reason the raise was removed. With it, slide 2 of 3 aborted
+    the whole run: slides 1's careful extract survived on disk, but the notes
+    for the lecture were never produced, because there was nothing downstream to
+    summarise. Every slide after the dense one was lost too.
+
+    Now slide 2's partial extract is written with its truncation note and the
+    deck continues to slide 3.
     """
     slides_dir = _write_slides(tmp_path, 3)
     session_dir = tmp_path / "session"
@@ -357,41 +477,76 @@ def test_truncated_stage_one_preserves_the_slides_already_extracted(
     synthesizer = _make_synthesizer(mocker)
     synthesizer.client.chat.completions.create.side_effect = [
         _make_response(mocker, "Extract of slide one"),
-        _make_response(mocker, "Extract of slide two, truncated", finish_reason="length"),
-    ]
-    _neutralise_backoff(mocker)
-
-    with pytest.raises(RuntimeError):
-        synthesizer._build_slide_manifest(slides_dir, session_dir)
-
-    # The completed slide survives; the failed one left no trace.
-    manifest = (session_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
-    assert "slide_001.jpg" in manifest
-    assert "Extract of slide one" in manifest
-    assert "slide_002.jpg" not in manifest
-    assert "truncated" not in manifest
-    # Only two calls were spent: one good extract, one that failed.
-    assert synthesizer.client.chat.completions.create.call_count == 2
-
-    # And a re-run picks up exactly where it stopped. Only the two missing
-    # slides are re-extracted — slide_001 is skipped via the resume cache, so
-    # the delta is 2, not 3.
-    calls_before_rerun = synthesizer.client.chat.completions.create.call_count
-    synthesizer.client.chat.completions.create.side_effect = [
-        _make_response(mocker, "Extract of slide two"),
+        _make_response(
+            mocker, "Extract of slide two, cut", finish_reason="length"
+        ),
         _make_response(mocker, "Extract of slide three"),
     ]
-    synthesizer._build_slide_manifest(slides_dir, session_dir)
+    _neutralise_backoff(mocker)
+    printed = mocker.patch.object(summarizer, "console")
 
-    manifest = (session_dir / MANIFEST_FILENAME).read_text(encoding="utf-8")
-    assert "Extract of slide one" in manifest
-    assert "Extract of slide two" in manifest
-    assert "Extract of slide three" in manifest
-    # slide_001 was not re-extracted — only the two that were missing.
-    rerun_calls = (
-        synthesizer.client.chat.completions.create.call_count - calls_before_rerun
-    )
-    assert rerun_calls == 2
+    manifest_text = synthesizer._build_slide_manifest(slides_dir, session_dir)
+
+    # All three slides reached the manifest.
+    assert "slide_001.jpg" in manifest_text
+    assert "slide_002.jpg" in manifest_text
+    assert "slide_003.jpg" in manifest_text
+    # The truncated one is present but flagged, and slide 3 is unaffected.
+    assert "Extract of slide two, cut" in manifest_text
+    assert "Extraction truncated due to slide density" in manifest_text
+    assert "Extract of slide three" in manifest_text
+    # Three calls, one per slide: the truncation bought no retries.
+    assert synthesizer.client.chat.completions.create.call_count == 3
+
+    # Slide 3's entry must not have inherited slide 2's marker.
+    third = manifest_text.split("slide_003.jpg", 1)[1]
+    assert "truncated" not in third.lower()
+
+    # Exactly one warning, naming the slide that was actually truncated. A
+    # per-slide warning is the only way an operator learns *which* slide to
+    # re-check once Stage 3's notes are in front of them.
+    assert printed.print.call_count == 1
+    assert "slide_002.jpg" in printed.print.call_args.args[0]
+
+
+def test_truncated_slide_is_retried_on_a_rerun(mocker, tmp_path) -> None:
+    """A truncated entry must not become permanent in the resume cache.
+
+    The resume cache treats any slide with a ``### Slide:`` header as finished.
+    Now that truncated extracts are persisted, that rule would silently freeze a
+    partial extract forever — the deck would stay broken until someone hand-edited
+    the manifest. Under the old raise behaviour the failed slide was never
+    written at all, so a plain re-run retried it for free.
+
+    So a truncated entry is dropped on resume and re-extracted.
+    """
+    slides_dir = _write_slides(tmp_path, 2)
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    synthesizer = _make_synthesizer(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Extract of slide one"),
+        _make_response(mocker, "Partial slide two", finish_reason="length"),
+    ]
+    _neutralise_backoff(mocker)
+    synthesizer._build_slide_manifest(slides_dir, session_dir)
+    assert synthesizer.client.chat.completions.create.call_count == 2
+
+    # Re-run: slide 1 is cached, slide 2 is retried and this time succeeds.
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "Extract of slide two, complete"),
+    ]
+    manifest_text = synthesizer._build_slide_manifest(slides_dir, session_dir)
+
+    assert "Extract of slide two, complete" in manifest_text
+    # The stale partial is gone, marker included -- not merely duplicated.
+    assert "Partial slide two" not in manifest_text
+    assert "Extraction truncated due to slide density" not in manifest_text
+    # Exactly one header for slide 2, so Stage 3 does not read it twice.
+    assert manifest_text.count("slide_002.jpg") == 1
+    # Only the truncated slide cost a call.
+    assert synthesizer.client.chat.completions.create.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -711,9 +866,9 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
 
     calls = synthesizer.client.chat.completions.create.call_args_list
 
-    # Stage 1 calls: each carried exactly one image, capped at 800 tokens.
+    # Stage 1 calls: each carried exactly one image, at the per-slide budget.
     for stage_one_call in calls[:2]:
-        assert stage_one_call.kwargs["max_tokens"] == 800
+        assert stage_one_call.kwargs["max_tokens"] == summarizer.SLIDE_MAX_TOKENS
         content = stage_one_call.kwargs["messages"][0]["content"]
         assert len(content) == 2
         assert content[1]["type"] == "image_url"
@@ -831,12 +986,13 @@ def test_system_prompt_opens_with_the_zero_preamble_directive() -> None:
 
 
 def test_stage_one_keeps_its_own_small_budget(mocker, tmp_path) -> None:
-    """Stage 1 is not swept up in the Stage 3 budget bump.
+    """Stage 1 is not swept up in the Stage 3 budget.
 
-    A 90-slide lecture issues 90 vision calls. Lifting each from 800 to 4096
-    tokens is a 5x cost increase on the stage that has no truncation problem
-    -- a single slide never needs more than ~800 tokens of extract. The two
-    budgets are deliberately different.
+    A 90-slide lecture issues 90 vision calls, so Stage 1's per-slide ceiling is
+    the pipeline's biggest cost multiplier. It was raised from 800 to
+    :data:`SLIDE_MAX_TOKENS` because 800 was failing hardest on the dense slides
+    a student most needs, but it must stay below Stage 3's 4096 -- that is a
+    different job producing a different artifact.
     """
     synthesizer = _make_synthesizer(mocker)
     synthesizer.client.chat.completions.create.return_value = _make_response(
@@ -848,7 +1004,8 @@ def test_stage_one_keeps_its_own_small_budget(mocker, tmp_path) -> None:
     synthesizer._extract_slide_data(slide_path)
 
     call = synthesizer.client.chat.completions.create.call_args
-    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["max_tokens"] == summarizer.SLIDE_MAX_TOKENS
+    assert call.kwargs["max_tokens"] != summarizer.MAX_TOKENS
     assert call.kwargs["temperature"] == 0.2
 
 
@@ -1064,7 +1221,7 @@ def test_stage_one_sends_no_thinking_parameter(mocker, tmp_path) -> None:
     call = synthesizer.client.chat.completions.create.call_args
 
     assert "extra_body" not in call.kwargs
-    assert call.kwargs["max_tokens"] == 800
+    assert call.kwargs["max_tokens"] == summarizer.SLIDE_MAX_TOKENS
     assert call.kwargs["temperature"] == 0.2
 
 
