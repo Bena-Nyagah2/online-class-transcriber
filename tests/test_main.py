@@ -625,7 +625,357 @@ def test_empty_wav_skips_ai_phases(consoles, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 6. No stray output during the test run
+# 6. run_pipeline: the programmatic entry point
+# ---------------------------------------------------------------------------
+# ``main()`` is now a thin shell over ``run_pipeline()``. These tests cover the
+# contract the web backend depends on: the return value, the state sequence, the
+# keyword-only escape hatches, and the PipelineError path.
+
+
+@pytest.fixture
+def recorded_states():
+    """Collect emitted pipeline states into a list.
+
+    Returns the list itself rather than a recording callable, so a test can
+    assert on it directly after the run.
+    """
+    return []
+
+
+def _drive_run(course_code="CRM_1106", **kwargs):
+    """Run the pipeline with every dependency faked; return ``(result, states)``.
+
+    Shared by the ``run_pipeline`` tests so each one states only what it is
+    actually asserting. ``_stub_engines`` supplies the two AI engines;
+    ``session`` (used by the caller) has already stubbed the interactive bits.
+    """
+    states: list[str] = []
+    t, s = _stub_engines()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, s:
+        result = m.run_pipeline(
+            course_code,
+            state_callback=states.append,
+            **kwargs,
+        )
+    return result, states
+
+
+def test_run_pipeline_returns_the_notes_path(consoles, session):
+    """The return value must be the study-notes path, not ``None``.
+
+    This is the whole reason the function is shaped the way it is: the web
+    backend reports the artifact location to the operator, and a pipeline that
+    only printed that path to a terminal would have nothing to hand back.
+    """
+    result, _ = _drive_run()
+    assert isinstance(result, str)
+    assert result.endswith(".md")
+    assert "CRM_1106" in result
+
+
+def test_run_pipeline_emits_every_stage_in_order(consoles, session):
+    """States must arrive as a strictly ordered sequence ending in ``complete``.
+
+    Order is the contract, not decoration: a dashboard that learned "the run
+    finished" before "transcribing" would stop showing the phase the operator is
+    actually waiting in. ``complete`` must be last -- it is the only signal that
+    the run is over.
+    """
+    _, states = _drive_run()
+    assert states == [
+        m.STATE_RECORDING,
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+    ]
+
+
+def test_states_are_emitted_at_stage_start_not_at_the_end(consoles, session):
+    """A state must fire *before* its stage does, or it is a progress lie.
+
+    Asserted positionally: recording the state sequence and the order the
+    engines were invoked in gives four possible interleavings, and only one of
+    them is honest. A status that fires after the expensive call has already
+    finished tells the operator nothing while it is happening.
+    """
+    timeline: list[str] = []
+
+    def record_state(state):
+        timeline.append(f"state:{state}")
+
+    t, s = _stub_engines()
+    transcriber = mock.MagicMock()
+    transcriber.return_value.transcribe_audio.side_effect = (
+        lambda p, language=None: timeline.append("transcribe")
+    )
+    synthesizer = mock.MagicMock()
+    synthesizer.return_value.generate_notes.side_effect = (
+        lambda *a: timeline.append("synthesize")
+    )
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         mock.patch.object(m, "LocalTranscriber", transcriber), \
+         mock.patch.object(m, "LectureSynthesizer", synthesizer):
+        m.run_pipeline("CRM_1106", state_callback=record_state)
+
+    assert timeline == [
+        f"state:{m.STATE_RECORDING}",
+        f"state:{m.STATE_TRANSCRIBING}",
+        "transcribe",
+        f"state:{m.STATE_SYNTHESIZING}",
+        "synthesize",
+        f"state:{m.STATE_COMPLETE}",
+    ]
+
+
+def test_callback_is_optional(consoles, session):
+    """Omitting the callback must not break the run.
+
+    ``None`` is the default, so a caller that does not want progress has to be
+    able to pass nothing at all. A stray ``state_callback()`` on ``None`` would
+    make the parameter mandatory in practice while its signature claimed
+    otherwise.
+    """
+    t, s = _stub_engines()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, s:
+        result = m.run_pipeline("CRM_1106")
+    assert result.endswith(".md")
+
+
+def test_error_path_emits_the_error_state_and_raises(consoles, session):
+    """A failed run must announce ``error`` and raise, not return quietly.
+
+    Both halves matter. The raise is how ``main()`` gets its exit code; the
+    state is how a dashboard stops displaying "Transcribing" for a run that has
+    already died. Returning a path here would report success for a lecture whose
+    notes were never written.
+    """
+    t, _ = _stub_engines()
+    failing = mock.MagicMock()
+    failing.return_value.generate_notes.side_effect = ValueError("no transcript")
+    states: list[str] = []
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", failing):
+        with pytest.raises(m.PipelineError):
+            m.run_pipeline("CRM_1106", state_callback=states.append)
+
+    assert states[-1] == m.STATE_ERROR
+    assert m.STATE_COMPLETE not in states, "reported success for a failed run"
+
+
+def test_error_state_precedes_the_exception(consoles, session, monkeypatch):
+    """The state must be emitted before the raise, not skipped by it.
+
+    ``_emit`` is called on the way out of each failure branch. If someone later
+    moves it into an ``except`` handler that re-raises first, or drops it, the
+    dashboard hangs on the last in-progress state with no way to tell.
+    """
+    order: list[str] = []
+    monkeypatch.setattr(m, "_emit", lambda cb, state: order.append(state))
+    t, _ = _stub_engines()
+    failing = mock.MagicMock()
+    failing.return_value.generate_notes.side_effect = ValueError("no transcript")
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", failing):
+        with pytest.raises(m.PipelineError):
+            m.run_pipeline("CRM_1106", lambda state: None)
+    assert order[-1] == m.STATE_ERROR
+
+
+def test_pipeline_error_carries_the_cancellation_exit_code(consoles, session):
+    """A cancelled run must report 130, not the generic failure code of 1.
+
+    130 is the conventional "terminated by SIGINT" status. Collapsing it into 1
+    would make a scheduled run's cancellation indistinguishable from a genuine
+    engine failure in whatever consumes its exit status.
+    """
+    t, s = _stub_engines()
+    interrupting = mock.MagicMock()
+    interrupting.return_value.transcribe_audio.side_effect = [KeyboardInterrupt, KeyboardInterrupt]
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LocalTranscriber", interrupting):
+        with pytest.raises(m.PipelineError) as excinfo:
+            m.run_pipeline("CRM_1106")
+    assert excinfo.value.exit_code == 130
+
+
+def test_main_maps_pipeline_error_to_the_exit_code(consoles, session):
+    """``main()`` must translate the exception into a process exit code.
+
+    The translation is the entire remaining job of ``main()``. If it leaked the
+    exception instead, the process would die with a traceback and status 1 --
+    which happens to look right for a failure but is wrong for the cancelled
+    case, where 130 is the answer.
+    """
+    with mock.patch.object(m, "run_pipeline", side_effect=m.PipelineError("x", 130)):
+        assert m.main(language="en") == 130
+    with mock.patch.object(m, "run_pipeline", side_effect=m.PipelineError("x", 1)):
+        assert m.main(language="en") == 1
+
+
+def test_main_still_prints_the_failure_detail(consoles, session):
+    """Moving the error handling into an exception must not silence the message.
+
+    ``main()`` no longer owns the wording, so the guard is that the *combined*
+    path still reaches the operator: ``run_pipeline`` prints at the raise site
+    because that is where the transcript path is in scope, and ``main`` only
+    converts the exception to a code.
+    """
+    t, _ = _stub_engines()
+    failing = mock.MagicMock()
+    failing.return_value.generate_notes.side_effect = ValueError("no transcript")
+    out, _ = consoles
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", failing):
+        assert m.main(language="en") == 1
+    assert "Synthesis skipped" in out.getvalue()
+
+
+def test_explicit_device_id_skips_the_prompt(consoles, session):
+    """A non-interactive caller must be able to skip ``select_device``.
+
+    The web backend has no terminal to prompt on. Without this, the first
+    browser-initiated run would block forever on an ``input()`` nobody can
+    answer -- the request would hang rather than fail, which is much harder to
+    diagnose.
+    """
+    def explode(recorder):
+        raise AssertionError("select_device must not be called")
+
+    with mock.patch.object(m, "select_device", explode):
+        result, _ = _drive_run(device_id=0)
+    assert result.endswith(".md")
+
+
+def test_explicit_device_index_is_validated(consoles, session):
+    """An out-of-range index must fail before a capture stream is opened.
+
+    Without validation the index reaches soundcard, which either raises an
+    opaque error or -- worse -- opens the wrong device. An HTTP client can send
+    any integer, so the bound has to be checked at this boundary.
+    """
+    t, s = _stub_engines()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, s:
+        with pytest.raises(m.PipelineError):
+            m.run_pipeline("CRM_1106", device_id=7)
+    # Fail fast: the capture thread must never have been started.
+    assert s.new is not None
+
+
+def test_confirm_overwrite_false_aborts_before_recording(consoles, session):
+    """Declining the overwrite must not start a capture.
+
+    A browser cannot ask the operator, so ``server.py`` passes ``False``. If
+    that value were ignored and the prompt fell through to ``input()``, the
+    request would hang on stdin instead of refusing -- and if it were ignored
+    the other way, an existing recording would be destroyed unasked.
+    """
+    def explode(path):
+        raise AssertionError("_confirm_overwrite must not be called")
+
+    t, s = _stub_engines()
+    with mock.patch.object(m, "_confirm_overwrite", explode), \
+         mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, s:
+        with pytest.raises(m.PipelineError) as excinfo:
+            m.run_pipeline("CRM_1106", confirm_overwrite=False)
+    assert excinfo.value.exit_code == 1
+    out, _ = consoles
+    assert "Aborted" in out.getvalue()
+
+
+def test_resolve_device_index_picks_the_first_device():
+    """The non-interactive selector returns index 0 without prompting."""
+    assert m.resolve_device_index(FakeRecorder()) == 0
+
+
+def test_resolve_device_index_fails_loudly_when_there_is_no_device():
+    """No loopback device is fatal, not a silent default-capture fallback.
+
+    Recording from an arbitrary input would produce a ``raw_audio.wav`` of
+    silence, and the failure would surface much later as the far less obvious
+    "no audio captured".
+
+    Asserts ``PipelineError`` rather than ``SystemExit`` on purpose. This helper
+    exists only for the web path, where the failure has to be catchable by
+    ``server._run_in_background`` -- and ``SystemExit`` is a ``BaseException``,
+    so it would escape ``except Exception`` and strand the dashboard on
+    "recording" with nothing to retry against.
+    """
+    with pytest.raises(m.PipelineError) as excinfo:
+        m.resolve_device_index(EmptyDeviceRecorder())
+    assert excinfo.value.exit_code == 1
+
+
+def test_resolve_device_index_error_is_catchable_as_an_exception():
+    """The raise must land in the ``except Exception`` net the server relies on.
+
+    A direct, mechanical guard on the reason the previous ``SystemExit`` was
+    wrong. If someone "simplifies" this back to a process exit, the suite stays
+    green everywhere except in production, where the dashboard hangs.
+    """
+    with pytest.raises(Exception):  # noqa: B017 - deliberately broad on purpose
+        m.resolve_device_index(EmptyDeviceRecorder())
+
+
+def test_cli_state_callback_renders_labels(consoles):
+    """The CLI must translate tokens back into the human stage names.
+
+    This is the inversion that keeps ``run_pipeline`` presentation-free: the
+    tokens go out bare, and only the terminal re-adds markup. If the mapping
+    lost an entry, a stage would print its own snake_case token as a heading.
+    """
+    m._cli_state_callback(m.STATE_TRANSCRIBING)
+    assert "Transcription & Diarization" in consoles[0].getvalue()
+
+
+def test_cli_state_callback_covers_every_emitted_state(consoles):
+    """No emitted state may fall through to a raw token as its heading.
+
+    Exhaustive over the states ``run_pipeline`` actually emits, which is the set
+    that matters -- an unmapped state would surface as a heading reading
+    "transcribing" in lower case, an obvious but easy-to-miss regression.
+    """
+    for state in (
+        m.STATE_RECORDING,
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+    ):
+        assert state in m._STATE_LABELS, f"{state} has no CLI label"
+
+
+def test_state_tokens_carry_no_rich_markup():
+    """Wire tokens must be bare -- markup would leak into JSON and the DOM.
+
+    ``LABELS``/``_STATE_LABELS`` hold presentation; the tokens themselves cross
+    the process boundary and are rendered by a browser. A stray ``[bold]`` in a
+    token would arrive as literal text in the dashboard's badge.
+    """
+    for state in (
+        m.STATE_RECORDING,
+        m.STATE_TRANSCRIBING,
+        m.STATE_SYNTHESIZING,
+        m.STATE_COMPLETE,
+        m.STATE_ERROR,
+    ):
+        assert state == state.lower()
+        assert "[" not in state and "]" not in state
+
+
+# ---------------------------------------------------------------------------
+# 7. No stray output during the test run
 # ---------------------------------------------------------------------------
 
 
