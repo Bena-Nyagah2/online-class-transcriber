@@ -376,6 +376,15 @@ class RecordRequest(BaseModel):
         max_length=2,
         description="ISO-639-1 spoken-language code, e.g. en or sw.",
     )
+    resume: bool = Field(
+        default=False,
+        description=(
+            "Continue an interrupted run instead of starting a new one. When "
+            "true the existing-take overwrite guard is bypassed: the audio "
+            "already on disk is the lecture being recovered, so capture is "
+            "skipped and the pipeline restarts at the first unfinished stage."
+        ),
+    )
 
 
 def _make_state_callback() -> Callable[[str], None]:
@@ -403,7 +412,11 @@ def _make_state_callback() -> Callable[[str], None]:
 
 
 def _run_in_background(
-    course_code: str, language: str, stop_event: threading.Event
+    course_code: str,
+    language: str,
+    stop_event: threading.Event,
+    resume: bool = False,
+    skipping_capture: bool = False,
 ) -> None:
     """Execute the pipeline, recording its outcome into :data:`APP_STATE`.
 
@@ -424,6 +437,14 @@ def _run_in_background(
             phase. Passed in rather than read from the module global so that
             this run can only ever be stopped by the request that started it --
             a stale event from a previous run cannot be re-armed into a new one.
+        resume: Forwarded verbatim to ``run_pipeline``. It is the caller's
+            opt-in to trust the checkpoints and the existing ``raw_audio.wav``,
+            and dropping it on the floor here would make the handler's 409
+            bypass a silent clobber instead of a recovery.
+        skipping_capture: Whether the handler has already established that the
+            run will resume from audio on disk. Only used to decide whether a
+            capture device is needed; ``resume`` remains the pipeline's own
+            authority on whether to read checkpoints.
 
     Every exit path releases ``_run_lock``; a run that raised while holding it
     would leave the server permanently refusing new requests. The same applies
@@ -440,16 +461,26 @@ def _run_in_background(
     """
     global _run_active, _stop_event
     try:
+        # A device index is only meaningful when capture will run. Resolving one
+        # on a resume would abort recovery on the machine most likely to need
+        # it -- the one whose capture device is broken -- even though
+        # ``run_pipeline`` never consults ``device_id`` once it resumes from
+        # audio already on disk. The placeholder is ``0`` and not ``None``
+        # because ``None`` means "prompt": a browser has no terminal to answer
+        # with, so a race that did make the resumed run capture would hang the
+        # worker forever instead of failing loudly.
+        device_id = 0 if skipping_capture else resolve_device_index()
         notes_path = run_pipeline(
             course_code,
             language,
             _make_state_callback(),
             # No terminal to prompt on, so both interactive decisions are made
-            # here instead. The device is auto-selected and the overwrite has
-            # already been vetted by the handler.
-            device_id=resolve_device_index(),
+            # here instead. The device is auto-selected (unless capture is
+            # skipped) and the overwrite has already been vetted by the handler.
+            device_id=device_id,
             confirm_overwrite=True,
             stop_event=stop_event,
+            resume=resume,
         )
     except PipelineError as exc:
         # Expected failure, already reported to the terminal by run_pipeline.
@@ -555,15 +586,17 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
     """Start a pipeline run and return immediately.
 
     Args:
-        payload: Course code and language.
+        payload: Course code, language and the optional resume opt-in.
         background: Starlette's post-response task runner.
 
     Returns:
         An acknowledgement carrying the accepted course code and status. The
         run is already in flight by the time this is serialised, and any
-        connected dashboard has already been pushed the ``recording`` state --
+        connected dashboard has already been pushed the run's opening state --
         the call to :func:`_set_state` below broadcasts before the response is
-        even built.
+        even built. The status is ``recording`` for a normal run and
+        ``transcribing`` for a resume that skips capture; see the note on the
+        branch below for why it is not a guess.
 
     Raises:
         HTTPException: 409 if a run is already in progress, or if this course
@@ -573,7 +606,8 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
             ``raw_audio.wav`` and race on the same output directory. The
             overwrite case is refused rather than confirmed because a browser
             has no way to ask the operator, and an existing ``raw_audio.wav``
-            is a previous lecture's only copy.
+            is a previous lecture's only copy. A request carrying
+            ``resume=true`` is the one exception: see below.
     """
     global _run_active, _stop_event
     with _run_lock:
@@ -607,7 +641,16 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
     # again itself.
     output_dir = create_output_dir(course_code)
     existing_take = output_dir / WAV_FILENAME
-    if existing_take.exists():
+    has_take = existing_take.exists()
+
+    # A resume request is the one caller that *wants* the existing take: the
+    # audio already on disk is the lecture being recovered, so refusing it would
+    # make recovery impossible. The bypass is safe only because the flag is
+    # threaded all the way into run_pipeline, which skips capture whenever the
+    # WAV is present and therefore never opens it for writing. If the flag were
+    # dropped between here and there, this would turn a guard into a clobber --
+    # which is why the wiring is tested rather than assumed.
+    if has_take and not payload.resume:
         with _run_lock:
             _run_active = False
         raise HTTPException(
@@ -616,22 +659,65 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
                 f"A recording for {course_code} already exists at "
                 f"{existing_take.name} from an earlier take today, and it is "
                 "the only copy of that lecture. Move or rename the output "
-                "directory before recording a new take."
+                "directory before recording a new take, or re-submit with "
+                "resume=true to continue it."
             ),
         )
 
-    # Published before the state flips to "recording" on purpose. The reverse
-    # order would admit a window where a client is told it is recording but
-    # /api/stop finds no event to set, so a legitimate Finish Class press would
-    # be answered with 400.
+    # Whether the run will actually open the microphone. Mirrors the condition
+    # run_pipeline uses to skip capture (a real, non-empty WAV plus the opt-in),
+    # so a device is only resolved for a run that will consult one, and only
+    # "recording" is announced for a run that will capture.
+    #
+    # The size is read defensively: this runs while the run slot is already
+    # held, so a FileNotFoundError escaping here would answer 500 *and* strand
+    # the slot, wedging every later request behind a 409 for a run that never
+    # existed. A WAV that vanished between the two checks has no audio to
+    # resume from, which is exactly what recording from scratch does about it.
+    skipping_capture = False
+    if payload.resume and has_take:
+        try:
+            skipping_capture = existing_take.stat().st_size > 0
+        except OSError:
+            skipping_capture = False
+
+    # Published before the opening state on purpose. The reverse order would
+    # admit a window where a client is told it is recording but /api/stop finds
+    # no event to set, so a legitimate Finish Class press would be answered with
+    # 400.
     stop_event = threading.Event()
     _stop_event = stop_event
 
-    _set_state(STATE_RECORDING, course_code=course_code)
+    if skipping_capture:
+        # No microphone is opened and no capture phase will run, so announcing
+        # "recording" would be a lie the dashboard acts on -- it would offer
+        # "Finish Class" for a phase that never begins. The run resumes into the
+        # AI stages, so it is reported as transcribing until the pipeline emits
+        # the phase it actually enters (which may be synthesizing, when the
+        # diarization checkpoint is already complete). The stream therefore
+        # skips "recording" entirely, and the dashboard -- which derives its
+        # stage tracker from whichever token arrives -- needs no special case
+        # for the fast-forward.
+        _set_state(
+            STATE_TRANSCRIBING,
+            "Resuming interrupted class: audio already captured. Picking up "
+            "at the first unfinished stage...",
+            course_code=course_code,
+        )
+        status = STATE_TRANSCRIBING
+    else:
+        _set_state(STATE_RECORDING, course_code=course_code)
+        status = STATE_RECORDING
+
     background.add_task(
-        _run_in_background, course_code, payload.language.lower(), stop_event
+        _run_in_background,
+        course_code,
+        payload.language.lower(),
+        stop_event,
+        payload.resume,
+        skipping_capture,
     )
-    return {"accepted": True, "course_code": course_code, "status": STATE_RECORDING}
+    return {"accepted": True, "course_code": course_code, "status": status}
 
 
 def _request_stop() -> threading.Event:

@@ -137,18 +137,25 @@ def client():
         server.resolve_device_index = real_resolve
 
 
-def _start(client, code="CRM_1106", language="en"):
+def _start(client, code="CRM_1106", language="en", resume=False):
     """POST /api/record and return the response.
+
+    ``resume`` is omitted from the body unless it is true, so the tests that
+    pre-date the flag keep exercising the exact payload a browser sends when
+    the toggle is left alone.
 
     NOTE ``TestClient`` runs the app to completion *inside* this call, which
     includes Starlette's background tasks. So a run that blocks will block this
     call too -- anything testing concurrency has to drive the request from a
     separate thread. :func:`_start_in_thread` does that.
     """
-    return client.post("/api/record", json={"course_code": code, "language": language})
+    body = {"course_code": code, "language": language}
+    if resume:
+        body["resume"] = True
+    return client.post("/api/record", json=body)
 
 
-def _start_in_thread(client, code="CRM_1106", language="en"):
+def _start_in_thread(client, code="CRM_1106", language="en", resume=False):
     """POST /api/record from a worker thread; return ``(response_box, slot)``.
 
     Needed because a ``TestClient`` call is synchronous through to the end of
@@ -162,7 +169,7 @@ def _start_in_thread(client, code="CRM_1106", language="en"):
 
     def _worker() -> None:
         try:
-            slot[0] = _start(client, code, language)
+            slot[0] = _start(client, code, language, resume)
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             slot[1] = exc
 
@@ -692,6 +699,150 @@ def test_a_rejected_overwrite_does_not_start_a_pipeline(client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 3b. Resuming an interrupted take
+# ---------------------------------------------------------------------------
+# The overwrite guard treats an existing ``raw_audio.wav`` as unrecoverable
+# because a browser cannot answer the prompt. ``resume=true`` is the caller
+# saying the file is the lecture to recover, so it is the one request allowed
+# past the 409. What these tests protect is that the bypass and the flag travel
+# together: bypassing the guard without telling ``run_pipeline`` to resume would
+# not recover anything, it would overwrite it.
+
+
+def test_a_normal_run_does_not_resume(client):
+    """``resume`` must default to false, or a same-day re-run is a data-loss bug.
+
+    The output directory is keyed by course *and date*, so an ordinary second
+    take of the same course on the same day would otherwise find the first
+    take's audio still sitting there and quietly transcribe that instead of the
+    lecture being taught now.
+    """
+    _start(client)
+
+    assert client.calls[0]["kwargs"]["resume"] is False
+
+
+def test_resume_bypasses_the_overwrite_guard_and_starts_the_run(client, tmp_path):
+    """The one request allowed past the 409 is the one that will not clobber.
+
+    An existing ``raw_audio.wav`` is normally refused, because a browser cannot
+    answer the overwrite prompt and the file is the only copy of an earlier
+    lecture. ``resume=true`` changes what the run does with that file -- it is
+    read, never written -- so the guard is bypassed. That safety depends
+    entirely on the flag reaching ``run_pipeline``, so both halves are asserted
+    together: a bypass without the flag would be a clobber.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    response = _start(client, "CRM_1106", resume=True)
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert client.calls, "the resume never reached run_pipeline"
+    assert client.calls[0]["course_code"] == "CRM_1106"
+    # The load-bearing half: the bypass is only safe because the pipeline is
+    # told to resume rather than to record over the file.
+    assert client.calls[0]["kwargs"]["resume"] is True
+
+
+def test_a_resume_does_not_need_a_capture_device(client, tmp_path):
+    """Recovery must work on the machine whose capture device is the problem.
+
+    ``resolve_device_index`` raises when no loopback device exists, and a normal
+    run needs it before it can capture. A resume that already has its audio must
+    not consult it at all, or the machine most likely to need recovery -- one
+    with a broken or absent capture device -- is the one machine that cannot.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    def _no_device(*a, **k):
+        raise m.PipelineError("no loopback audio devices found")
+
+    real = server.resolve_device_index
+    server.resolve_device_index = _no_device
+    try:
+        response = _start(client, "CRM_1106", resume=True)
+    finally:
+        server.resolve_device_index = real
+
+    assert response.status_code == 200
+    assert client.calls, "the resume never reached run_pipeline"
+    assert client.calls[0]["kwargs"]["device_id"] == 0
+
+
+def test_resume_without_audio_records_from_scratch(client):
+    """resume=true with nothing to resume is a normal run, not an empty one.
+
+    The guard bypass is conditional on the WAV being there; with no audio the
+    flag has nothing to recover, so capture must run and the opening state is
+    ``recording``, not a claim that work is already under way.
+    """
+    response = _start(client, "CRM_1106", resume=True)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == m.STATE_RECORDING
+    assert client.calls[0]["kwargs"]["resume"] is True
+
+
+def test_a_refused_overwrite_points_at_the_resume_flag(client, tmp_path):
+    """The 409 has to tell the operator how to recover, not just say no.
+
+    A crash is the case that leaves a WAV behind with no notes, and the person
+    who hit it is the one reading this message. An error that names the file but
+    not the escape hatch leaves them moving directories by hand.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    response = _start(client, "CRM_1106")
+
+    assert response.status_code == 409
+    assert "resume=true" in response.json()["detail"]
+
+
+def test_a_resumed_run_skips_the_recording_state_entirely(client, tmp_path):
+    """resume=true must never tell the dashboard a microphone is live.
+
+    The pipeline emits no ``recording`` state on a resume -- capture is the
+    phase it just skipped -- so the server must not invent one, or the dashboard
+    would offer a "Finish Class" button for a phase that never begins. The run
+    opens on ``transcribing`` instead, and the pipeline then fast-forwards to
+    whichever AI stage it actually entered. This is the stream shape the
+    dashboard has to render, and the reason its stage tracker keys off the token
+    rather than waiting for a capture frame that will never arrive.
+    """
+    (tmp_path / "raw_audio.wav").write_bytes(b"RIFF" + b"\0" * 200)
+
+    def _resumed(course_code, language, state_callback=None, **kwargs):
+        # Resumed from a complete diarization checkpoint: synthesis is the first
+        # phase that actually runs, so transcription is skipped too.
+        state_callback(m.STATE_SYNTHESIZING)
+        state_callback(m.STATE_COMPLETE)
+        return "notes.md"
+
+    published: list[dict] = []
+    real_deliver = server._broadcaster._deliver
+
+    def _capture(payload):
+        published.append(payload)
+        real_deliver(payload)
+
+    real_pipeline = server.run_pipeline
+    server.run_pipeline = _resumed
+    server._broadcaster._deliver = _capture
+    try:
+        response = _start(client, "CRM_1106", resume=True)
+    finally:
+        server.run_pipeline = real_pipeline
+        server._broadcaster._deliver = real_deliver
+
+    assert response.status_code == 200
+    assert response.json()["status"] == m.STATE_TRANSCRIBING
+    seen = [p["status"] for p in published]
+    assert m.STATE_RECORDING not in seen, f"a resume claimed to be recording: {seen}"
+    assert seen[-1] == m.STATE_COMPLETE
+
+
+# ---------------------------------------------------------------------------
 # 4. Static shell
 # ---------------------------------------------------------------------------
 
@@ -836,6 +987,63 @@ def test_the_dashboard_collects_a_course_code_and_a_language(client):
     # And it must actually offer choices, or it is a text box wearing a costume.
     options = html.split("<select", 1)[1].split("</select>", 1)[0]
     assert options.count("<option") >= 2, "the language select has no options"
+
+
+def test_the_dashboard_offers_a_resume_toggle(client):
+    """The resume capability is reachable from the UI, not just from the API.
+
+    Off by default in the markup as well as in the schema: an untouched form
+    has to mean the same thing on both sides, or a re-run of the same course on
+    the same day would silently recover the earlier take.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    anchor = html.index('id="resume"')
+    start = html.rindex("<", 0, anchor)
+    end = html.index(">", anchor)
+    tag = html[start:end]
+    assert tag.startswith("<input"), f"resume control is: {tag!r}"
+    assert 'type="checkbox"' in tag, f"resume control is: {tag!r}"
+    # No ``checked`` attribute: the default has to be off.
+    assert "checked" not in tag, f"resume toggle defaults to on: {tag!r}"
+    assert "Resume interrupted class" in html
+    assert "Recovers a crashed session" in html
+
+
+def test_the_resume_toggle_is_sent_to_the_backend(client):
+    """A toggle that never reaches the request body is decoration.
+
+    The API only bypasses the overwrite guard for a body carrying
+    ``resume=true``, so the form's submit handler has to read the checkbox and
+    put it there.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    body = html.split("body: JSON.stringify({", 1)[1].split("})", 1)[0]
+    assert "resume" in body, f"submit payload is: {body!r}"
+    assert "resumeIn.checked" in body, f"submit payload is: {body!r}"
+    # And the element the handler reads must exist.
+    assert 'id="resume"' in html
+
+
+def test_the_stage_tracker_handles_a_fast_forwarded_status(client):
+    """A resumed stream never reports capture, and may skip transcription too.
+
+    Every stage is drawn as done the moment the reported status is one it could
+    not still be running in, so a run that opens on ``synthesizing`` renders
+    Capture and Transcribe as finished rather than pending. If either stage
+    counted only ``recording``/``transcribing`` as proof of completion, a
+    resumed dashboard would sit on a tracker that never advances.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    stages = html.split("const STAGES = [", 1)[1].split("];", 1)[0]
+
+    for stage_id, label in (("capture", "Capture"), ("transcribe", "Transcribe")):
+        entry = stages.split(f'id: "{stage_id}"', 1)[1].split("}", 1)[0]
+        assert "synthesizing" in entry, (
+            f"the {label} stage is not marked done when the stream reports "
+            f"synthesizing, so a resumed run would render it as pending: {entry!r}"
+        )
 
 
 # ---------------------------------------------------------------------------

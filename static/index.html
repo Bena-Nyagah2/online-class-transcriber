@@ -125,6 +125,33 @@
         </div>
 
         <!--
+          Resume opt-in. Off by default, and deliberately so: the output
+          directory is keyed by course *and date*, so a same-day re-run finds
+          the previous take's audio sitting right there. Checking this is the
+          operator's explicit statement that the earlier run crashed -- the
+          backend treats that audio as the lecture to recover and bypasses its
+          409 overwrite guard, so a convenience default would silently
+          transcribe an earlier lecture instead of the one being taught.
+        -->
+        <div class="flex items-start gap-3 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
+          <input
+            id="resume"
+            name="resume"
+            type="checkbox"
+            class="mt-0.5 h-4 w-4 shrink-0 cursor-pointer rounded border-slate-600
+                   bg-slate-900 accent-blue-600 focus:ring-2 focus:ring-blue-500/40
+                   disabled:cursor-not-allowed disabled:opacity-40"
+          />
+          <label for="resume" class="cursor-pointer select-none text-sm text-slate-300">
+            Resume interrupted class
+            <span class="mt-0.5 block text-xs text-slate-500">
+              Recovers a crashed session by continuing from the last completed
+              stage instead of recording over it.
+            </span>
+          </label>
+        </div>
+
+        <!--
           Control deck. Both buttons are always in the DOM and toggled with
           `hidden` rather than removed and re-created: a re-created button
           loses focus, and losing focus mid-run is exactly the moment the
@@ -339,6 +366,7 @@
     stopButton:     document.getElementById("stop-button"),
     courseIn:       document.getElementById("course_code"),
     langIn:         document.getElementById("language"),
+    resumeIn:       document.getElementById("resume"),
     tracker:        document.getElementById("stage-tracker"),
     processing:     document.getElementById("processing-state"),
     processingText: document.getElementById("processing-text"),
@@ -362,6 +390,14 @@
   let lastStatus = "idle";
   let connection = "connecting";
   let source = null;
+
+  // Counts every state frame the stream has actually delivered. It exists so
+  // the acknowledgement drawn by submit() can tell whether the pipeline has
+  // already spoken for itself. A resumed run can fast-forward past capture --
+  // and even past transcription -- before the POST response is rendered, and
+  // drawing the ack unconditionally would overwrite that newer frame and strand
+  // the deck on a phase the run has already left.
+  let streamSeq = 0;
 
   // Set when the operator presses Finish Class, cleared as soon as the server
   // reports a state that is no longer "recording". It is a UI acknowledgement
@@ -548,6 +584,7 @@
     // the value has already been accepted by the server either way.
     el.courseIn.disabled = working;
     el.langIn.disabled = working;
+    el.resumeIn.disabled = working;
 
     if (el.button.disabled) {
       el.button.textContent = "Server unreachable";
@@ -594,6 +631,7 @@
         // Ignore it and wait for the next one.
         return;
       }
+      streamSeq += 1;
       setConnection("live");
       render(payload);
     };
@@ -657,6 +695,11 @@
     clearError();
     el.button.disabled = true;
 
+    // Remember where the stream was before this request. A resumed run can
+    // fast-forward to a later phase before the response even lands, and the
+    // optimistic draw below must not clobber that newer frame.
+    const seqAtSubmit = streamSeq;
+
     try {
       const response = await fetch(RECORD_URL, {
         method: "POST",
@@ -664,6 +707,7 @@
         body: JSON.stringify({
           course_code: el.courseIn.value.trim(),
           language: el.langIn.value.trim().toLowerCase(),
+          resume: el.resumeIn.checked,
         }),
       });
 
@@ -674,16 +718,31 @@
       }
 
       const accepted = await response.json();
-      // Draw the accepted state immediately. The stream will push the same state
-      // within milliseconds, and rendering it here as well means the deck
+      const status = accepted.status || RECORDING;
+
+      if (streamSeq !== seqAtSubmit) {
+        // The stream has already reported this run's real state -- on a resume
+        // it may be synthesizing, having skipped capture and transcription
+        // entirely. That frame is newer and truer than the acknowledgement, so
+        // leave it standing rather than painting the deck backwards.
+        syncDeck();
+        return;
+      }
+
+      // Draw the accepted state immediately. The stream will push the same
+      // state within milliseconds, and rendering it here as well means the deck
       // re-enables correctly even if the stream happens to be down -- a run
       // really is starting, and the operator should be able to submit another
       // once it finishes. The acknowledgement carries no message field, so one
-      // is supplied; the stream overwrites it moments later.
+      // is supplied; the stream overwrites it moments later. The wording is
+      // chosen by the token, because a resume opens on transcribing while a
+      // fresh run opens on recording.
       render({
-        status: accepted.status || RECORDING,
+        status: status,
         course_code: accepted.course_code,
-        message: "Recording started. Waiting for the first update...",
+        message: status === RECORDING
+          ? "Recording started. Waiting for the first update..."
+          : "Resuming interrupted class. Waiting for the first update...",
       });
     } catch (err) {
       showError("Could not reach the server. Is it still running?");
