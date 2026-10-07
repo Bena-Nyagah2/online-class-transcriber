@@ -739,3 +739,58 @@ class LocalTranscriber:
         segments = self.diarize(wav_path, segments)
         return self.write_transcript(wav_path, segments)
 
+
+
+def format_diarization_md(diarization_path: Path) -> str:
+    """Read a diarization JSON and compile a clean Markdown string.
+
+    The output excludes raw timestamps and confidence scores; every segment
+    is rendered as ``**Speaker N:** text`` with a blank line between speakers
+    for readability.  If the file is empty or missing, an empty string is
+    returned.
+
+    Args:
+        diarization_path: Path to ``diarization.json``.
+
+    Returns:
+        Markdown-formatted string suitable for saving as ``.txt`` or uploading
+        to Drive.
+    """
+    if not diarization_path.is_file():
+        return ""
+
+    try:
+        data = json.loads(diarization_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+    if not isinstance(data, list):
+        return ""
+
+    lines: list[str] = []
+    current_speaker: str | None = None
+
+    for segment in data:
+        speaker = segment.get("speaker", "SPEAKER_UNKNOWN")
+        text = segment.get("text", "").strip()
+
+        if not text:
+            continue
+
+        # Emit a blank line when the speaker changes.
+        if speaker != current_speaker:
+            if current_speaker is not None:
+                lines.append("")
+            current_speaker = speaker
+
+        # Speaker labels from pyannote are typically ``SPEAKER_00``, etc.
+        # Normalise them to ``Speaker 1``, ``Speaker 2``, etc.
+        try:
+            num = int(speaker.split("_")[-1])
+            label = f"Speaker {num}"
+        except (ValueError, IndexError):
+            label = speaker
+
+        lines.append(f"**{label}:** {text}")
+
+    return "\n".join(lines) + "\n" if lines else ""

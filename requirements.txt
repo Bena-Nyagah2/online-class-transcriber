@@ -19,3 +19,7 @@ rich>=13.0.0
 fastapi>=0.115.0            # Phase 7: HTTP API + static dashboard shell
 uvicorn>=0.30.0             # ASGI server for server.py (run: uvicorn server:app)
 httpx>=0.27.0               # tests only: Starlette's TestClient; separate from httpx2 above
+
+# Google Drive sync
+google-auth-oauthlib>=1.0.0
+google-api-python-client>=2.0.0

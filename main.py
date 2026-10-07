@@ -983,6 +983,15 @@ def run_pipeline(
         f"{slide_catcher.slides_dir if slide_catcher else slides_dir.name}",
     )
     _kv("Study Notes:", f"[bold]{notes_path}[/bold]")
+
+    # -- Google Drive sync (best-effort; never blocks the pipeline) ----------
+    try:
+        from services.gdrive import sync_markdown
+        sync_markdown(course_code, str(date.today()), notes_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 – best‑effort only
+        import logging
+        logging.getLogger("gdrive-sync").warning("google-drive-sync: %s", exc)
+
     return str(notes_path)
 
 
