@@ -17,24 +17,31 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 import transcriber
 from transcriber import (
+    ALIGNMENT_CHECKPOINT,
     BATCH_SIZE,
     BATCH_SIZE_ENV,
+    CHECKPOINT_FILENAMES,
     COMPUTE_TYPE,
     COMPUTE_TYPE_ENV,
     DEFAULT_LANGUAGE,
+    DIARIZATION_CHECKPOINT,
     HF_TOKEN_ENV,
     LocalTranscriber,
     MAX_TURN_GAP_SECONDS,
+    TRANSCRIPTION_CHECKPOINT,
     TRANSCRIPT_FILENAME,
     UNKNOWN_SPEAKER,
     _format_turns,
     format_timestamp,
+    read_checkpoint,
     resolve_batch_size,
     resolve_compute_type,
     resolve_hf_token,
+    write_checkpoint,
 )
 
 
@@ -765,3 +772,194 @@ def test_speaker_bounds_go_to_the_pipeline_not_the_assigner(mocker, tmp_path) ->
     }
     # The audio is decoded once and shared across all three stages.
     assert whisperx.load_audio.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# resume checkpoints
+# ---------------------------------------------------------------------------
+# The pipeline resumes by skipping a phase whose checkpoint is already on disk,
+# so the on-disk format is load-bearing: if it cannot round-trip a segment, or
+# if a corrupt file is mistaken for a good one, "resume" silently produces a
+# wrong transcript instead of failing. These tests pin the format itself.
+
+
+def test_checkpoint_round_trips_segments(tmp_path) -> None:
+    """Whatever is written must load back byte-for-byte equivalent."""
+    segments = [
+        {"start": 0.0, "end": 2.5, "text": "hello", "speaker": "SPEAKER_00"},
+        {"start": 2.5, "end": 4.0, "text": "world", "speaker": "SPEAKER_01"},
+    ]
+    path = tmp_path / TRANSCRIPTION_CHECKPOINT
+
+    write_checkpoint(path, segments)
+
+    assert read_checkpoint(path) == segments
+
+
+def test_checkpoint_coerces_numpy_scalars_and_arrays(tmp_path) -> None:
+    """WhisperX emits NumPy types, and ``json`` refuses them outright.
+
+    Without coercion the very first checkpoint write would die with
+    ``TypeError: Object of type float32 is not JSON serializable`` -- but only
+    on real audio, since the test doubles use plain floats. That is exactly the
+    kind of gap that would surface during a lecture and not before.
+    """
+    segments = [
+        {
+            "start": np.float32(1.5),
+            "end": np.float64(2.5),
+            "text": "hi",
+            "words": [{"w": "hi", "score": np.float32(0.9)}],
+            "embedding": np.array([1.0, 2.0], dtype=np.float32),
+        }
+    ]
+    path = tmp_path / DIARIZATION_CHECKPOINT
+
+    write_checkpoint(path, segments)
+    loaded = read_checkpoint(path)
+
+    assert loaded[0]["start"] == 1.5
+    assert loaded[0]["end"] == 2.5
+    assert isinstance(loaded[0]["start"], float)
+    assert loaded[0]["words"][0]["score"] == pytest.approx(0.9)
+    assert loaded[0]["embedding"] == [1.0, 2.0]
+
+
+def test_checkpoint_refuses_a_type_it_cannot_encode(tmp_path) -> None:
+    """An unknown type must raise, not recurse until the process dies.
+
+    ``json.dumps`` feeds a ``default`` handler's return value back into its own
+    encoder, so a coercion that yields another non-native object loops forever.
+    A hung process during a 90-minute lecture is far worse than a clean failure
+    that just recomputes the stage, so the handler checks its own output.
+    """
+    path = tmp_path / DIARIZATION_CHECKPOINT
+
+    with pytest.raises(TypeError):
+        write_checkpoint(path, [{"speaker": object()}])
+
+
+def test_pathological_coercion_object_raises_instead_of_recursing(tmp_path) -> None:
+    """A type whose ``item()`` returns another exotic object must not loop.
+
+    This is the precise shape that exhausted memory in a real run: an object
+    exposing ``item()`` that yields something still not JSON-native.
+
+    Asserted on ``_json_default`` directly, *not* through ``json.dumps``. That
+    is deliberate: if the guard is removed, the end-to-end form recurses until
+    the process runs out of memory, so the failure surfaces as a machine
+    problem instead of a test failure -- a test that can bring down the host is
+    worse than no test. Calling the boundary function keeps the failure a clean
+    ``TypeError`` under any implementation.
+    """
+
+    class Endless:
+        def item(self):
+            return Endless()
+
+    with pytest.raises(TypeError):
+        transcriber._json_default(Endless())
+
+
+def test_read_checkpoint_returns_none_for_a_missing_file(tmp_path) -> None:
+    """Absent means "recompute" -- the ordinary first-run case."""
+    assert read_checkpoint(tmp_path / TRANSCRIPTION_CHECKPOINT) is None
+
+
+def test_read_checkpoint_treats_a_truncated_file_as_absent(tmp_path) -> None:
+    """A half-written checkpoint is the expected artefact of the crash we survive.
+
+    Returning ``None`` collapses "not written", "corrupt", and "wrong shape"
+    into the single correct action: recompute. Letting the ``JSONDecodeError``
+    escape would turn a recoverable crash into a second crash on resume.
+    """
+    path = tmp_path / TRANSCRIPTION_CHECKPOINT
+    path.write_text('[{"start": 0.0, "text": "half a', encoding="utf-8")
+
+    assert read_checkpoint(path) is None
+
+
+def test_write_checkpoint_leaves_no_partial_file(tmp_path) -> None:
+    """The write goes through a sibling temp file and never litters.
+
+    A checkpoint observed half-written is worse than a missing one, because it
+    parses far enough to look like a resume and then produces a truncated
+    transcript.
+    """
+    path = tmp_path / ALIGNMENT_CHECKPOINT
+
+    write_checkpoint(path, [{"text": "a"}])
+    write_checkpoint(path, [{"text": "b"}])
+
+    assert read_checkpoint(path) == [{"text": "b"}]
+    assert not list(tmp_path.glob("*.partial"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == [ALIGNMENT_CHECKPOINT]
+
+
+def test_every_checkpoint_name_is_distinct_and_non_empty() -> None:
+    """The tuple is what invalidation iterates, so a duplicate is a silent leak.
+
+    If two phases shared a filename, recording a fresh take would delete one
+    file while leaving the other's stale content behind -- and the resume would
+    then trust it.
+    """
+    assert len(set(CHECKPOINT_FILENAMES)) == len(CHECKPOINT_FILENAMES)
+    assert all(name.endswith(".json") for name in CHECKPOINT_FILENAMES)
+
+
+# ---------------------------------------------------------------------------
+# the phase seam resume depends on
+# ---------------------------------------------------------------------------
+
+
+def test_the_phases_are_individually_callable(mocker, tmp_path) -> None:
+    """``transcribe``/``align``/``diarize`` must be separate entry points.
+
+    This is the seam the whole resume feature rests on. A single combined
+    ``transcribe_audio`` gives the pipeline nowhere to checkpoint, so "resume
+    after the crash" would collapse back into "start over" -- which is what the
+    original design did.
+    """
+    segments = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    _make_whisperx(mocker, segments)
+    wav_path = _write_wav(tmp_path)
+    transcriber_obj = LocalTranscriber()
+
+    asr_segments = transcriber_obj.transcribe(wav_path, language="en")
+    aligned = transcriber_obj.align(wav_path, asr_segments, language="en")
+    diarized = transcriber_obj.diarize(wav_path, aligned)
+
+    assert asr_segments == segments
+    assert aligned == segments
+    assert diarized == segments
+
+
+def test_transcribe_audio_runs_the_same_phases_in_order(mocker, tmp_path) -> None:
+    """The convenience wrapper must stay a composition, not a second code path.
+
+    If ``transcribe_audio`` ever grew its own copy of the work, checkpointing
+    would silently stop covering the callers that use it.
+    """
+    segments = [{"start": 0.0, "end": 1.0, "text": "hi", "speaker": "S"}]
+    _make_whisperx(mocker, segments)
+    wav_path = _write_wav(tmp_path)
+    transcriber_obj = LocalTranscriber()
+    order: list[str] = []
+
+    mocker.patch.object(
+        transcriber_obj, "transcribe",
+        side_effect=lambda *a, **k: (order.append("transcribe"), list(segments))[1],
+    )
+    mocker.patch.object(
+        transcriber_obj, "align",
+        side_effect=lambda *a, **k: (order.append("align"), list(segments))[1],
+    )
+    mocker.patch.object(
+        transcriber_obj, "diarize",
+        side_effect=lambda *a, **k: (order.append("diarize"), list(segments))[1],
+    )
+
+    result = transcriber_obj.transcribe_audio(wav_path, language="en")
+
+    assert order == ["transcribe", "align", "diarize"]
+    assert result == tmp_path / TRANSCRIPT_FILENAME

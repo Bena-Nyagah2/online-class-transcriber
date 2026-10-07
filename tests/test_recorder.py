@@ -12,6 +12,7 @@ input:
 from __future__ import annotations
 
 import threading
+import time
 from datetime import date
 
 import numpy as np
@@ -22,10 +23,13 @@ from main import _sanitize_course_code, create_output_dir, prompt_course_code
 from recorder import (
     AudioRecorder,
     CHUNK_FRAMES,
+    CHECKPOINT_INTERVAL_SECONDS,
+    REPLACE_RETRY_ATTEMPTS,
     SAMPLE_RATE,
     _combine_streams,
     _stack_chunks,
     _to_mono,
+    _write_wav_atomic,
 )
 
 
@@ -372,3 +376,209 @@ def test_prompt_then_create_output_dir_uses_sanitized_code(
     assert result.name == f"CRM_1106_{date.today():%Y-%m-%d}"
     assert result.parent.name == "output"
     assert result.is_dir()
+
+# ---------------------------------------------------------------------------
+# recorder.py — crash durability (periodic flush + atomic writes)
+# ---------------------------------------------------------------------------
+# Before this, nothing reached disk until stop_recording wrote the whole take in
+# one shot, so a power cut, kernel panic, or pulled battery destroyed 100% of a
+# 90-minute lecture -- the in-memory chunk lists were the only copy, and the old
+# device-drop backup never applied because a power cut raises no exception. The
+# tests below hold the replacement contract: at any moment during capture, a
+# *valid and self-consistent* WAV exists on disk.
+
+
+def _fill(recorder, seconds: float) -> int:
+    """Queue ``seconds`` of constant audio into the recorder's system buffer.
+
+    Returns:
+        The number of whole chunks queued, so a test can assert on the exact
+        frame count rather than re-deriving it. ``SAMPLE_RATE`` is not divisible
+        by ``CHUNK_FRAMES``, so the integer truncation here is deliberate and
+        callers must use this return value -- assuming ``seconds * SAMPLE_RATE``
+        frames would be off by the remainder and fail on a correct file.
+    """
+    chunk = np.full(CHUNK_FRAMES, 0.25, dtype=np.float32)
+    count = int(seconds * SAMPLE_RATE / CHUNK_FRAMES)
+    with recorder._buffer_lock:
+        recorder._system_buffer.extend(chunk.copy() for _ in range(count))
+    return count
+
+
+def _assert_self_consistent(path, expected_frames=None) -> None:
+    """Assert ``path`` is a readable WAV whose RIFF length matches its size.
+
+    The header check is the one that matters. A WAV whose declared length
+    exceeds the bytes actually present is exactly the "corrupted .wav" the
+    durability work exists to prevent, and ``sf.info`` alone will happily report
+    the *declared* frame count for such a file -- so it would pass a naive
+    "is it readable" check while being unplayable past the truncation point.
+    """
+    assert path.is_file(), f"{path.name} was never written"
+    info = sf.info(str(path))
+    assert info.samplerate == SAMPLE_RATE
+    assert info.channels == 1
+    declared_bytes = info.frames * 2 + 44  # PCM_16 mono + canonical header
+    assert path.stat().st_size == declared_bytes, (
+        f"{path.name} claims {declared_bytes} bytes but holds "
+        f"{path.stat().st_size}; the header and the data disagree"
+    )
+    if expected_frames is not None:
+        assert info.frames == expected_frames
+
+
+def test_a_mid_capture_flush_writes_a_valid_self_consistent_wav(tmp_path) -> None:
+    """The flush must produce a playable file, not a truncated husk.
+
+    This is the core promise: whatever was captured before the lights went out
+    is recoverable. Asserted on the header/data agreement, because a partially
+    written WAV is still *openable* and would otherwise look like success.
+    """
+    recorder = AudioRecorder(emergency_backup_path=tmp_path / "backup.wav")
+    chunks = _fill(recorder, seconds=10)
+
+    assert recorder._flush_backup() is True
+
+    _assert_self_consistent(tmp_path / "backup.wav", expected_frames=chunks * CHUNK_FRAMES)
+
+
+def test_an_empty_buffer_does_not_churn_a_zero_byte_file(tmp_path) -> None:
+    """Before any audio arrives, the flush must decline, not write 0 bytes.
+
+    A 0-byte ``emergency_backup.wav`` is worse than none at all: it is
+    indistinguishable from a crashed write, so an operator recovering a take
+    would open it and find nothing where a missing file would at least have
+    said "no backup was made".
+    """
+    backup = tmp_path / "backup.wav"
+    recorder = AudioRecorder(emergency_backup_path=backup)
+
+    assert recorder._flush_backup() is False
+    assert not backup.exists()
+
+
+def test_the_periodic_flusher_keeps_the_backup_current_and_is_retired(
+    tmp_path, monkeypatch
+) -> None:
+    """During capture the backup is refreshed; on stop it is cleared.
+
+    The final WAV is a superset of every periodic flush (same audio, more
+    seconds), so leaving the backup behind after a clean stop would only invite
+    the operator to open the stale one. Removing it also preserves the
+    long-standing behaviour that a clean stop leaves no backup file.
+    """
+    monkeypatch.setattr("recorder.CHECKPOINT_INTERVAL_SECONDS", 0.05)
+    backup = tmp_path / "periodic.wav"
+    final = tmp_path / "final.wav"
+    recorder = AudioRecorder(emergency_backup_path=backup)
+    _fill(recorder, seconds=2)
+    recorder.is_recording.set()
+
+    recorder._start_checkpointing()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not backup.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert recorder._checkpoint_thread.is_alive(), "the flusher died"
+        assert backup.is_file(), "the flusher never produced a backup"
+    finally:
+        # Retired before the read: reading a file that another thread may be
+        # replacing races on Windows, and the race would be in the test.
+        recorder.is_recording.clear()
+        recorder._stop_checkpointing()
+
+    _assert_self_consistent(backup)
+
+    recorder._finalized = False
+    recorder._last_path = None
+    recorder.stop_recording(final)
+
+    _assert_self_consistent(final)
+    assert not backup.exists(), "the superseded backup survived a clean stop"
+
+
+def test_a_transient_flush_failure_does_not_end_the_protection(tmp_path, monkeypatch) -> None:
+    """One bad flush must not silently disarm durability for the whole lecture.
+
+    Windows ``os.replace`` fails with PermissionError whenever anything holds
+    the destination open -- an indexer, a scanner -- and those handles are
+    transient. Treating the first failure as fatal would leave the operator
+    believing they still had periodic backups for the remaining hour, which is
+    the one outcome this mechanism exists to rule out.
+    """
+    monkeypatch.setattr("recorder.CHECKPOINT_INTERVAL_SECONDS", 0.05)
+    backup = tmp_path / "transient.wav"
+    recorder = AudioRecorder(emergency_backup_path=backup)
+    _fill(recorder, seconds=2)
+    recorder.is_recording.set()
+
+    calls = {"n": 0}
+    real_flush = recorder._flush_backup
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("simulated Windows handle contention")
+        return real_flush()
+
+    monkeypatch.setattr(recorder, "_flush_backup", flaky)
+    recorder._start_checkpointing()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not backup.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] > 1, "the flusher gave up instead of retrying"
+        assert recorder._checkpoint_thread.is_alive(), "the flusher died"
+    finally:
+        recorder.is_recording.clear()
+        recorder._stop_checkpointing()
+
+    _assert_self_consistent(backup)
+
+
+def test_stop_recording_retires_the_flusher_itself(tmp_path, monkeypatch) -> None:
+    """``stop_recording`` must join the flusher, not rely on the caller.
+
+    This is a race, and it is the reason the join happens before any write: the
+    background thread replaces the *backup* while ``stop_recording`` writes the
+    *final* WAV, and if the join were skipped the two could overlap and leave a
+    half-written backup beside a good final file -- precisely the confusing state
+    the mechanism exists to prevent.
+
+    Driven without calling ``_stop_checkpointing`` by hand, because a test that
+    retires the thread itself would pass even with the production call removed.
+    """
+    monkeypatch.setattr("recorder.CHECKPOINT_INTERVAL_SECONDS", 0.05)
+    recorder = AudioRecorder(emergency_backup_path=tmp_path / "race.wav")
+    _fill(recorder, seconds=2)
+    recorder.is_recording.set()
+    recorder._start_checkpointing()
+    try:
+        assert recorder._checkpoint_thread is not None
+        recorder.stop_recording(tmp_path / "final.wav")
+        assert recorder._checkpoint_thread is None, (
+            "stop_recording left the periodic flusher running; it would race the "
+            "final write and could leave a truncated backup behind"
+        )
+    finally:
+        recorder.is_recording.clear()
+        recorder._stop_checkpointing()  # harmless if already retired
+
+
+def test_write_wav_atomic_replaces_in_place_and_leaves_no_partial(tmp_path) -> None:
+    """The swap must be atomic and must not litter ``.partial`` files.
+
+    A crash partway through an in-place write leaves a 0-byte file or one whose
+    RIFF length overruns the data -- the two failure modes the atomic swap is
+    there to make impossible by construction.
+    """
+    target = tmp_path / "atomic.wav"
+
+    _write_wav_atomic(target, np.zeros(SAMPLE_RATE, dtype=np.float32))
+    first_size = target.stat().st_size
+
+    _write_wav_atomic(target, np.zeros(SAMPLE_RATE // 10, dtype=np.float32))
+
+    assert target.stat().st_size != first_size, "the second write did not land"
+    _assert_self_consistent(target, expected_frames=SAMPLE_RATE // 10)
+    assert not list(tmp_path.glob("*.partial")), "a partial file was left behind"

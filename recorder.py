@@ -26,8 +26,10 @@ Architectural notes
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
+import time
 import warnings
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -52,8 +54,37 @@ OPEN_TIMEOUT_SECONDS: float = 5.0
 STOP_JOIN_TIMEOUT_SECONDS: float = 5.0
 """How long ``stop_recording`` waits for the capture thread to exit."""
 
+REPLACE_RETRY_ATTEMPTS: int = 5
+"""How many times to retry an ``os.replace`` that Windows refused.
+
+Five attempts with a growing delay spans a few hundred milliseconds, which is
+long enough for an indexer or scanner to release a handle and short enough that
+an operator would notice if a flush genuinely stalled.
+"""
+
+REPLACE_RETRY_DELAY_SECONDS: float = 0.05
+"""Base delay for the ``os.replace`` retry backoff (grows linearly per attempt)."""
+
 EMERGENCY_BACKUP_FILENAME: str = "emergency_backup.wav"
 """Default filename for the mid-lecture device-failure dump."""
+
+CHECKPOINT_INTERVAL_SECONDS: float = 30.0
+"""How often the mixed audio so far is flushed to the emergency backup.
+
+Why this exists: before it, *nothing* reached disk until
+:meth:`AudioRecorder.stop_recording` wrote the final file in one shot, so a
+power loss, a kernel panic, or a pulled battery during a 90-minute take
+destroyed 100% of the audio — the in-memory chunks were the only copy. The
+device-drop backup did not help, because it only fires on an *exception* in the
+capture thread, which a power cut by definition never raises.
+
+The cost of a power cut is now bounded by this interval rather than being total.
+Thirty seconds is chosen against the write cost: each flush mixes and rewrites
+the whole take, so this is O(duration) work per interval, and the resulting
+quadratic I/O is why the value is not smaller. A lecture is a one-shot,
+write-once workload, so trading I/O for recoverability is the right side of
+that trade.
+"""
 
 AUTO_MICROPHONE: Any = object()
 """Sentinel: "use :meth:`AudioRecorder.get_default_microphone`".
@@ -91,6 +122,57 @@ class LoopbackDevice(Protocol):
     ) -> AbstractContextManager[Any]:
         """Open (and context-manage) a capture stream at ``samplerate``."""
         ...
+
+
+def _replace_with_retry(temp: Path, path: Path) -> None:
+    """``os.replace`` the temp file into place, retrying on Windows contention.
+
+    POSIX has no equivalent problem, but on Windows ``os.replace`` fails with
+    ``PermissionError`` whenever *anything* holds the destination open --
+    another reader, an indexer, a virus scanner passing through. Those handles
+    are transient by nature, so a short bounded backoff turns a spurious
+    failure into a slightly slower write.
+
+    The retry is bounded and the final error is re-raised, so a genuinely
+    stuck destination still surfaces to the caller (which is the checkpoint
+    loop, where it is warned about and retried on the next interval) instead of
+    hanging the recording.
+    """
+    for attempt in range(REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(REPLACE_RETRY_DELAY_SECONDS * (attempt + 1))
+
+
+def _write_wav_atomic(path: Path, audio: np.ndarray) -> None:
+    """Write ``audio`` to ``path`` so the file is never observed half-written.
+
+    ``soundfile.write`` truncates the destination and streams the header and
+    data into it, so a crash partway through leaves either a 0-byte file or one
+    whose RIFF length fields claim more data than the file contains -- the two
+    exact outcomes this durability work exists to prevent. Writing to a sibling
+    temp file and ``os.replace``-ing it in makes the swap atomic on both POSIX
+    and Windows, so ``path`` is only ever the previous good file or the new
+    good file.
+
+    The temp name is derived from the destination rather than randomised so a
+    leftover from a killed run is reused (and overwritten) instead of
+    accumulating one per crash.
+
+    ``format="WAV"`` is passed explicitly and is load-bearing, not decoration:
+    soundfile otherwise infers the container from the *filename extension*, and
+    the temp name ends in ``.partial`` -- which it rejects with
+    ``TypeError: No format specified and unable to get format from file
+    extension``. Naming the format directly keeps the atomic-write trick from
+    depending on the one thing it necessarily changes.
+    """
+    temp = path.with_name(f"{path.name}.partial")
+    sf.write(str(temp), audio, SAMPLE_RATE, subtype="PCM_16", format="WAV")
+    _replace_with_retry(temp, path)
 
 
 def _to_mono(chunk: np.ndarray) -> np.ndarray:
@@ -217,6 +299,12 @@ class AudioRecorder:
         )
         self._finalized: bool = False
         self._last_path: Optional[Path] = None
+
+        # Periodic durability flush. ``_checkpoint_stop`` is cleared by
+        # stop_recording() to retire the thread; the thread itself only ever
+        # exits through that flag, so it can never outlive the recorder.
+        self._checkpoint_stop = threading.Event()
+        self._checkpoint_thread: Optional[threading.Thread] = None
 
         # soundcard forces its runtime warnings to print on every occurrence;
         # during a multi-hour take, "data discontinuity" warnings would flood
@@ -379,12 +467,94 @@ class AudioRecorder:
             flush=True,
         )
 
+        # Started only once the streams are confirmed open, so the periodic
+        # flush never races a failed handshake and writes an empty backup over
+        # a previous take's.
+        self._start_checkpointing()
+
     def _is_capturing(self) -> bool:
         """Return True if either capture thread is still running."""
         return any(
             thread is not None and thread.is_alive()
             for thread in (self._system_thread, self._mic_thread)
         )
+
+    # ------------------------------------------------------------------
+    # periodic durability flush
+    # ------------------------------------------------------------------
+
+    def _start_checkpointing(self) -> None:
+        """Launch the background thread that keeps the backup current."""
+        self._checkpoint_stop.clear()
+        self._checkpoint_thread = threading.Thread(
+            target=self._checkpoint_loop,
+            name="AudioRecorder.checkpoint",
+            daemon=True,
+        )
+        self._checkpoint_thread.start()
+
+    def _stop_checkpointing(self) -> None:
+        """Retire the checkpoint thread and wait for it to leave the file alone.
+
+        Joining is not optional. Without it, stop_recording could begin its
+        final write while a flush is midway, and the two would race for the
+        backup path -- leaving a half-written backup next to a good final WAV,
+        which is precisely the confusing state this mechanism exists to avoid.
+        """
+        self._checkpoint_stop.set()
+        thread = self._checkpoint_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
+        self._checkpoint_thread = None
+
+    def _checkpoint_loop(self) -> None:
+        """Flush the mixed audio to the backup path every interval, until stopped.
+
+        A failed flush is reported once and then *retried on the next interval*
+        rather than ending the loop. That is the whole point of the mechanism:
+        it is insurance against a power cut, so a transient failure -- a full
+        disk, an antivirus scanner holding the file on Windows -- must not
+        quietly leave the operator unprotected for the remaining hour. Going
+        quiet after the first warning keeps a persistent problem from printing
+        once per interval for the rest of the lecture, while the retry means
+        recovery is automatic and invisible.
+        """
+        warned = False
+        while not self._checkpoint_stop.wait(timeout=CHECKPOINT_INTERVAL_SECONDS):
+            # Stopped cleanly while we were sleeping: the final write is
+            # happening or has happened, so do not race it.
+            if not self.is_recording.is_set():
+                return
+            try:
+                if not self._flush_backup():
+                    return
+                warned = False
+            except Exception as exc:  # noqa: BLE001 - daemon thread boundary
+                if not warned:
+                    print(
+                        f"\n⚠️  Periodic audio checkpoint failed ({exc!r}) — "
+                        "continuing to record, but a power loss would now lose "
+                        f"more than the last "
+                        f"{CHECKPOINT_INTERVAL_SECONDS:.0f}s. Will keep retrying.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    warned = True
+
+    def _flush_backup(self) -> bool:
+        """Write everything captured so far to the emergency backup path.
+
+        Returns:
+            ``False`` when there is nothing worth writing yet, so the caller can
+            stop looping rather than churn a 0-byte file every interval.
+        """
+        audio = self._mix_buffers()
+        if audio.shape[0] == 0:
+            return False
+        path = self._emergency_backup_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_wav_atomic(path, audio)
+        return True
 
     def stop_recording(self, output_filepath: Path | str) -> Path:
         """Stop recording, mix both streams, and write a 16 kHz mono WAV.
@@ -407,6 +577,11 @@ class AudioRecorder:
         """
         self.is_recording.clear()
 
+        # First, retire the periodic flusher. Joining before any write is what
+        # guarantees the background thread cannot overwrite the final WAV's
+        # backup mid-write.
+        self._stop_checkpointing()
+
         for thread in (self._system_thread, self._mic_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=STOP_JOIN_TIMEOUT_SECONDS)
@@ -428,7 +603,17 @@ class AudioRecorder:
         path = Path(output_filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         if audio.shape[0] > 0:
-            sf.write(str(path), audio, SAMPLE_RATE, subtype="PCM_16")
+            _write_wav_atomic(path, audio)
+
+        # The periodic backup is now strictly a subset of the final WAV (same
+        # audio, fewer seconds), so leaving it behind would only invite the
+        # operator to open the stale one. Removing it also preserves the
+        # long-standing behaviour that a clean stop leaves no backup file.
+        # Best-effort: a failure here must not fail an otherwise good capture.
+        try:
+            self._emergency_backup_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
         self._finalized = True
         self._last_path = path
@@ -537,12 +722,7 @@ class AudioRecorder:
             audio = self._mix_buffers()  # buffers are kept: stop_recording
                                          # still flushes them afterwards
             self._emergency_backup_path.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(
-                str(self._emergency_backup_path),
-                audio,
-                SAMPLE_RATE,
-                subtype="PCM_16",
-            )
+            _write_wav_atomic(self._emergency_backup_path, audio)
             return self._emergency_backup_path
         except Exception:
             return None

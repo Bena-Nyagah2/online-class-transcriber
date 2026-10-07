@@ -32,6 +32,7 @@ from types import SimpleNamespace
 import pytest
 from imagehash import hex_to_hash
 
+import vision
 from vision import SLIDE_TIMES_FILENAME, SlideCatcher
 
 # Two hashes 64 bits apart: every motion (>2) and dedup (>5) check triggers.
@@ -283,12 +284,19 @@ def test_sidecar_write_failure_does_not_kill_the_capture(mocker, tmp_path) -> No
     assert catcher.captured_slides[0].exists()
 
 
+@pytest.mark.allow_capture_start
 def test_start_stamps_the_elapsed_time_origin(mocker, tmp_path) -> None:
     """``start()`` sets the clock origin, not ``__init__``.
 
     main.py constructs the catcher and starts it back-to-back, but a caller
     that builds a catcher early (or restarts one) must not accumulate dead
     time into every offset.
+
+    This is the one test that opts out of the suite-wide capture guard, because
+    the thread spawn *is* the subject here. The opt-out only re-permits
+    ``start()``; it grants no access to the display, and the two patches below
+    are what keep that true -- the thread body is replaced outright, and the
+    fake ``mss`` is the second layer in case that replacement is ever dropped.
     """
     catcher = SlideCatcher(output_dir=tmp_path)
     assert catcher.start_time == 0.0  # unset until capture begins
@@ -516,3 +524,55 @@ def test_forced_capture_timeout_is_configurable(mocker, tmp_path) -> None:
 
     assert [p.name for p in catcher.captured_slides] == ["slide_001.jpg"]
     assert catcher.slide_times["slide_001.jpg"] == pytest.approx(4.0)
+
+
+def test_the_suite_guard_blocks_an_unpatched_capture(tmp_path) -> None:
+    """An unpatched ``start()`` must fail loudly, in this thread.
+
+    The failure this prevents is silent and delayed: a test that constructs a
+    ``SlideCatcher`` without patching would otherwise screenshot the real
+    display and write the frames into the lecture output directory, and nothing
+    would look wrong until someone opened the archive and found their own
+    desktop in it.
+
+    Asserted on ``start()`` rather than on ``mss.mss`` because of *where* the
+    failure lands. ``start()`` spawns a daemon thread; anything raised inside it
+    is swallowed and the test would pass while proving nothing. Raising here, in
+    the test's own thread, is what makes the mistake visible as a named error
+    instead of an empty ``captured_slides`` list.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path)
+
+    with pytest.raises(RuntimeError, match="real screen"):
+        catcher.start()
+
+    assert catcher.captured_slides == []
+
+
+def test_the_guard_also_blocks_a_bare_mss_grab() -> None:
+    """``mss`` is blocked independently, for a grab that skips ``start()``."""
+    with pytest.raises(RuntimeError, match="real screen"):
+        vision.mss.mss()
+
+
+@pytest.mark.allow_capture_start
+def test_a_marked_test_may_drive_the_capture_loop(mocker, tmp_path) -> None:
+    """The guard is a default, not a wall: a marked test can still capture.
+
+    Without this, the guard could be "fixed" by deleting the tests that trip it
+    and nothing would object.
+
+    Both layers are visible here. The marker is what re-permits ``start()`` to
+    spawn -- it cannot be substituted for by a patch, because the guard
+    replaces the method itself. In exchange, the marker also declines to patch
+    ``mss``, so this test must supply its own fake device; that is the trade,
+    and it is why the marker is safe to hand out.
+    """
+    mocker.patch("vision.mss.mss", return_value=_FakeSCT())
+    mocker.patch.object(SlideCatcher, "_run", lambda self: None)
+
+    catcher = SlideCatcher(output_dir=tmp_path)
+    catcher.start()
+    catcher._thread.join(timeout=5.0)
+
+    assert not catcher._thread.is_alive()
