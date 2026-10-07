@@ -231,10 +231,10 @@ def prompt_course_code() -> str:
     """Prompt until a filesystem-safe course unit code is entered.
 
     Returns:
-        The course code (e.g. ``CRM_1106``), sanitised for use in a path.
+        The course code (e.g. ``COURSE_101``), sanitised for use in a path.
     """
     while True:
-        raw = input("Enter Course Unit Code (e.g. CRM_1106): ").strip()
+        raw = input("Enter Course Unit Code (e.g. COURSE_101): ").strip()
         if not raw:
             console.print("  [yellow]Course code cannot be empty — try again.[/yellow]")
             continue
@@ -678,6 +678,7 @@ def run_pipeline(
     confirm_overwrite: bool | None = None,
     stop_event: threading.Event | None = None,
     resume: bool = False,
+    domain: str = "criminology",
 ) -> str:
     """Run record → transcribe → synthesize and return the study-notes path.
 
@@ -743,6 +744,13 @@ def run_pipeline(
             like a feature. Opting in also keeps the prompt for a genuinely new
             take meaningful. A caller recovering from a crash wants
             ``resume=True``; a caller starting a class wants the default.
+        domain: Key into ``summarizer.PROFILES`` selecting which synthesis
+            prompts shape the notes (``"criminology"``, ``"software"``, or
+            ``"general"``). Defaults to ``"criminology"`` to match the web
+            API's own default, so a caller that says nothing gets exactly the
+            behaviour it had before profiles existed. Forwarded verbatim to
+            ``generate_notes``; an unknown key degrades to the generic
+            profile inside the synthesizer rather than failing the run.
 
     Returns:
         The path to the generated study notes, as a string.
@@ -954,7 +962,7 @@ def run_pipeline(
             _interrupt_protected(
                 "synthesis",
                 lambda: synthesizer.generate_notes(
-                    transcript_path, notes_path, slides_dir
+                    transcript_path, notes_path, slides_dir, domain=domain
                 ),
             )
     except ValueError as exc:

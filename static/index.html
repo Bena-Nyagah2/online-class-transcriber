@@ -69,6 +69,33 @@
     <section class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-xl">
       <form id="record-form" class="space-y-5">
 
+        <!--
+          Domain profile: which synthesizer profile the backend should use
+          (summarizer.PROFILES). A dropdown rather than free text for the
+          same reason as the language picker below -- the value is a key into
+          a fixed table, so an unsupported choice must not be typable at all.
+          Criminology is selected by default so an untouched form means
+          exactly what it meant before profiles existed, and the server's own
+          schema default agrees with it.
+        -->
+        <div>
+          <label for="domain" class="mb-1.5 block text-sm font-medium text-slate-300">
+            Domain Profile
+          </label>
+          <select
+            id="domain"
+            name="domain"
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
+                   text-slate-100 outline-none
+                   focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40
+                   disabled:cursor-not-allowed disabled:bg-slate-900 disabled:text-slate-600"
+          >
+            <option value="criminology" selected>Law &amp; Criminology</option>
+            <option value="software">Software Engineering</option>
+            <option value="general">General Meeting</option>
+          </select>
+        </div>
+
         <div>
           <label for="course_code" class="mb-1.5 block text-sm font-medium text-slate-300">
             Course Code
@@ -79,7 +106,7 @@
             type="text"
             required
             maxlength="64"
-            placeholder="e.g., CRM_3102"
+            placeholder="e.g., CRIM_101 or SYS_Arch"
             autocomplete="off"
             class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
                    text-slate-100 placeholder-slate-600 outline-none
@@ -365,6 +392,7 @@
     button:         document.getElementById("record-button"),
     stopButton:     document.getElementById("stop-button"),
     courseIn:       document.getElementById("course_code"),
+    domainIn:       document.getElementById("domain"),
     langIn:         document.getElementById("language"),
     resumeIn:       document.getElementById("resume"),
     tracker:        document.getElementById("stage-tracker"),
@@ -583,6 +611,7 @@
     // code cannot be edited mid-transcription any more than mid-capture, and
     // the value has already been accepted by the server either way.
     el.courseIn.disabled = working;
+    el.domainIn.disabled = working;
     el.langIn.disabled = working;
     el.resumeIn.disabled = working;
 
@@ -706,6 +735,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           course_code: el.courseIn.value.trim(),
+          domain: el.domainIn.value,
           language: el.langIn.value.trim().toLowerCase(),
           resume: el.resumeIn.checked,
         }),

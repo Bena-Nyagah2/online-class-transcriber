@@ -8,8 +8,9 @@ run and *watch* it, not a second implementation of it.
 Endpoints
 ---------
 ``POST /api/record``
-    Accepts ``{"course_code": ..., "language": ...}``, returns immediately, and
-    runs the pipeline in the background.
+    Accepts ``{"course_code": ..., "domain": ..., "language": ...}``, returns
+    immediately, and runs the pipeline in the background. ``domain`` picks the
+    synthesis profile (default ``criminology``).
 ``POST /api/stop``
     Ends the recording phase and lets the pipeline proceed to transcription.
 ``GET /api/stream``
@@ -362,13 +363,29 @@ class RecordRequest(BaseModel):
     an output directory name; an unbounded string is a filesystem DoS at best.
     It is sanitised again in :func:`_run_in_background` -- the browser is not a
     trusted caller, and this is the boundary where that stops being true.
+
+    ``domain`` selects which synthesis profile from ``summarizer.PROFILES``
+    shapes the notes. It is validated only for length here on purpose: an
+    unknown key degrades to the generic profile inside the synthesizer rather
+    than failing a run that has already captured the lecture, so rejecting it
+    at the boundary would buy no safety and cost the operator their session.
     """
 
     course_code: str = Field(
         ...,
         min_length=1,
         max_length=64,
-        description="Course unit code, e.g. CRM_1106.",
+        description="Course unit code, e.g. COURSE_101.",
+    )
+    domain: str = Field(
+        default="criminology",
+        min_length=1,
+        max_length=32,
+        description=(
+            "Domain profile key selecting the synthesis prompts: "
+            "criminology, software, or general. Defaults to criminology; "
+            "unknown keys fall back to the general profile."
+        ),
     )
     language: str = Field(
         default=DEFAULT_LANGUAGE,
@@ -417,6 +434,7 @@ def _run_in_background(
     stop_event: threading.Event,
     resume: bool = False,
     skipping_capture: bool = False,
+    domain: str = "criminology",
 ) -> None:
     """Execute the pipeline, recording its outcome into :data:`APP_STATE`.
 
@@ -445,6 +463,11 @@ def _run_in_background(
             run will resume from audio on disk. Only used to decide whether a
             capture device is needed; ``resume`` remains the pipeline's own
             authority on whether to read checkpoints.
+        domain: Domain profile key forwarded verbatim to ``run_pipeline`` and
+            on to ``generate_notes``, where it selects the system prompt and
+            slide-extraction prompt. Normalised to lower case by the handler
+            so ``"Software"`` from a hand-rolled client still matches the
+            ``"software"`` profile key.
 
     Every exit path releases ``_run_lock``; a run that raised while holding it
     would leave the server permanently refusing new requests. The same applies
@@ -481,6 +504,7 @@ def _run_in_background(
             confirm_overwrite=True,
             stop_event=stop_event,
             resume=resume,
+            domain=domain,
         )
     except PipelineError as exc:
         # Expected failure, already reported to the terminal by run_pipeline.
@@ -586,7 +610,8 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
     """Start a pipeline run and return immediately.
 
     Args:
-        payload: Course code, language and the optional resume opt-in.
+        payload: Course code, domain profile, language and the optional
+            resume opt-in.
         background: Starlette's post-response task runner.
 
     Returns:
@@ -716,6 +741,7 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
         stop_event,
         payload.resume,
         skipping_capture,
+        payload.domain.lower(),
     )
     return {"accepted": True, "course_code": course_code, "status": status}
 

@@ -142,7 +142,7 @@ _SLIDE_HEADER_RE = re.compile(r"^### Slide: (?:\[[^\]]*\]\s*)?(.+)$", re.MULTILI
 
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
 
-SYSTEM_PROMPT = textwrap.dedent(
+_CRIMINOLOGY_SYSTEM_PROMPT = textwrap.dedent(
     """
     STRICT OUTPUT FORMAT DIRECTIVE: Output ONLY the final Markdown document. Do NOT include preambles, drafting thoughts, scratchpads, or meta-commentary (e.g., NEVER output "Here's a thinking process:" or outline your planning steps). Your response MUST begin immediately with the exact characters "## Executive Summary".
 
@@ -190,14 +190,171 @@ SYSTEM_PROMPT = textwrap.dedent(
     """
 ).strip()  # .strip() so the first directive is character 0, not character 1
 
-# Stage 1: sent alongside exactly one slide image.
-SLIDE_EXTRACT_PROMPT = (
+# Stage 1: sent alongside exactly one slide image (criminology profile).
+_CRIMINOLOGY_SLIDE_PROMPT = (
     "You are an expert academic visual analyst. Extract all text, bullet points, "
     "and statutory/case references. IF the image contains infographics, charts, "
     "diagrams, or visual metaphors, you MUST explicitly describe the data, "
     "structural relationships, and meaning of the visual elements. Be highly "
     "detailed but format concisely in Markdown."
 )
+
+# ---------------------------------------------------------------------------
+# Domain profiles
+# ---------------------------------------------------------------------------
+#
+# The synthesis prompts are the only domain-coupled part of this pipeline, so
+# they live here as data rather than being smeared through the code. A profile
+# supplies the two prompts the pipeline is parameterised by:
+#
+#   SYSTEM_PROMPT         -- Stage 3 system role: persona, mandated sections,
+#                            and the domain-agnostic directives (grounding,
+#                            truncated-slide handling, speaker identification).
+#   SLIDE_EXTRACT_PROMPT  -- Stage 1 vision instruction sent with each slide.
+#
+# ``generate_notes`` looks its ``domain`` argument up in this table and falls
+# back to the "general" profile when the key is unknown, so a bad value from a
+# caller degrades to neutral meeting notes instead of crashing a run that has
+# already spent money capturing and transcribing the session.
+
+PROFILES: dict[str, dict[str, str]] = {
+    "criminology": {
+        "SYSTEM_PROMPT": _CRIMINOLOGY_SYSTEM_PROMPT,
+        "SLIDE_EXTRACT_PROMPT": _CRIMINOLOGY_SLIDE_PROMPT,
+    },
+    "software": {
+        "SYSTEM_PROMPT": textwrap.dedent(
+            """
+            STRICT OUTPUT FORMAT DIRECTIVE: Output ONLY the final Markdown document. Do NOT include preambles, drafting thoughts, scratchpads, or meta-commentary (e.g., NEVER output "Here's a thinking process:" or outline your planning steps). Your response MUST begin immediately with the exact characters "## Executive Summary".
+
+            You are a Senior Technical Architect. You are receiving a chronological meeting transcript and a manifest of described visual slides. Your mandate is to produce a rigorous, structured engineering record -- not a blog post, not a summary, and certainly not a hallucinated narrative.
+
+            CRITICAL RULES:
+            1. **Structure is Mandatory.** The output MUST be organized into exactly these four Markdown sections, in this order, using ATX headings (##):
+               - ## Executive Summary
+               - ## Core Architectures & System Design
+               - ## API & Code References
+               - ## Action Items
+
+            2. **Executive Summary** -- A concise TL;DR of the discussion (150-250 words). No fluff, no rhetorical questions. State the central problem, the decisions taken, and the practical takeaway for the engineering team.
+
+            3. **Core Architectures & System Design** -- For each major component, service, or design decision discussed:
+               - Name it precisely (e.g., "ingest gateway", "event ledger", "read-through cache").
+               - Describe it in the speaker's own wording where possible, citing the transcript timestamp.
+               - Note any trade-offs, rejected alternatives, or open questions raised in the discussion.
+               - Use **bold** for the component name on first use.
+
+            4. **API & Code References** -- Extract *explicitly* from OCR and audio. Each entry must include:
+               - The reference exactly as given: an endpoint as "<METHOD> <path>"; a symbol as "<module>.<name>"; a snippet transcribed exactly as the slide shows it.
+               - The context in which it was discussed (one sentence).
+               - Do NOT add endpoints, symbols, or code the speaker did not mention. This is absolute: if no reference was spoken or shown, the section says so and lists nothing. Never supply a signature from your own knowledge, however well known it is, and never reuse the format templates above as if they were real references. If a slide shows a reference the speaker skipped, note it as "[Slide reference only]".
+               - Use a Markdown table with columns: **Reference | Context | Source (Audio/Slide/Both)**.
+
+            5. **Action Items** -- Capture every follow-up agreed in the session:
+               - Number them 1., 2., 3.
+               - Attribute each item to its owner when a name was given, otherwise write "Unassigned".
+               - Include a deadline only when one was spoken or shown; never invent one.
+
+            6. **Visual Fusion:** When the transcript aligns with a described diagram, screenshot, or architecture sketch from the slides, explain the visual relationship in context. Do not describe the visual in isolation -- anchor it to the spoken argument.
+
+            7. **No Hallucinations, No Fluff.** The STRICT OUTPUT FORMAT DIRECTIVE, the STRICT GROUNDING DIRECTIVE and the SPEAKER IDENTIFICATION directives are all non-negotiable.
+
+            STRICT GROUNDING DIRECTIVE: NEVER invent, infer, or hallucinate URLs, code snippets, or fictional narratives. If a slide shows code, transcribe exactly what is visible. If the audio topic entirely mismatches the visual slide, report both facts neutrally.
+
+            TRUNCATED SLIDE HANDLING: A slide extract may end with the literal marker "[Note: Extraction truncated due to slide density.]" That marker is an annotation added by the extraction pipeline, NOT content from the slide. When you see it, that slide's extract is incomplete: cover the material that IS present, never guess at what the cut-off remainder said, and never quote or repeat the marker itself in the notes. Where a truncated slide covers material central to the discussion, say in the relevant section that the slide's detail was only partially captured.
+
+            SPEAKER IDENTIFICATION: Cross-reference the timestamps of the slides with the timestamps of the transcript. If a slide's OCR text reveals a person's name or title (e.g., a lower-third graphic) during the exact time a specific [SPEAKER_XX] is talking, deduce their identity and replace [SPEAKER_XX] with their real name in the final notes.
+
+            Your output will be graded on precision, technical accuracy, and utility to the engineers picking this work up.
+            """
+        ).strip(),
+        "SLIDE_EXTRACT_PROMPT": (
+            "Extract all text, code snippets, system diagrams, and architectures. "
+            "IF the image contains code, schemas, API signatures, sequence or "
+            "flow diagrams, or infrastructure topology, you MUST explicitly "
+            "describe the data flow, structural relationships, and meaning of "
+            "the visual elements. Be highly detailed but format concisely in "
+            "Markdown."
+        ),
+    },
+    "general": {
+        "SYSTEM_PROMPT": textwrap.dedent(
+            """
+            STRICT OUTPUT FORMAT DIRECTIVE: Output ONLY the final Markdown document. Do NOT include preambles, drafting thoughts, scratchpads, or meta-commentary (e.g., NEVER output "Here's a thinking process:" or outline your planning steps). Your response MUST begin immediately with the exact characters "## Executive Summary".
+
+            You are a professional meeting-notes facilitator. You are receiving a chronological transcript of a meeting and a manifest of described visual slides. Your mandate is to produce a rigorous, structured record of the discussion -- not a blog post, not a summary, and certainly not a hallucinated narrative.
+
+            CRITICAL RULES:
+            1. **Structure is Mandatory.** The output MUST be organized into exactly these four Markdown sections, in this order, using ATX headings (##):
+               - ## Executive Summary
+               - ## Key Points & Discussion
+               - ## Decisions & References
+               - ## Action Items
+
+            2. **Executive Summary** -- A concise TL;DR of the meeting (150-250 words). No fluff, no rhetorical questions. State the purpose of the meeting, the central conclusions reached, and the practical takeaway for the attendees.
+
+            3. **Key Points & Discussion** -- For each major topic discussed:
+               - Name it precisely.
+               - Summarise it using the speaker's own wording where possible, citing the transcript timestamp.
+               - Note any competing views or unresolved questions raised in the discussion.
+               - Use **bold** for the topic name on first use.
+
+            4. **Decisions & References** -- Extract *explicitly* from OCR and audio. Each entry must include:
+               - The item exactly as it was given: a decision as "<what was agreed> (<owner/date if given>)"; a referenced document, link, or artifact transcribed as the slide shows it.
+               - The context in which it was raised (one sentence).
+               - Do NOT add decisions, documents, or references nobody raised. This is absolute: if nothing was decided or referenced, the section says so and lists nothing. Never supply a reference from your own knowledge, and never reuse the format templates above as if they were real. If a slide shows a reference the speaker skipped, note it as "[Slide reference only]".
+               - Use a Markdown table with columns: **Item | Context | Source (Audio/Slide/Both)**.
+
+            5. **Action Items** -- Capture every follow-up agreed in the meeting:
+               - Number them 1., 2., 3.
+               - Attribute each item to its owner when a name was given, otherwise write "Unassigned".
+               - Include a deadline only when one was spoken or shown; never invent one.
+
+            6. **Visual Fusion:** When the transcript aligns with a described chart, diagram, or document from the slides, explain the visual relationship in context. Do not describe the visual in isolation -- anchor it to the spoken discussion.
+
+            7. **No Hallucinations, No Fluff.** The STRICT OUTPUT FORMAT DIRECTIVE, the STRICT GROUNDING DIRECTIVE and the SPEAKER IDENTIFICATION directives are all non-negotiable.
+
+            STRICT GROUNDING DIRECTIVE: NEVER invent, infer, or hallucinate URLs, code snippets, or fictional narratives. If a slide shows code, transcribe exactly what is visible. If the audio topic entirely mismatches the visual slide, report both facts neutrally.
+
+            TRUNCATED SLIDE HANDLING: A slide extract may end with the literal marker "[Note: Extraction truncated due to slide density.]" That marker is an annotation added by the extraction pipeline, NOT content from the slide. When you see it, that slide's extract is incomplete: cover the material that IS present, never guess at what the cut-off remainder said, and never quote or repeat the marker itself in the notes. Where a truncated slide covers material central to the meeting, say in the relevant section that the slide's detail was only partially captured.
+
+            SPEAKER IDENTIFICATION: Cross-reference the timestamps of the slides with the timestamps of the transcript. If a slide's OCR text reveals a person's name or title (e.g., a lower-third graphic) during the exact time a specific [SPEAKER_XX] is talking, deduce their identity and replace [SPEAKER_XX] with their real name in the final notes.
+
+            Your output will be graded on precision, fidelity to the discussion, and utility to the attendees.
+            """
+        ).strip(),
+        "SLIDE_EXTRACT_PROMPT": (
+            "You are an expert meeting-notes visual analyst. Extract all text, "
+            "bullet points, and referenced documents or links. IF the image "
+            "contains charts, diagrams, or other visuals, you MUST explicitly "
+            "describe the data, structural relationships, and meaning of the "
+            "visual elements. Be highly detailed but format concisely in Markdown."
+        ),
+    },
+}
+
+# The module-level names predate the profile table and are imported by tests
+# and by direct callers. They are -- and remain -- the criminology profile's
+# entries, which is what they always were. ``generate_notes`` no longer reads
+# them; it resolves the caller's ``domain`` through :func:`resolve_profile`.
+SYSTEM_PROMPT = PROFILES["criminology"]["SYSTEM_PROMPT"]
+SLIDE_EXTRACT_PROMPT = PROFILES["criminology"]["SLIDE_EXTRACT_PROMPT"]
+
+
+def resolve_profile(domain: str) -> dict[str, str]:
+    """Return the profile for ``domain``, falling back to the general one.
+
+    Args:
+        domain: Profile key, e.g. ``"criminology"`` or ``"software"``.
+
+    Returns:
+        The matching profile mapping, or the generic meeting-notes profile
+        when the key is unknown -- a typo or a key added by a newer client
+        must degrade to neutral notes, not fail a run that is already paid
+        for end to end.
+    """
+    return PROFILES.get(domain, PROFILES["general"])
+
 
 # Stage 3: leading instruction that fuses the two channels.
 SYNTHESIS_INSTRUCTION = (
@@ -278,7 +435,9 @@ class LectureSynthesizer:
         retry=retry_if_exception_type(_RETRYABLE_ERRORS),
         reraise=True,
     )
-    def _extract_slide_data(self, image_path: Path) -> str:
+    def _extract_slide_data(
+        self, image_path: Path, slide_prompt: str = SLIDE_EXTRACT_PROMPT
+    ) -> str:
         """Extract the content of a single slide via a one-image vision call.
 
         NVIDIA's endpoint accepts one image per request, so each slide is
@@ -299,13 +458,17 @@ class LectureSynthesizer:
 
         Args:
             image_path: Path to one captured slide JPEG.
+            slide_prompt: Stage 1 instruction sent ahead of the image. Defaults
+                to the criminology profile's prompt so a direct call behaves
+                as it always has; ``generate_notes`` passes the selected
+                profile's own.
 
         Returns:
             The extracted content as concise, fence-free Markdown, carrying
             :data:`SLIDE_TRUNCATION_NOTE` when the token cap was hit.
         """
         content = [
-            {"type": "text", "text": SLIDE_EXTRACT_PROMPT},
+            {"type": "text", "text": slide_prompt},
             {
                 "type": "image_url",
                 "image_url": {"url": self._encode_image(image_path)},
@@ -370,7 +533,12 @@ class LectureSynthesizer:
             if isinstance(value, (int, float)) and not isinstance(value, bool)
         }
 
-    def _build_slide_manifest(self, slides_dir: Path, session_dir: Path) -> str:
+    def _build_slide_manifest(
+        self,
+        slides_dir: Path,
+        session_dir: Path,
+        slide_prompt: str = SLIDE_EXTRACT_PROMPT,
+    ) -> str:
         """Combine per-slide extracts into a resumable ``slides_manifest.txt``.
 
         Slides are processed in chronological order (``slide_001.jpg``
@@ -396,6 +564,10 @@ class LectureSynthesizer:
             slides_dir: Directory of deduplicated JPEG slides.
             session_dir: Session root where ``slides_manifest.txt`` is written
                 (alongside ``raw_transcript.txt``).
+            slide_prompt: Stage 1 instruction forwarded to
+                :meth:`_extract_slide_data` for every pending slide. Defaults
+                to the criminology profile's prompt for direct callers;
+                ``generate_notes`` passes the selected profile's own.
 
         Returns:
             The full accumulated manifest text (all slide sections).
@@ -450,7 +622,7 @@ class LectureSynthesizer:
         for slide in pending:
             position = slide_paths.index(slide) + 1
             print(f"Extracting slide {position}/{total} ({slide.name})...")
-            entry = self._extract_slide_data(slide)
+            entry = self._extract_slide_data(slide, slide_prompt)
             # Prefix the header with the capture offset so Stage 3 can line the
             # slide up against the transcript's [SPEAKER_xx] (MM:SS) headers.
             # format_timestamp is shared with the transcript, so both channels
@@ -477,7 +649,7 @@ class LectureSynthesizer:
         retry=retry_if_exception_type(_RETRYABLE_ERRORS),
         reraise=True,
     )
-    def _call_synthesis(self, prompt: str) -> str:
+    def _call_synthesis(self, prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
         """Send the merged transcript + slide text to the LLM (no images).
 
         The call is deliberately pinned to ``max_tokens=4096`` and
@@ -488,6 +660,9 @@ class LectureSynthesizer:
 
         Args:
             prompt: Fully assembled Stage 3 prompt.
+            system_prompt: The domain profile's system role. Defaults to the
+                criminology profile's prompt so a direct call behaves as it
+                always has; ``generate_notes`` passes the selected profile's.
 
         Returns:
             Raw markdown response from the model.
@@ -499,7 +674,7 @@ class LectureSynthesizer:
         response = self.client.chat.completions.create(
             model=REDUCE_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=TEMPERATURE,
@@ -556,7 +731,11 @@ class LectureSynthesizer:
     # -- public entry point ------------------------------------------------
 
     def generate_notes(
-        self, transcript_path: Path, notes_path: Path, slides_dir: Path
+        self,
+        transcript_path: Path,
+        notes_path: Path,
+        slides_dir: Path,
+        domain: str = "general",
     ) -> bool:
         """Generate study notes from a transcript and its captured slides.
 
@@ -569,6 +748,12 @@ class LectureSynthesizer:
             transcript_path: Path to the raw transcript text file.
             notes_path: Path where the cleaned Markdown notes will be written.
             slides_dir: Directory of deduplicated JPEG slides.
+            domain: Key into :data:`PROFILES` selecting the persona, the
+                mandated section headings, and the Stage 1 slide instruction.
+                An unknown key falls back to the "general" profile via
+                :func:`resolve_profile` rather than raising: a bad value must
+                degrade to neutral notes, not throw away a session that has
+                already been captured and transcribed.
 
         Returns:
             True on success.
@@ -588,7 +773,11 @@ class LectureSynthesizer:
                 "Transcript too short. Aborting synthesis to prevent hallucination."
             )
 
-        slide_manifest = self._build_slide_manifest(slides_dir, session_dir)
+        profile = resolve_profile(domain)
+
+        slide_manifest = self._build_slide_manifest(
+            slides_dir, session_dir, profile["SLIDE_EXTRACT_PROMPT"]
+        )
         print(f"  -> slide manifest ready: {session_dir / MANIFEST_FILENAME}")
 
         prompt = (
@@ -598,7 +787,7 @@ class LectureSynthesizer:
         )
 
         print("Synthesizing study notes from transcript + slide manifest...")
-        raw_markdown = self._call_synthesis(prompt)
+        raw_markdown = self._call_synthesis(prompt, profile["SYSTEM_PROMPT"])
         cleaned_markdown = self._clean_markdown(raw_markdown)
 
         notes_path.write_text(cleaned_markdown, encoding="utf-8")

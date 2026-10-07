@@ -852,7 +852,11 @@ def test_generate_notes_synthesis_text_only(mocker, tmp_path) -> None:
     ]
 
     output_path = tmp_path / "study_notes.md"
-    result = synthesizer.generate_notes(transcript_path, output_path, slides_dir)
+    # domain is passed explicitly: this test asserts on the *criminology*
+    # prompt, and generate_notes defaults to the generic profile.
+    result = synthesizer.generate_notes(
+        transcript_path, output_path, slides_dir, domain="criminology"
+    )
 
     assert result is True
     assert output_path.exists()
@@ -983,6 +987,168 @@ def test_system_prompt_opens_with_the_zero_preamble_directive() -> None:
     assert SYSTEM_PROMPT.index("Tenured University Professor") > 0
     assert "STRICT GROUNDING DIRECTIVE" in SYSTEM_PROMPT
     assert "SPEAKER IDENTIFICATION" in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Domain profiles
+# ---------------------------------------------------------------------------
+
+
+def test_profiles_cover_the_shipped_domains() -> None:
+    """The table has exactly the three shipped keys, and each is complete.
+
+    A profile missing one of the two prompts would not crash -- the lookup
+    would raise ``KeyError`` deep inside a paid run, or worse, a prompt could
+    silently be ``None`` and reach the API as an absent message role. Both
+    prompts are therefore asserted here, for every key, in one place.
+    """
+    assert set(summarizer.PROFILES) == {"criminology", "software", "general"}
+    for key, profile in summarizer.PROFILES.items():
+        system = profile["SYSTEM_PROMPT"]
+        # Every profile keeps the zero-preamble directive first: it is the
+        # strongest conditioning line the API offers, and it is what stops
+        # the model narrating its thinking into the document.
+        assert system.startswith("STRICT OUTPUT FORMAT DIRECTIVE:"), key
+        assert '"## Executive Summary"' in system, key
+        assert "STRICT GROUNDING DIRECTIVE" in system, key
+        assert profile["SLIDE_EXTRACT_PROMPT"].strip(), key
+
+
+def test_the_criminology_profile_keeps_the_original_prompts() -> None:
+    """The module-level names are -- and remain -- the criminology entries.
+
+    They are imported by name in this suite and by any external caller written
+    before profiles existed, so the alias has to stay identical to the table
+    entry rather than being a copy that can drift away from it.
+    """
+    assert summarizer.SYSTEM_PROMPT is summarizer.PROFILES["criminology"]["SYSTEM_PROMPT"]
+    assert (
+        summarizer.SLIDE_EXTRACT_PROMPT
+        is summarizer.PROFILES["criminology"]["SLIDE_EXTRACT_PROMPT"]
+    )
+    assert summarizer.SYSTEM_PROMPT == SYSTEM_PROMPT
+    assert summarizer.SLIDE_EXTRACT_PROMPT == SLIDE_EXTRACT_PROMPT
+
+
+def test_the_software_profile_targets_engineering_notes() -> None:
+    """The software profile is the one this handover exists to ship."""
+    profile = summarizer.PROFILES["software"]
+    system = profile["SYSTEM_PROMPT"]
+
+    assert "Senior Technical Architect" in system
+    for heading in (
+        "## Executive Summary",
+        "## Core Architectures & System Design",
+        "## API & Code References",
+        "## Action Items",
+    ):
+        assert heading in system, heading
+
+    # The criminology framing must not leak across profiles: a Software
+    # Development meeting must not be asked for statutes or exam answers.
+    assert "Criminology" not in system
+    assert "Statutes, Case Law" not in system
+    assert "Exam Preparation" not in system
+    assert "law school" not in system
+
+    slide_prompt = profile["SLIDE_EXTRACT_PROMPT"]
+    assert "code snippets, system diagrams, and architectures" in slide_prompt
+    assert "statutory/case references" not in slide_prompt
+
+
+def test_the_general_profile_is_domain_neutral() -> None:
+    """The fallback profile must fit any meeting it has never seen."""
+    system = summarizer.PROFILES["general"]["SYSTEM_PROMPT"]
+
+    for term in (
+        "Criminology",
+        "Statutes",
+        "Case Law",
+        "Senior Technical Architect",
+        "Exam Preparation",
+    ):
+        assert term not in system, term
+
+    for heading in (
+        "## Executive Summary",
+        "## Key Points & Discussion",
+        "## Decisions & References",
+        "## Action Items",
+    ):
+        assert heading in system, heading
+
+
+def test_resolve_profile_falls_back_to_general() -> None:
+    """Unknown keys degrade to the generic profile; known keys pass through."""
+    assert summarizer.resolve_profile("no-such-domain") is summarizer.PROFILES["general"]
+    assert summarizer.resolve_profile("") is summarizer.PROFILES["general"]
+    assert summarizer.resolve_profile("SOFTWARE") is summarizer.PROFILES["general"]
+    for key in summarizer.PROFILES:
+        assert summarizer.resolve_profile(key) is summarizer.PROFILES[key]
+
+
+def test_generate_notes_sends_the_selected_domain_profile(mocker, tmp_path) -> None:
+    """``domain`` selects *both* prompts: Stage 1 slide text and Stage 3 role.
+
+    Checked end to end rather than through ``resolve_profile`` alone, because
+    the wiring between the two stages is exactly what a regression would
+    break -- the profile resolved correctly while the pipeline still sent the
+    criminology prompt it captured at import time.
+    """
+    transcript_path = tmp_path / "raw_transcript.txt"
+    transcript_path.write_text(" ".join(["filler"] * 60), encoding="utf-8")
+    slides_dir = _write_slides(tmp_path, 1)
+
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "slide text"),
+        _make_response(mocker, "## Executive Summary\nnotes"),
+    ]
+
+    synthesizer.generate_notes(
+        transcript_path, tmp_path / "notes.md", slides_dir, domain="software"
+    )
+
+    calls = synthesizer.client.chat.completions.create.call_args_list
+    assert len(calls) == 2
+
+    stage_one_text = calls[0].kwargs["messages"][0]["content"][0]["text"]
+    assert stage_one_text == summarizer.PROFILES["software"]["SLIDE_EXTRACT_PROMPT"]
+
+    system_content = calls[1].kwargs["messages"][0]["content"]
+    assert system_content == summarizer.PROFILES["software"]["SYSTEM_PROMPT"]
+    assert "Senior Technical Architect" in system_content
+
+
+def test_generate_notes_falls_back_to_general_for_an_unknown_domain(
+    mocker, tmp_path
+) -> None:
+    """A bad ``domain`` produces neutral notes, not a crashed pipeline.
+
+    The run has already paid for capture, transcription, and diarization by
+    the time synthesis runs; failing here over a typo would throw all of it
+    away. The fallback is asserted end to end for the same reason as above.
+    """
+    transcript_path = tmp_path / "raw_transcript.txt"
+    transcript_path.write_text(" ".join(["filler"] * 60), encoding="utf-8")
+    slides_dir = _write_slides(tmp_path, 1)
+
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+    synthesizer.client.chat.completions.create.side_effect = [
+        _make_response(mocker, "slide text"),
+        _make_response(mocker, "## Executive Summary\nnotes"),
+    ]
+
+    result = synthesizer.generate_notes(
+        transcript_path, tmp_path / "notes.md", slides_dir, domain="basket-weaving"
+    )
+    assert result is True
+
+    calls = synthesizer.client.chat.completions.create.call_args_list
+    system_content = calls[1].kwargs["messages"][0]["content"]
+    assert system_content == summarizer.PROFILES["general"]["SYSTEM_PROMPT"]
 
 
 def test_stage_one_keeps_its_own_small_budget(mocker, tmp_path) -> None:

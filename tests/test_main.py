@@ -294,7 +294,7 @@ def _stub_engines(slow: float | None = None):
     )
     instance.render_transcript.side_effect = lambda segs=None: "mock transcript"
     synthesizer = mock.MagicMock()
-    synthesizer.return_value.generate_notes.side_effect = lambda *a: _block()
+    synthesizer.return_value.generate_notes.side_effect = lambda *a, **k: _block()
     transcriber_patcher = mock.patch.object(m, "LocalTranscriber", transcriber)
     # Exposed for tests that need to ask which phases ran; see _transcriber_stub
     # for why the handle lives on the patcher rather than the mock.
@@ -556,7 +556,9 @@ def test_transcription_runs_before_synthesis(consoles, session):
         lambda p, segs=None: Path(p).parent / m.TRANSCRIPT_FILENAME
     )
     synthesizer = mock.MagicMock()
-    synthesizer.return_value.generate_notes.side_effect = lambda *a: order.append("s")
+    synthesizer.return_value.generate_notes.side_effect = (
+        lambda *a, **k: order.append("s")
+    )
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
          mock.patch.object(m, "LocalTranscriber", transcriber), \
@@ -578,12 +580,16 @@ def test_synthesis_receives_the_three_artifact_paths(consoles, session):
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
          t, mock.patch.object(m, "LectureSynthesizer", synth):
         m.main()
-    (args, _kwargs) = synth.return_value.generate_notes.call_args
+    (args, kwargs) = synth.return_value.generate_notes.call_args
     transcript_path, notes_path, slides_dir = args
     assert transcript_path.name == m.TRANSCRIPT_FILENAME
     assert notes_path.suffix == ".md"
     assert slides_dir.name == "slides"
     assert all(isinstance(a, Path) for a in args)
+    # The domain rides as a keyword so the three paths keep their positions;
+    # the default is pinned here because a silent drift would re-shape every
+    # run's notes without a single call site changing.
+    assert kwargs["domain"] == "criminology"
 
 
 def test_synthesis_value_error_reports_transcript_path(consoles, session):
@@ -864,7 +870,7 @@ def test_states_are_emitted_at_stage_start_not_at_the_end(consoles, session):
     )
     synthesizer = mock.MagicMock()
     synthesizer.return_value.generate_notes.side_effect = (
-        lambda *a: timeline.append("synthesize")
+        lambda *a, **k: timeline.append("synthesize")
     )
     with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
          mock.patch.object(m, "SlideCatcher", FakeCatcher), \
@@ -1168,6 +1174,46 @@ def test_prompt_language_falls_back_on_absurd_input(monkeypatch):
     """
     monkeypatch.setattr("builtins.input", lambda *a: "english please")
     assert m.prompt_language() == DEFAULT_LANGUAGE
+
+
+def test_the_course_code_prompt_uses_a_domain_neutral_example():
+    """The CLI's example code must not smuggle a discipline back in.
+
+    The prompt text is what a new operator sees first, and an example like
+    ``CRM_1106`` quietly tells them what the tool is "for". The example is a
+    placeholder by design; this pins it there.
+    """
+    import inspect
+
+    source = inspect.getsource(m.prompt_course_code)
+    assert "COURSE_101" in source, "the example course code is missing"
+    assert "CRM" not in source, "a criminology code is still in the CLI prompt"
+
+
+def test_run_pipeline_forwards_the_domain_to_synthesis(consoles, session):
+    """The profile chosen at the edge must arrive at ``generate_notes``.
+
+    Default *and* explicit, because the two fail differently: a lost default
+    silently reverts every run to the generic profile, while a lost explicit
+    value would only show up when someone noticed their Software Engineering
+    meeting produced law-school notes.
+    """
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    t, _ = _stub_engines()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        m.run_pipeline("COURSE_101")
+    assert synth.return_value.generate_notes.call_args.kwargs["domain"] == "criminology"
+
+    synth.reset_mock()
+    synth.return_value.generate_notes.return_value = True
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        m.run_pipeline("SYS_Arch", domain="software")
+    assert synth.return_value.generate_notes.call_args.kwargs["domain"] == "software"
 
 
 def test_course_code_is_asked_before_the_language(consoles, tmp_path, mocker):

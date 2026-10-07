@@ -137,12 +137,12 @@ def client():
         server.resolve_device_index = real_resolve
 
 
-def _start(client, code="CRM_1106", language="en", resume=False):
+def _start(client, code="CRM_1106", language="en", resume=False, domain=None):
     """POST /api/record and return the response.
 
-    ``resume`` is omitted from the body unless it is true, so the tests that
-    pre-date the flag keep exercising the exact payload a browser sends when
-    the toggle is left alone.
+    ``resume`` is omitted from the body unless it is true, and ``domain``
+    unless it is given, so the tests that pre-date either flag keep exercising
+    the exact payload a browser sends when the control is left alone.
 
     NOTE ``TestClient`` runs the app to completion *inside* this call, which
     includes Starlette's background tasks. So a run that blocks will block this
@@ -152,6 +152,8 @@ def _start(client, code="CRM_1106", language="en", resume=False):
     body = {"course_code": code, "language": language}
     if resume:
         body["resume"] = True
+    if domain is not None:
+        body["domain"] = domain
     return client.post("/api/record", json=body)
 
 
@@ -279,6 +281,62 @@ def test_language_defaults_to_english_when_omitted(client):
     response = client.post("/api/record", json={"course_code": "CRM_1106"})
     assert response.status_code == 200
     assert client.calls[0]["language"] == m.DEFAULT_LANGUAGE
+
+
+def test_domain_defaults_to_criminology_and_reaches_the_pipeline(client):
+    """An omitted ``domain`` must mean criminology on both sides of the wire.
+
+    The schema default and the dashboard's ``selected`` option have to agree;
+    otherwise an untouched form would send one thing while the API meant
+    another, and the operator would get notes shaped by a guess.
+    """
+    response = client.post("/api/record", json={"course_code": "CRM_1106"})
+    assert response.status_code == 200
+    assert server.RecordRequest(course_code="CRM_1106").domain == "criminology"
+    assert client.calls[0]["kwargs"]["domain"] == "criminology"
+
+
+def test_a_selected_domain_reaches_the_pipeline_unchanged(client):
+    """The profile key is the whole point of the field -- it must survive.
+
+    It rides through a background task, which is where the language flag was
+    already known to need its own test: a value dropped there is invisible
+    until the notes come back shaped for the wrong meeting.
+    """
+    _start(client, "SYS_Arch", domain="software")
+    assert client.calls[0]["kwargs"]["domain"] == "software"
+
+    _start(client, "STANDUP", domain="general")
+    assert client.calls[1]["kwargs"]["domain"] == "general"
+
+
+def test_the_domain_is_normalised_to_the_profile_key(client):
+    """A hand-rolled client sending ``Software`` still matches the profile.
+
+    Mirrors the language normalisation one test above: the keys are the
+    synthesizer's, not the caller's, and a case mismatch would otherwise fall
+    through to the generic profile with no error to explain why.
+    """
+    _start(client, "SYS_Arch", domain="SOFTWARE")
+    assert client.calls[0]["kwargs"]["domain"] == "software"
+
+
+def test_an_empty_domain_is_rejected(client):
+    """An empty key cannot name a profile; caught at the boundary."""
+    assert _start(client, "SYS_Arch", domain="").status_code == 422
+
+
+def test_an_unknown_domain_is_accepted_rather_than_rejected(client):
+    """Validation here is length-only, deliberately.
+
+    An unknown key degrades to the generic profile inside the synthesizer, so
+    rejecting it would refuse a run over a spelling mistake -- after the
+    operator had already committed to recording. The summarizer's fallback is
+    what makes this safe; this test pins the boundary's half of the contract.
+    """
+    response = _start(client, "SYS_Arch", domain="blockchain-archaeology")
+    assert response.status_code == 200
+    assert client.calls[0]["kwargs"]["domain"] == "blockchain-archaeology"
 
 
 def test_empty_course_code_is_rejected(client):
@@ -973,7 +1031,7 @@ def test_the_dashboard_collects_a_course_code_and_a_language(client):
     filesystem DoS at best.
     """
     html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    assert 'placeholder="e.g., CRM_3102"' in html
+    assert 'placeholder="e.g., CRIM_101 or SYS_Arch"' in html
     assert 'maxlength="64"' in html
 
     # A <select> rather than free text, so an unsupported code cannot be typed.
@@ -985,7 +1043,10 @@ def test_the_dashboard_collects_a_course_code_and_a_language(client):
     tag = html[:anchor][html[:anchor].rindex("<"):]
     assert tag.startswith("<select"), f"language control is: {tag!r}"
     # And it must actually offer choices, or it is a text box wearing a costume.
-    options = html.split("<select", 1)[1].split("</select>", 1)[0]
+    # Scoped from the id rather than from the first ``<select`` in the file:
+    # the domain profile dropdown now sits above this one, so a document-wide
+    # split would assert against the wrong control and still pass.
+    options = html.split('id="language"', 1)[1].split("</select>", 1)[0]
     assert options.count("<option") >= 2, "the language select has no options"
 
 
@@ -1024,6 +1085,46 @@ def test_the_resume_toggle_is_sent_to_the_backend(client):
     assert "resumeIn.checked" in body, f"submit payload is: {body!r}"
     # And the element the handler reads must exist.
     assert 'id="resume"' in html
+
+
+def test_the_dashboard_offers_a_domain_selector(client):
+    """The profile choice is reachable from the UI, not just from the API.
+
+    Scanned backwards from the id to the opening angle bracket -- the same
+    trick the language control uses -- so a stray ``id="domain"`` on some
+    other element type would fail here rather than pass as a dropdown.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    anchor = html.index('id="domain"')
+    start = html.rindex("<", 0, anchor)
+    end = html.index(">", anchor)
+    tag = html[start:end]
+    assert tag.startswith("<select"), f"domain control is: {tag!r}"
+
+    options = html.split('id="domain"', 1)[1].split("</select>", 1)[0]
+    for value in ("criminology", "software", "general"):
+        assert f'value="{value}"' in options, f"no option for {value}"
+    # Criminology must be the default *in the markup*, matching the API's
+    # own schema default: an untouched form means the same thing on both
+    # sides, or the operator's notes are shaped by which half they forgot.
+    criminology_tag = html.split('value="criminology"', 1)[1].split(">", 1)[0]
+    assert "selected" in criminology_tag, "criminology is not the default option"
+    assert 'id="domain"' in html
+
+
+def test_the_domain_selection_is_sent_to_the_backend(client):
+    """A selector that never reaches the request body is decoration.
+
+    Same contract as the resume toggle above: the value has to be read by the
+    submit handler and placed in the JSON payload, or every run silently
+    falls back to the schema default no matter what the operator chose.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    body = html.split("body: JSON.stringify({", 1)[1].split("})", 1)[0]
+    assert "domain" in body, f"submit payload is: {body!r}"
+    assert "el.domainIn.value" in body, f"submit payload is: {body!r}"
 
 
 def test_the_stage_tracker_handles_a_fast_forwarded_status(client):
