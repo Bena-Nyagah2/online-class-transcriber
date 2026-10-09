@@ -23,3 +23,6 @@ httpx>=0.27.0               # tests only: Starlette's TestClient; separate from 
 # Google Drive sync
 google-auth-oauthlib>=1.0.0
 google-api-python-client>=2.0.0
+
+# Persistence — local SQLite ledger for recorded lecture sessions
+sqlalchemy>=2.0

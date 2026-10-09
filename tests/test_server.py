@@ -957,6 +957,21 @@ def test_healthz_is_independent_of_pipeline_state(client):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
+def test_health_alias_answers_like_healthz(client):
+    """Both probe spellings are served, with identical payloads.
+
+    ``/health`` is what browser extensions, uptime checkers, and container
+    healthchecks request by default; the 404s it used to draw are not
+    functional failures, but they are noise that trains an operator to ignore
+    the log. The two routes must agree, or a monitor could get a different
+    answer depending on which spelling it happened to pick.
+    """
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.json() == client.get("/healthz").json()
+
+
 def test_dashboard_streams_instead_of_polling(client):
     """The shell must consume the endpoint the server actually exposes.
 
