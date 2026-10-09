@@ -16,6 +16,7 @@ Ctrl+C handling:
 
 from __future__ import annotations
 
+import logging
 import re
 import signal
 import sys
@@ -26,6 +27,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+import database
+import models
 from recorder import AudioRecorder
 from transcriber import (
     ALIGNMENT_CHECKPOINT,
@@ -40,6 +43,14 @@ from transcriber import (
 )
 from summarizer import LectureSynthesizer
 from vision import SlideCatcher
+
+# Create the SQLite ledger's tables once, when the module is first imported.
+# This is the pipeline's "startup" hook: whether the process was launched as
+# ``python main.py`` or as ``uvicorn server:app`` (which imports this module),
+# the ``lectures`` table exists before any run tries to write to it. It is
+# idempotent -- ``create_all`` checks for an existing table and issues no DDL
+# when there is nothing to do -- so importing main twice is harmless.
+models.Base.metadata.create_all(bind=database.engine)
 
 # ``Console`` renders the markup; ``Status`` is the live spinner type returned
 # by ``Console.status``. NOTE the split: ``Status`` is *not* re-exported from
@@ -992,13 +1003,51 @@ def run_pipeline(
     )
     _kv("Study Notes:", f"[bold]{notes_path}[/bold]")
 
-    # -- Google Drive sync (best-effort; never blocks the pipeline) ----------
+    # -- Google Drive sync + session ledger (best-effort) --------------------
+    # The Markdown is already on disk, so nothing in this block may stop the
+    # pipeline's return: a SQLite error or a Drive outage is logged and the
+    # local artifacts are left exactly as they are. The ledger row is written
+    # PENDING *before* the upload so a crash mid-sync leaves a visible,
+    # unfinished record rather than no record at all.
+    db = database.SessionLocal()
     try:
+        # Imported inside the try: the Google client libraries are an optional
+        # dependency, and an ImportError here must degrade to "no sync", never
+        # crash a run whose notes are already written.
         from services.gdrive import sync_markdown
-        sync_markdown(course_code, str(date.today()), notes_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 – best‑effort only
-        import logging
-        logging.getLogger("gdrive-sync").warning("google-drive-sync: %s", exc)
+
+        lecture = models.Lecture(
+            course_code=course_code,
+            domain=domain,
+            session_date=str(date.today()),
+            audio_path=str(wav_path),
+            md_path=str(notes_path),
+            sync_status="PENDING",
+        )
+        db.add(lecture)
+        db.commit()
+        db.refresh(lecture)
+
+        try:
+            synced = sync_markdown(
+                course_code,
+                str(date.today()),
+                notes_path.read_text(encoding="utf-8"),
+            )
+        except Exception as exc:  # noqa: BLE001 - sync is best-effort
+            logging.getLogger("gdrive-sync").warning("google-drive-sync: %s", exc)
+            synced = False
+
+        lecture.sync_status = "SUCCESS" if synced else "FAILED"
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 - the ledger must never crash the run
+        # A database failure is not a pipeline failure: the notes and audio are
+        # already on disk, so the run returns its path as if the ledger did not
+        # exist. Roll back the half-written row, log, and move on.
+        logging.getLogger("lecture-ledger").warning("sqlite-ledger: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
     return str(notes_path)
 

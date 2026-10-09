@@ -15,6 +15,10 @@ Endpoints
     Ends the recording phase and lets the pipeline proceed to transcription.
 ``GET /api/stream``
     A Server-Sent Events stream of every state change.
+``GET /health``
+    Liveness probe; returns ``{"status": "ok"}``. The non-``z`` spelling is
+    what browser extensions, container runtimes, and proxies probe by default,
+    so serving it stops a steady drip of 404s in the terminal.
 ``GET /``
     The dashboard shell.
 
@@ -838,6 +842,20 @@ def healthz() -> dict[str, str]:
     up" from "a lecture is running" -- ``/api/stream`` is a hanging connection
     and useless as a probe, while this always answers immediately and its
     payload never changes with the pipeline.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Conventional liveness alias for :func:`healthz`.
+
+    The ``z`` in ``/healthz`` is Google's convention, not the one every tool
+    reaches for first: browser extensions, uptime checkers, and container
+    healthchecks probe ``/health`` by default, and every miss lands in the
+    server log as a 404. Answering both spellings is cheaper than teaching
+    every client about this one, and the two are deliberately identical so a
+    monitor cannot get a different answer depending on which it picked.
     """
     return {"status": "ok"}
 

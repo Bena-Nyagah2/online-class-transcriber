@@ -1216,6 +1216,165 @@ def test_run_pipeline_forwards_the_domain_to_synthesis(consoles, session):
     assert synth.return_value.generate_notes.call_args.kwargs["domain"] == "software"
 
 
+# ---------------------------------------------------------------------------
+# 6b. The SQLite session ledger
+# ---------------------------------------------------------------------------
+
+
+def _use_temp_ledger(tmp_path, monkeypatch):
+    """Repoint the pipeline's ledger at a throwaway SQLite file.
+
+    Patching ``database.SessionLocal`` (not the engine) is sufficient and
+    intent-revealing: ``run_pipeline`` resolves the name at call time, so every
+    session it opens lands on this file. Returns the sessionmaker so a test can
+    open its own session to read back what the pipeline wrote.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'lectures.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    m.models.Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    monkeypatch.setattr(m.database, "SessionLocal", factory)
+    return factory
+
+
+def _run_with_fake_engines(course_code="COURSE_101", **kwargs):
+    """Drive a full run with both AI engines stubbed; return the notes path.
+
+    The synthesizer stub *writes the notes file* as a side effect, because the
+    real one does and the sync block reads that file back. A stub that only
+    returned a mock would make every ledger test exercise the wrong branch
+    (``read_text`` raising into the except) and pass for the wrong reason.
+    """
+    t, _ = _stub_engines()
+
+    synth = mock.MagicMock()
+
+    def _write_notes(transcript_path, notes_path, slides_dir, domain=None):
+        Path(notes_path).write_text("# study notes\n", encoding="utf-8")
+        return True
+
+    synth.return_value.generate_notes.side_effect = _write_notes
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", FakeCatcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        return m.run_pipeline(course_code, **kwargs)
+
+
+def test_a_successful_run_records_a_synced_lecture(
+    consoles, session, tmp_path, monkeypatch
+):
+    """The ledger must capture who/what/where and the upload's outcome."""
+    factory = _use_temp_ledger(tmp_path, monkeypatch)
+    synced: list[tuple[str, str, str]] = []
+
+    def _fake_sync(course_code, date_str, content):
+        synced.append((course_code, date_str, content))
+        return True
+
+    monkeypatch.setattr("services.gdrive.sync_markdown", _fake_sync)
+
+    result = _run_with_fake_engines("COURSE_101", domain="software")
+
+    assert result.endswith(".md")
+    assert len(synced) == 1
+    assert synced[0][0] == "COURSE_101"
+
+    db = factory()
+    try:
+        rows = db.query(m.models.Lecture).all()
+    finally:
+        db.close()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.course_code == "COURSE_101"
+    assert row.domain == "software"
+    assert row.session_date
+    assert row.audio_path.endswith(m.WAV_FILENAME)
+    assert row.md_path.endswith(".md")
+    assert row.sync_status == "SUCCESS"
+
+
+def test_a_failed_sync_is_recorded_as_failed(consoles, session, tmp_path, monkeypatch):
+    """A ``False`` from the sync service must persist as ``FAILED``, not vanish.
+
+    This is the whole reason the row is written before the upload: without it,
+    a silent Drive failure would look identical to a run that never tried.
+    """
+    factory = _use_temp_ledger(tmp_path, monkeypatch)
+    monkeypatch.setattr("services.gdrive.sync_markdown", lambda *a, **k: False)
+
+    _run_with_fake_engines("COURSE_101")
+
+    db = factory()
+    try:
+        row = db.query(m.models.Lecture).one()
+    finally:
+        db.close()
+    assert row.sync_status == "FAILED"
+
+
+def test_a_sync_exception_is_recorded_as_failed_without_crashing(
+    consoles, session, tmp_path, monkeypatch
+):
+    """The Drive client raising is a ``FAILED`` upload, not a failed lecture."""
+    factory = _use_temp_ledger(tmp_path, monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("drive is down")
+
+    monkeypatch.setattr("services.gdrive.sync_markdown", _boom)
+
+    result = _run_with_fake_engines("COURSE_101")
+
+    assert result.endswith(".md")
+    db = factory()
+    try:
+        row = db.query(m.models.Lecture).one()
+    finally:
+        db.close()
+    assert row.sync_status == "FAILED"
+
+
+def test_a_ledger_failure_never_crashes_the_run(consoles, session, monkeypatch):
+    """The notes are already on disk; a broken database must not undo that.
+
+    ``SessionLocal`` is replaced with a session whose ``commit`` always raises.
+    The pipeline must still return its notes path and must still close the
+    session -- the ``finally`` is not optional just because the body failed.
+    """
+    closed = {"n": 0}
+
+    class BrokenSession:
+        def add(self, obj):  # noqa: D401 - bare test double
+            pass
+
+        def commit(self):
+            raise RuntimeError("disk full")
+
+        def refresh(self, obj):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            closed["n"] += 1
+
+    monkeypatch.setattr(m.database, "SessionLocal", lambda: BrokenSession())
+    monkeypatch.setattr("services.gdrive.sync_markdown", lambda *a, **k: True)
+
+    result = _run_with_fake_engines("COURSE_101")
+
+    assert result.endswith(".md")
+    assert closed["n"] == 1
+
+
 def test_course_code_is_asked_before_the_language(consoles, tmp_path, mocker):
     """The course code prompt must come first; the language prompt second.
 

@@ -18,8 +18,16 @@ output/
 # Local secrets — .env holds the NVIDIA_API_KEY and must never be committed
 .env
 
+# Google Drive OAuth material — never committed
+credentials.json
+token.json
+
+# Local SQLite ledger — reproducible local state, not source
+lectures.db
+lectures.db-journal
+
 # Editors / OS
 .vscode/
 .idea/
 .DS_Store
-Thumbs.dbcredentials.json
+Thumbs.db
