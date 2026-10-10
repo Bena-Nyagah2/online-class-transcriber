@@ -55,23 +55,17 @@ import numpy as np
 # and surfaces the genuine error if the submodule itself is broken.
 from whisperx.diarize import DiarizationPipeline, assign_word_speakers
 
-from dotenv import load_dotenv
-
+from config import settings
 from recorder import SAMPLE_RATE
 
-# ``WHISPER_COMPUTE_TYPE`` / ``WHISPER_BATCH_SIZE`` are documented as .env
-# settings, so this module has to load that file itself. It previously relied
-# on ``summarizer`` doing it as an import side effect -- which happens to work
-# under main.py, since summarizer is imported before any transcriber is
-# constructed, but silently yields the code defaults (notably float16) the
-# moment this module is imported on its own. That is exactly the kind of
-# difference between "configured" and "appears configured" that costs a
-# multi-hour CPU transcription to discover.
-#
-# ``override`` stays False (the python-dotenv default) so a value already
-# exported in the real environment always wins over the file, and tests that
-# monkeypatch os.environ are never clobbered by re-loading .env.
-load_dotenv()
+# ``WHISPER_COMPUTE_TYPE`` / ``WHISPER_BATCH_SIZE`` are now read from the
+# validated ``config.settings`` singleton (Pydantic + pydantic-settings).
+# Pydantic loads the ``.env`` file once at import of ``config`` and validates
+# every field, so there is no separate ``load_dotenv`` step here: the settings
+# object is the single source of truth. Explicit shell exports still take
+# precedence over the file (pydantic-settings default behaviour), and tests
+# monkeypatch ``os.environ`` before importing ``config`` so they are never
+# clobbered by re-loading .env.
 
 TRANSCRIPT_FILENAME = "raw_transcript.txt"
 
@@ -278,7 +272,7 @@ def resolve_hf_token() -> str:
         ValueError: The variable is unset or empty, with instructions for
             where to get a working token.
     """
-    token = os.environ.get(HF_TOKEN_ENV, "").strip()
+    token = settings.HF_TOKEN.strip()
     if not token:
         raise ValueError(
             f"{HF_TOKEN_ENV} is not set — speaker diarization needs a Hugging "
@@ -302,7 +296,7 @@ def resolve_compute_type() -> str:
             Failing here beats failing inside ``load_model`` after the WAV has
             already been decoded.
     """
-    raw = os.environ.get(COMPUTE_TYPE_ENV, "").strip()
+    raw = settings.WHISPER_COMPUTE_TYPE.strip()
     if not raw:
         return COMPUTE_TYPE
 
@@ -328,7 +322,7 @@ def resolve_batch_size() -> int:
             produces a confusing failure deep inside the decoder, so it is
             rejected up front with the offending value quoted.
     """
-    raw = os.environ.get(BATCH_SIZE_ENV, "").strip()
+    raw = str(settings.WHISPER_BATCH_SIZE).strip()
     if not raw:
         return BATCH_SIZE
     try:

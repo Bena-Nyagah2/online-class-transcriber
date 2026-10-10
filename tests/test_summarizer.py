@@ -120,10 +120,30 @@ def fresh_summarizer():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        # Patch config.settings so the reloaded module sees the controlled
+        # values (it reads from the singleton, not os.environ, at import).
+        import config
+        saved_settings = {}
+        settings_map = {
+            "LLM_MODEL_NAME": "LLM_MODEL_NAME",
+            "MAP_MODEL": "MAP_MODEL",
+            "REDUCE_MODEL": "REDUCE_MODEL",
+            "REDUCE_REASONING_ENABLED": "REDUCE_REASONING_ENABLED",
+        }
+        for key, value in env.items():
+            if key in settings_map:
+                attr = settings_map[key]
+                saved_settings[attr] = getattr(config.settings, attr)
+                if value is None:
+                    setattr(config.settings, attr, None)
+                else:
+                    setattr(config.settings, attr, value)
         try:
             with mock.patch("dotenv.load_dotenv"):
                 return importlib.reload(summarizer)
         finally:
+            for attr, value in saved_settings.items():
+                setattr(config.settings, attr, value)
             for key, value in saved.items():
                 if value is missing:
                     os.environ.pop(key, None)
