@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -587,6 +589,74 @@ def test_build_slide_manifest_extracts_new_and_resumes(mocker, tmp_path) -> None
     manifest_path = tmp_path / MANIFEST_FILENAME
     assert manifest_path.exists()
     assert "slide_003.jpg" in manifest_path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — deck downsampling circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def test_uniform_slide_sample_cuts_a_100_slide_deck_to_max_slides() -> None:
+    """100 mock slides downsample to exactly MAX_SLIDES, first and last kept.
+
+    The pure arithmetic of the circuit breaker, pinned directly so a future
+    refactor of the step logic is caught here rather than only through the
+    manifest's observable side effects.
+    """
+    slides = [Path(f"slide_{i:03d}.jpg") for i in range(1, 101)]
+    sampled = summarizer._uniform_slide_sample(slides)
+
+    assert len(sampled) == summarizer.MAX_SLIDES == 60
+    # Every sampled slide is one of the originals -- never a fabricated name.
+    assert set(sampled) <= set(slides)
+    # First and last are always included: the opening framing and the closing
+    # review survive any downsample.
+    assert sampled[0] == slides[0]
+    assert sampled[-1] == slides[-1]
+    # Evenly distributed: strictly increasing original indices, no doubles,
+    # and no neighbour gap wider than two (100/60 step is ~1.68).
+    indices = [slides.index(slide) for slide in sampled]
+    assert indices == sorted(indices)
+    assert len(set(indices)) == len(indices)
+    assert max(b - a for a, b in zip(indices, indices[1:])) <= 2
+
+
+def test_uniform_slide_sample_leaves_a_deck_at_or_under_the_cap_untouched() -> None:
+    """No downsample when the deck already fits: the same list comes back."""
+    modest = [Path(f"slide_{i:03d}.jpg") for i in range(1, 30)]
+    assert summarizer._uniform_slide_sample(modest) is modest
+
+    at_cap = [Path(f"slide_{i:03d}.jpg") for i in range(1, summarizer.MAX_SLIDES + 1)]
+    assert summarizer._uniform_slide_sample(at_cap) is at_cap
+
+
+def test_build_slide_manifest_downsamples_a_huge_deck(
+    mocker, tmp_path, caplog
+) -> None:
+    """A 100-slide deck is cut to MAX_SLIDES extracts, first and last kept.
+
+    What matters operationally: the sampled subset is the *only* one that
+    reaches OCR/LLM (60 extraction calls, not 100) and the manifest -- the
+    whole deck Stage 3 reads -- carries exactly the sampled headers.
+    """
+    synthesizer = _make_synthesizer(mocker)
+    _neutralise_backoff(mocker)
+
+    slides_dir = _write_slides(tmp_path, 100)
+    extracted = mocker.patch.object(
+        synthesizer, "_extract_slide_data", return_value="extracted text"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="summarizer"):
+        manifest = synthesizer._build_slide_manifest(slides_dir, tmp_path)
+
+    assert extracted.call_count == summarizer.MAX_SLIDES == 60
+    headers = summarizer._SLIDE_HEADER_RE.findall(manifest)
+    assert len(headers) == 60
+    assert headers[0] == "slide_001.jpg"
+    assert headers[-1] == "slide_100.jpg"
+    assert len(set(headers)) == len(headers)
+    assert "Downsampling to 60" in caplog.text
 
 
 # ---------------------------------------------------------------------------
