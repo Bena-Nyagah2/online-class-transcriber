@@ -1230,6 +1230,92 @@ def test_the_domain_selection_is_sent_to_the_backend(client):
     assert "el.domainIn.value" in body, f"submit payload is: {body!r}"
 
 
+def test_the_dashboard_offers_a_capture_target_picker(client):
+    """Full screen vs. one window, reachable from the UI, not just the API.
+
+    The two modes must exist in the markup with full screen checked: an
+    untouched form has to mean the same thing on both sides, and the schema's
+    own default is ``fullscreen``.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    for value in ("fullscreen", "window"):
+        assert f'value="{value}"' in html, f"no capture-mode radio for {value}"
+    fullscreen = html.split('value="fullscreen"', 1)[1].split(">", 1)[0]
+    assert "checked" in fullscreen, "full screen is not the default mode"
+    assert "Capture Target" in html
+
+    # The picker is a <select>, scanned backwards from its id to the opening
+    # angle bracket -- the same trick the language and domain controls use, so
+    # a stray id on another element type fails instead of passing.
+    anchor = html.index('id="targetWindowIn"')
+    start = html.rindex("<", 0, anchor)
+    end = html.index(">", anchor)
+    tag = html[start:end]
+    assert tag.startswith("<select"), f"window picker is: {tag!r}"
+    # The attributes *before* ``class`` -- the class list contains the literal
+    # "disabled:" variants, so a naive substring check would pass regardless.
+    attributes = tag.split("class=", 1)[0]
+    assert "disabled" in attributes, (
+        f"the picker is enabled while Full Screen is selected: {tag!r}"
+    )
+
+    # And a refresh control sits beside it.
+    assert 'id="refresh-windows"' in html
+
+
+def test_the_capture_target_is_sent_to_the_backend(client):
+    """A picker that never reaches the request body is decoration.
+
+    Same contract as the domain selector above: the submit handler has to read
+    the checked mode and the chosen window into the JSON payload, or every run
+    silently falls back to the schema default regardless of the choice.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    body = html.split("body: JSON.stringify({", 1)[1].split("})", 1)[0]
+    assert "capture_mode" in body, f"submit payload is: {body!r}"
+    assert "captureMode" in body, f"submit payload is: {body!r}"
+    assert "target_window" in body, f"submit payload is: {body!r}"
+    assert "el.targetWindowIn.value" in body, f"submit payload is: {body!r}"
+
+
+def test_the_window_picker_is_populated_from_the_api(client):
+    """The picker must consume the endpoint the server actually exposes.
+
+    A rename on either side would leave a dropdown that silently never fills,
+    which looks identical to a desktop with no windows. Asserted against the
+    shipped HTML so the two cannot drift apart.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "/api/windows" in html
+    assert "async function fetchWindows(" in html
+    # Fetched on load as well as from the refresh button: a list that is only
+    # ever fetched on click would leave the picker empty until the operator
+    # discovers the refresh control.
+    assert "fetchWindows();" in html
+    assert 'el.refreshWindows.addEventListener("click", fetchWindows)' in html
+    assert "el.targetWindowIn.appendChild" in html
+
+
+def test_the_capture_target_controls_lock_during_a_run(client):
+    """The new inputs follow the same lockdown as the rest of the form.
+
+    A capture target swapped mid-lecture would not take effect -- the server
+    read the original request when the run started -- so the controls must
+    disable for the whole run rather than merely looking editable.
+    """
+    html = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "el.targetWindowIn.disabled = locked || !windowMode;" in html
+    assert "el.refreshWindows.disabled = locked;" in html
+    assert "radio.disabled = locked;" in html
+    # And the deck drives it, so the lock follows the same statuses as the
+    # other inputs.
+    assert "syncCaptureTarget();" in html
+
+
 def test_the_stage_tracker_handles_a_fast_forwarded_status(client):
     """A resumed stream never reports capture, and may skip transcription too.
 
