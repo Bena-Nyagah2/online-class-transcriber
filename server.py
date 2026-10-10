@@ -18,6 +18,14 @@ Endpoints
 ``GET /api/windows``
     Enumerates the titles of the on-screen windows available as slide-capture
     targets, returning ``{"windows": [...]}``.
+``GET /api/sessions/{session_id}``
+    Fetches one recorded session: its identity fields, the raw study-notes
+    Markdown (``markdown_text``), and ``/media`` URLs for the audio and slides
+    when those files still exist on disk. Answers 404 for an unknown id.
+``/media/<path>``
+    Mount of ``output/`` so the playback UI can load raw ``.wav`` and ``.jpg``
+    artifacts directly from the browser instead of proxying bytes through the
+    API.
 ``GET /health``
     Liveness probe; returns ``{"status": "ok"}``. The non-``z`` spelling is
     what browser extensions, container runtimes, and proxies probe by default,
@@ -75,11 +83,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
+from database import get_db
 from main import (
     STATE_COMPLETE,
     STATE_ERROR,
@@ -93,6 +103,7 @@ from main import (
     resolve_device_index,
     run_pipeline,
 )
+from models import Lecture
 from transcriber import DEFAULT_LANGUAGE
 from vision import get_active_windows
 
@@ -362,6 +373,25 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Static media
+# ---------------------------------------------------------------------------
+
+# Root of the artifacts the /media mount serves. ``output`` is relative to the
+# process working directory, matching how the pipeline writes it
+# (main.create_output_dir). Kept as a module constant so ``_media_url`` below
+# builds URLs against the exact same root the server serves from, and so the
+# tests can redirect it to a scratch directory instead of the real one.
+MEDIA_ROOT = Path("output")
+
+# The directory must exist before the mount or Starlette raises at startup,
+# and a fresh clone has no output/ yet. The mkdir is idempotent, so this is a
+# one-time guard, not a reset of anything the pipeline wrote.
+Path(MEDIA_ROOT).mkdir(exist_ok=True)
+
+app.mount("/media", StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 
 
 class RecordRequest(BaseModel):
@@ -927,6 +957,112 @@ def health() -> dict[str, str]:
     monitor cannot get a different answer depending on which it picked.
     """
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Session playback
+# ---------------------------------------------------------------------------
+
+
+def _media_url(stored_path: str | None) -> str | None:
+    """Map a stored artifact path onto the ``/media`` mount, or ``None``.
+
+    The ledger stores artifact paths relative to the process working directory
+    as ``output/<SESSION_DIR>/<artifact>``, and the ``/media`` mount serves
+    exactly that root, so the URL is the stored path with the root replaced by
+    ``/media``. Anything that resolves outside the root -- an absolute path
+    somewhere else, or a session folder the operator moved -- is not
+    serviceable by the mount and is reported as ``None`` rather than a URL the
+    browser would 404 on.
+    """
+    if not stored_path:
+        return None
+    try:
+        relative = Path(stored_path).resolve().relative_to(MEDIA_ROOT.resolve())
+    except ValueError:
+        return None
+    # as_posix() keeps the URL on forward slashes even on Windows.
+    return "/media/" + relative.as_posix()
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Fetch one recorded session and the URLs of its on-disk artifacts.
+
+    The playback UI asks for a specific lecture, so this route reads the
+    ledger row by primary key and answers 404 when it does not exist. Every
+    artifact URL is presence-checked against the filesystem first -- a row
+    can outlive its files (a moved ``output/``, or a machine that synced the
+    database but never had the session) -- so the payload never advertises a
+    URL the browser would just 404 on. When the notes file exists its raw
+    Markdown is returned as ``markdown_text``, so the UI can render the
+    document without a second round trip.
+
+    Args:
+        session_id: Primary key of the ``Lecture`` row to load.
+        db: Dependency-injected session over the ledger; overridden with a
+            throwaway in-memory engine in tests.
+
+    Returns:
+        The row's identity fields, ``audio_url`` and ``slides_url_prefix``
+        pointing at the ``/media`` mount when the corresponding files exist
+        (``None`` otherwise), and the raw ``markdown_text`` of the notes.
+
+    Raises:
+        HTTPException: 404 when no session has this id.
+    """
+    lecture = db.get(Lecture, session_id)
+    if lecture is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No recorded session with id {session_id}.",
+        )
+
+    # The audio, slides and notes live in the same session folder, so the
+    # folder is derived from whichever path the row has rather than stored a
+    # fourth time where it could drift out of sync with the files.
+    if lecture.md_path:
+        anchor = Path(lecture.md_path)
+    elif lecture.audio_path:
+        anchor = Path(lecture.audio_path)
+    else:
+        anchor = None
+    session_dir = anchor.parent if anchor is not None else None
+
+    markdown_text = None
+    if lecture.md_path:
+        notes_file = Path(lecture.md_path)
+        if notes_file.is_file():
+            try:
+                markdown_text = notes_file.read_text(encoding="utf-8")
+            except OSError:
+                # Present but unreadable is the same answer as absent: there is
+                # no document to render, and no grounds for a 500.
+                markdown_text = None
+
+    audio_url = None
+    if lecture.audio_path:
+        wav = Path(lecture.audio_path)
+        if wav.is_file():
+            audio_url = _media_url(lecture.audio_path)
+
+    slides_url_prefix = None
+    if session_dir is not None:
+        slides_dir = session_dir / "slides"
+        if slides_dir.is_dir():
+            base = _media_url(str(slides_dir))
+            if base is not None:
+                slides_url_prefix = base + "/"
+
+    return {
+        "id": lecture.id,
+        "course_code": lecture.course_code,
+        "domain": lecture.domain,
+        "session_date": lecture.session_date,
+        "audio_url": audio_url,
+        "slides_url_prefix": slides_url_prefix,
+        "markdown_text": markdown_text,
+    }
 
 
 # ---------------------------------------------------------------------------

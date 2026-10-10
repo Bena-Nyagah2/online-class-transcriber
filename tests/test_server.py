@@ -47,6 +47,7 @@ import asyncio
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1026,7 +1027,13 @@ def test_api_routes_are_registered_before_the_root_static_mount(client):
     api = {
         r.path for r in routes[:mount_index] if getattr(r, "path", "").startswith("/api")
     }
-    assert api == {"/api/record", "/api/stream", "/api/stop", "/api/windows"}
+    assert api == {
+        "/api/record",
+        "/api/stream",
+        "/api/stop",
+        "/api/windows",
+        "/api/sessions/{session_id}",
+    }
 
     # And the two routes that *can* complete a response still answer normally.
     assert client.get("/healthz").status_code == 200
@@ -2056,3 +2063,188 @@ def test_the_stop_endpoint_publishes_no_state_change(client):
     asyncio.run(_check())
 
     assert not failures, failures[0]
+
+
+# ---------------------------------------------------------------------------
+# 6. Session playback (GET /api/sessions/{session_id})
+# ---------------------------------------------------------------------------
+# The playback UI needs three things for a lecture: its identity, the raw
+# notes text, and URLs for the audio and slides. The failure modes worth
+# pinning are the boring ones -- a row that does not exist (404, not 500), and
+# a row whose files were moved or deleted (a clean payload of nulls, not URLs
+# the browser then 404s on).
+
+
+@pytest.fixture
+def session_db():
+    """Override the ledger dependency with a private in-memory database.
+
+    The route reads ``get_db`` from ``database``, which is bound to the real
+    ``lectures.db`` beside the app; a test that let a row through to it would
+    mutate the developer's actual ledger. Each test pins
+    ``server.app.dependency_overrides`` to a throwaway engine with the schema
+    applied and gets the session factory back so it can seed a row.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import database
+    import models
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    models.Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def override():
+        session = factory()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    server.app.dependency_overrides[database.get_db] = override
+    try:
+        yield factory
+    finally:
+        server.app.dependency_overrides.pop(database.get_db, None)
+
+
+def _seed_session(factory, root: Path, **overrides) -> int:
+    """Insert one ``Lecture`` row whose artifacts live under ``root``.
+
+    Returns the new row's id. ``root`` stands in for ``output/``: passing it
+    here and monkeypatching ``server.MEDIA_ROOT`` to the same path keeps the
+    stored paths and the ``/media`` URL mapper agreeing, exactly as they do in
+    a real run where both are ``output/``.
+    """
+    import models
+
+    session_dir = root / "CRM_1106_2026-10-09"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "raw_audio.wav").write_bytes(b"RIFF....WAVEfmt ")
+    (session_dir / "slides").mkdir(exist_ok=True)
+    notes = session_dir / "CRM_1106_2026-10-09.md"
+    notes.write_text("# Study Notes\n\nGrounded markdown.", encoding="utf-8")
+
+    fields = {
+        "course_code": "CRM_1106",
+        "domain": "criminology",
+        "session_date": "2026-10-09",
+        "audio_path": str(session_dir / "raw_audio.wav"),
+        "md_path": str(notes),
+    }
+    fields.update(overrides)
+
+    session = factory()
+    try:
+        lecture = models.Lecture(**fields)
+        session.add(lecture)
+        session.commit()
+        session.refresh(lecture)
+        return lecture.id
+    finally:
+        session.close()
+
+
+def test_session_endpoint_returns_every_artifact_for_a_valid_id(
+    client, session_db, tmp_path, monkeypatch
+):
+    """A complete session yields identity, notes text, and /media URLs."""
+    monkeypatch.setattr(server, "MEDIA_ROOT", tmp_path)
+    session_id = _seed_session(session_db, tmp_path)
+
+    response = client.get(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == session_id
+    assert payload["course_code"] == "CRM_1106"
+    assert payload["domain"] == "criminology"
+    assert payload["session_date"] == "2026-10-09"
+    assert payload["audio_url"] == "/media/CRM_1106_2026-10-09/raw_audio.wav"
+    assert payload["slides_url_prefix"] == "/media/CRM_1106_2026-10-09/slides/"
+    assert payload["markdown_text"] == "# Study Notes\n\nGrounded markdown."
+
+
+def test_session_endpoint_404s_for_an_unknown_id(client, session_db):
+    """A missing row is a 404 with a reason, never a 500 or an empty 200."""
+    response = client.get("/api/sessions/999999")
+
+    assert response.status_code == 404
+    assert "999999" in response.json()["detail"]
+
+
+def test_session_endpoint_degrades_when_the_files_were_deleted(
+    client, session_db, tmp_path, monkeypatch
+):
+    """A row whose files are gone reports nulls, not dangling URLs.
+
+    The ledger survives the artifacts -- an operator can clear ``output/`` to
+    reclaim disk, or clone the database onto a machine that never had the
+    media. The endpoint must reflect the filesystem, not the row, so the UI
+    shows "media unavailable" instead of a broken player.
+    """
+    monkeypatch.setattr(server, "MEDIA_ROOT", tmp_path)
+    session_id = _seed_session(session_db, tmp_path)
+    session_dir = tmp_path / "CRM_1106_2026-10-09"
+
+    # Simulate the cleanup: remove the audio, every slide, and the notes.
+    (session_dir / "raw_audio.wav").unlink()
+    for slide in (session_dir / "slides").glob("*"):
+        slide.unlink()
+    (session_dir / "slides").rmdir()
+    (session_dir / "CRM_1106_2026-10-09.md").unlink()
+
+    response = client.get(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["course_code"] == "CRM_1106"
+    assert payload["audio_url"] is None
+    assert payload["slides_url_prefix"] is None
+    assert payload["markdown_text"] is None
+
+
+def test_media_mount_is_registered_before_the_catch_all_static_mount():
+    """/media must win the route match against the "/" static mount.
+
+    Starlette matches in registration order and a mount at "/" matches every
+    path, so a media mount registered after it would serve a 404 for every
+    artifact while the API URL construction still looked correct.
+    """
+    from starlette.routing import Mount
+
+    routes = server.app.routes
+    media_index = next(
+        i for i, r in enumerate(routes) if isinstance(r, Mount) and r.name == "media"
+    )
+    static_index = next(
+        i for i, r in enumerate(routes) if isinstance(r, Mount) and r.name == "static"
+    )
+    assert media_index < static_index
+
+
+def test_media_mount_serves_raw_artifacts_over_http(client):
+    """A file under output/ is fetchable at /media/... without the API.
+
+    This is the guarantee the playback UI is built on: the browser loads the
+    .wav and .jpg with plain tags. A unique filename is used and removed in
+    the teardown so the real (gitignored) output/ directory is left as found.
+    """
+    import uuid
+
+    name = f"_media_probe_{uuid.uuid4().hex}.txt"
+    path = server.MEDIA_ROOT / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text("media bytes", encoding="utf-8")
+        response = client.get(f"/media/{name}")
+        assert response.status_code == 200
+        assert response.text == "media bytes"
+    finally:
+        path.unlink(missing_ok=True)
