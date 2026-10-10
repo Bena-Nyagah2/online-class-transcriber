@@ -15,6 +15,9 @@ Endpoints
     Ends the recording phase and lets the pipeline proceed to transcription.
 ``GET /api/stream``
     A Server-Sent Events stream of every state change.
+``GET /api/windows``
+    Enumerates the titles of the on-screen windows available as slide-capture
+    targets, returning ``{"windows": [...]}``.
 ``GET /health``
     Liveness probe; returns ``{"status": "ok"}``. The non-``z`` spelling is
     what browser extensions, container runtimes, and proxies probe by default,
@@ -91,6 +94,7 @@ from main import (
     run_pipeline,
 )
 from transcriber import DEFAULT_LANGUAGE
+from vision import get_active_windows
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -373,6 +377,11 @@ class RecordRequest(BaseModel):
     unknown key degrades to the generic profile inside the synthesizer rather
     than failing a run that has already captured the lecture, so rejecting it
     at the boundary would buy no safety and cost the operator their session.
+
+    ``capture_mode`` and ``target_window`` choose what the vision daemon
+    records: the whole primary monitor, or one named window. They are forwarded
+    verbatim to :func:`main.run_pipeline`, which reduces them to a single
+    ``window_title`` (``None`` = full screen) before constructing the catcher.
     """
 
     course_code: str = Field(
@@ -404,6 +413,22 @@ class RecordRequest(BaseModel):
             "true the existing-take overwrite guard is bypassed: the audio "
             "already on disk is the lecture being recovered, so capture is "
             "skipped and the pipeline restarts at the first unfinished stage."
+        ),
+    )
+    capture_mode: str = Field(
+        default="fullscreen",
+        description=(
+            'Capture source: "fullscreen" grabs the primary monitor; '
+            '"window" restricts capture to the on-screen window named by '
+            '"target_window". Any other value is treated as fullscreen.'
+        ),
+    )
+    target_window: str | None = Field(
+        default=None,
+        description=(
+            "Title of the window to capture when capture_mode is 'window'. "
+            "Taken from the /api/windows picker; matching is a case-insensitive "
+            "substring, so a stable prefix also works. Ignored otherwise."
         ),
     )
 
@@ -439,6 +464,8 @@ def _run_in_background(
     resume: bool = False,
     skipping_capture: bool = False,
     domain: str = "criminology",
+    capture_mode: str = "fullscreen",
+    target_window: str | None = None,
 ) -> None:
     """Execute the pipeline, recording its outcome into :data:`APP_STATE`.
 
@@ -472,6 +499,13 @@ def _run_in_background(
             slide-extraction prompt. Normalised to lower case by the handler
             so ``"Software"`` from a hand-rolled client still matches the
             ``"software"`` profile key.
+        capture_mode: Capture source, ``"fullscreen"`` or ``"window"``.
+            Forwarded verbatim to ``run_pipeline``; ``"fullscreen"`` (or any
+            unrecognised value) records the primary monitor.
+        target_window: Window title for the vision daemon when
+            ``capture_mode == "window"``, otherwise ignored. Forwarded
+            verbatim so the decision happens in one place, inside
+            ``run_pipeline``.
 
     Every exit path releases ``_run_lock``; a run that raised while holding it
     would leave the server permanently refusing new requests. The same applies
@@ -509,6 +543,8 @@ def _run_in_background(
             stop_event=stop_event,
             resume=resume,
             domain=domain,
+            capture_mode=capture_mode,
+            target_window=target_window,
         )
     except PipelineError as exc:
         # Expected failure, already reported to the terminal by run_pipeline.
@@ -602,6 +638,35 @@ def stream_events() -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Window discovery
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/windows")
+def list_active_windows() -> dict[str, list[str]]:
+    """Enumerate the slide-capture targets for the dashboard's window picker.
+
+    Returns the deduplicated titles of every currently visible, non-minimised
+    top-level window via :func:`vision.get_active_windows`. Only titles cross
+    the boundary -- window handles are not stable across sessions and process
+    ids mean nothing to the operator choosing what to capture -- and the value
+    feeds ``RecordRequest.target_window`` verbatim.
+
+    Enumeration is best-effort: a failure (no display, no window-server
+    access) yields an empty list rather than a 500, so a client can simply
+    hide the picker when there is nothing to pick.
+
+    Returns:
+        ``{"windows": [title, ...]}`` sorted in enumeration order.
+    """
+    try:
+        windows = get_active_windows()
+    except Exception:  # noqa: BLE001 - degrading is the contract, see above
+        windows = []
+    return {"windows": windows}
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +811,10 @@ def start_recording(payload: RecordRequest, background: BackgroundTasks) -> dict
         payload.resume,
         skipping_capture,
         payload.domain.lower(),
+        # Normalised here so a hand-rolled client sending "Window", or a title
+        # with stray whitespace, still lands on the intended capture target.
+        payload.capture_mode.lower(),
+        payload.target_window.strip() if payload.target_window else None,
     )
     return {"accepted": True, "course_code": course_code, "status": status}
 

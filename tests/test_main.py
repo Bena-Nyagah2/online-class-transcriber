@@ -1216,6 +1216,45 @@ def test_run_pipeline_forwards_the_domain_to_synthesis(consoles, session):
     assert synth.return_value.generate_notes.call_args.kwargs["domain"] == "software"
 
 
+def test_run_pipeline_forwards_the_capture_target_to_the_slide_catcher(
+    consoles, session
+):
+    """The capture mode chosen at the edge must reach ``SlideCatcher``.
+
+    Three cases, because they fail differently. The default must stay
+    full-screen. An explicit window must reach the catcher by title. And
+    ``capture_mode="window"`` with no title must degrade to ``None`` -- an
+    empty string would match the first window whose "title" contains "" (i.e.
+    every window) and capture something arbitrary.
+    """
+    synth = mock.MagicMock()
+    synth.return_value.generate_notes.return_value = True
+    catcher = mock.MagicMock(wraps=FakeCatcher)
+    t, _ = _stub_engines()
+
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", catcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        m.run_pipeline("COURSE_101")
+    assert catcher.call_args.kwargs["window_title"] is None
+
+    catcher.reset_mock()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", catcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        m.run_pipeline(
+            "SYS_Arch", capture_mode="window", target_window="Slides - Chrome"
+        )
+    assert catcher.call_args.kwargs["window_title"] == "Slides - Chrome"
+
+    catcher.reset_mock()
+    with mock.patch.object(m, "AudioRecorder", FakeRecorder), \
+         mock.patch.object(m, "SlideCatcher", catcher), \
+         t, mock.patch.object(m, "LectureSynthesizer", synth):
+        m.run_pipeline("SYS_Arch", capture_mode="window")
+    assert catcher.call_args.kwargs["window_title"] is None
+
+
 # ---------------------------------------------------------------------------
 # 6b. The SQLite session ledger
 # ---------------------------------------------------------------------------

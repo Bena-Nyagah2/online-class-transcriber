@@ -63,7 +63,72 @@ class _FakeSCT:
         return SimpleNamespace(size=FRAME_SIZE, bgra=self.raw)
 
 
-def _run(catcher: SlideCatcher, mocker, frames: list[tuple[float, str]]) -> None:
+class _RecordingSCT(_FakeSCT):
+    """``_FakeSCT`` that records every successful grab box.
+
+    ``fail_first`` makes the first N grabs raise, simulating a window tearing
+    down mid-capture or a monitor switching resolution; the loop is expected to
+    skip those frames and survive.
+    """
+
+    def __init__(self, fail_first: int = 0) -> None:
+        super().__init__()
+        self.grabbed: list[dict] = []
+        self._fail_left = fail_first
+
+    def grab(self, monitor):
+        box = dict(monitor)
+        if self._fail_left > 0:
+            self._fail_left -= 1
+            raise RuntimeError("simulated grab failure")
+        self.grabbed.append(box)
+        return super().grab(monitor)
+
+
+def _window(
+    title: str,
+    visible: int = 1,
+    minimized: bool = False,
+    left: int = 0,
+    top: int = 0,
+    width: int = 800,
+    height: int = 600,
+) -> SimpleNamespace:
+    """A duck-typed stand-in for a ``pygetwindow`` window object."""
+    return SimpleNamespace(
+        title=title,
+        visible=visible,
+        isMinimized=minimized,
+        left=left,
+        top=top,
+        width=width,
+        height=height,
+    )
+
+
+def _window_sequence(*results):
+    """Return a ``getWindowsWithTitle`` fake replaying ``results``, last forever.
+
+    One entry per poll: the first call yields ``results[0]``, the second
+    ``results[1]``, and once ``results`` is exhausted the final entry repeats --
+    which is how "the window restored mid-lecture" stays restored.
+    """
+    poll = {"i": 0}
+
+    def _next(*_args, **_kwargs):
+        item = results[min(poll["i"], len(results) - 1)]
+        poll["i"] += 1
+        return item
+
+    return _next
+
+
+def _run(
+    catcher: SlideCatcher,
+    mocker,
+    frames: list[tuple[float, str]],
+    sct_instance: _FakeSCT | None = None,
+) -> None:
     """Drive one synchronous ``_run`` pass with a fully mocked environment.
 
     Args:
@@ -76,6 +141,9 @@ def _run(catcher: SlideCatcher, mocker, frames: list[tuple[float, str]]) -> None
             poll's motion/settle logic reads ``time.time()``, so both time
             reads in the settle branch (the ``>=`` check and the reset) see
             the same frame timestamp.
+        sct_instance: Optional pre-built capture device, for tests that need to
+            inspect the grab boxes or inject failures. Defaults to a fresh
+            :class:`_FakeSCT`.
     """
     clock = {"now": 100.0}
     frame_iter = iter(frames)
@@ -90,7 +158,10 @@ def _run(catcher: SlideCatcher, mocker, frames: list[tuple[float, str]]) -> None
 
     mocker.patch("vision.time.time", side_effect=_time)
     mocker.patch("vision.imagehash.phash", side_effect=_phash)
-    mocker.patch("vision.mss.mss", return_value=_FakeSCT())
+    mocker.patch(
+        "vision.mss.mss",
+        return_value=sct_instance if sct_instance is not None else _FakeSCT(),
+    )
 
     polls_left = len(frames)
 
@@ -576,3 +647,172 @@ def test_a_marked_test_may_drive_the_capture_loop(mocker, tmp_path) -> None:
     catcher._thread.join(timeout=5.0)
 
     assert not catcher._thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Window enumeration (get_active_windows)
+# ---------------------------------------------------------------------------
+
+
+def test_get_active_windows_lists_visible_deduplicated_titles(mocker) -> None:
+    """Only visible, upright windows with a real title reach the picker."""
+    fake_gw = SimpleNamespace(
+        getAllWindows=lambda: [
+            _window("Slides - Chrome"),  # kept
+            _window(""),  # empty title -> system internals, dropped
+            _window("Hidden Proc", visible=0),  # hidden -> dropped
+            _window("Minimized", minimized=True),  # dropped
+            _window("Program Manager"),  # desktop shell -> dropped
+            _window("Slides - Chrome"),  # duplicate -> deduplicated away
+        ]
+    )
+    mocker.patch.object(vision, "gw", fake_gw)
+
+    assert vision.get_active_windows() == ["Slides - Chrome"]
+
+
+def test_get_active_windows_survives_a_dying_window(mocker) -> None:
+    """A window torn down between enumeration and title read is skipped, not fatal."""
+    dead = SimpleNamespace()
+    fake_gw = SimpleNamespace(
+        getAllWindows=lambda: [_window("Alive"), _window("Alive"), dead]
+    )
+    mocker.patch.object(vision, "gw", fake_gw)
+
+    # `.title` on the dead object raises AttributeError -> skipped;
+    # the duplicate "Alive" is the dedup exercised on the list.
+    assert vision.get_active_windows() == ["Alive"]
+
+
+def test_get_active_windows_degrades_to_empty_when_enumeration_fails(mocker) -> None:
+    """No window server / headless box -> [], never an exception."""
+    fake_gw = SimpleNamespace(getAllWindows=lambda: (_ for _ in ()).throw(RuntimeError))
+    mocker.patch.object(vision, "gw", fake_gw)
+
+    assert vision.get_active_windows() == []
+
+
+# ---------------------------------------------------------------------------
+# Targeted window capture (SlideCatcher(window_title=...))
+# ---------------------------------------------------------------------------
+
+
+def test_window_capture_grabs_the_windows_own_bounding_box(mocker, tmp_path) -> None:
+    """A ``window_title`` narrows ``mss.grab`` to that window's rect."""
+    catcher = SlideCatcher(output_dir=tmp_path, window_title="Lecture Slides")
+    mocker.patch.object(
+        vision,
+        "gw",
+        SimpleNamespace(
+            getWindowsWithTitle=_window_sequence(
+                [_window("Lecture Slides", left=100, top=50, width=800, height=600)]
+            ),
+            getAllWindows=lambda: [],
+        ),
+    )
+    sct = _RecordingSCT()
+    _run(
+        catcher,
+        mocker,
+        frames=[(100.0, HASH_A), (101.0, HASH_A)],
+        sct_instance=sct,
+    )
+
+    assert sct.grabbed == [
+        {"left": 100, "top": 50, "width": 800, "height": 600},
+        {"left": 100, "top": 50, "width": 800, "height": 600},
+    ]
+
+
+def test_window_capture_follows_a_moved_window_between_polls(mocker, tmp_path) -> None:
+    """The rect is re-read every poll, so a dragged window stays framed."""
+    catcher = SlideCatcher(output_dir=tmp_path, window_title="Lecture Slides")
+    mocker.patch.object(
+        vision,
+        "gw",
+        SimpleNamespace(
+            getWindowsWithTitle=_window_sequence(
+                [_window("Lecture Slides", left=10, top=10, width=400, height=300)],
+                [_window("Lecture Slides", left=90, top=70, width=640, height=480)],
+            ),
+            getAllWindows=lambda: [],
+        ),
+    )
+    sct = _RecordingSCT()
+    _run(catcher, mocker, frames=[(100.0, HASH_A), (101.0, HASH_A)], sct_instance=sct)
+
+    assert sct.grabbed[0] == {"left": 10, "top": 10, "width": 400, "height": 300}
+    assert sct.grabbed[1] == {"left": 90, "top": 70, "width": 640, "height": 480}
+
+
+def test_minimised_window_falls_back_to_fullscreen_then_resumes(
+    mocker, tmp_path, capsys
+) -> None:
+    """Minimised -> primary monitor; restored -> window box again.
+
+    The fallback is announced exactly once and the latch clears on recovery,
+    so the resume is observable (and testable) rather than silent.
+    """
+    catcher = SlideCatcher(output_dir=tmp_path, window_title="Lecture Slides")
+    mocker.patch.object(
+        vision,
+        "gw",
+        SimpleNamespace(
+            getWindowsWithTitle=_window_sequence(
+                [_window("Lecture Slides", minimized=True)],  # minimised at start
+                [_window("Lecture Slides", left=120, top=30, width=700, height=500)],
+            ),
+            getAllWindows=lambda: [],
+        ),
+    )
+    sct = _RecordingSCT()
+    _run(catcher, mocker, frames=[(100.0, HASH_A), (101.0, HASH_A)], sct_instance=sct)
+
+    # Poll 1: window minimised -> emulated-primary-monitor box.
+    assert sct.grabbed[0] == sct.monitors[1]
+    # Poll 2: window restored -> its own box again.
+    assert sct.grabbed[1] == {"left": 120, "top": 30, "width": 700, "height": 500}
+    assert catcher._window_missing is False  # latch cleared on resume
+
+    output = capsys.readouterr().out
+    assert "unavailable" in output
+    assert "Resumed tracking window" in output
+
+
+def test_closed_window_stays_on_fullscreen_without_spamming(mocker, tmp_path, capsys) -> None:
+    """A window that never comes back keeps capturing, announcing the fallback once."""
+    catcher = SlideCatcher(output_dir=tmp_path, window_title="Lecture Slides")
+    mocker.patch.object(
+        vision,
+        "gw",
+        SimpleNamespace(
+            getWindowsWithTitle=_window_sequence([]),
+            getAllWindows=lambda: [],
+        ),
+    )
+    sct = _RecordingSCT()
+    _run(catcher, mocker, frames=[(100.0, HASH_A), (101.0, HASH_A)], sct_instance=sct)
+
+    assert catcher._window_missing is True
+    assert sct.grabbed == [sct.monitors[1], sct.monitors[1]]
+    output = capsys.readouterr().out
+    assert output.count("unavailable") == 1  # announced once per outage
+
+
+def test_a_failed_grab_skips_the_frame_and_the_daemon_survives(
+    mocker, tmp_path, capsys
+) -> None:
+    """A grab racing a window teardown costs one frame, not the whole lecture."""
+    catcher = SlideCatcher(output_dir=tmp_path)
+    sct = _RecordingSCT(fail_first=1)
+    _run(
+        catcher,
+        mocker,
+        frames=[(100.0, HASH_A), (101.0, HASH_A)],
+        sct_instance=sct,
+    )
+
+    # The failed grab consumed a poll but never yielded a frame.
+    assert sct.grabbed == [sct.monitors[1]]
+    assert catcher._grab_failed is False  # latch reset once a grab succeeds
+    assert "skipping" in capsys.readouterr().out

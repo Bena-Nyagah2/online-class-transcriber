@@ -137,12 +137,21 @@ def client():
         server.resolve_device_index = real_resolve
 
 
-def _start(client, code="CRM_1106", language="en", resume=False, domain=None):
+def _start(
+    client,
+    code="CRM_1106",
+    language="en",
+    resume=False,
+    domain=None,
+    capture_mode=None,
+    target_window=None,
+):
     """POST /api/record and return the response.
 
     ``resume`` is omitted from the body unless it is true, and ``domain``
     unless it is given, so the tests that pre-date either flag keep exercising
-    the exact payload a browser sends when the control is left alone.
+    the exact payload a browser sends when the control is left alone. The same
+    convention is followed for ``capture_mode`` / ``target_window``.
 
     NOTE ``TestClient`` runs the app to completion *inside* this call, which
     includes Starlette's background tasks. So a run that blocks will block this
@@ -154,6 +163,10 @@ def _start(client, code="CRM_1106", language="en", resume=False, domain=None):
         body["resume"] = True
     if domain is not None:
         body["domain"] = domain
+    if capture_mode is not None:
+        body["capture_mode"] = capture_mode
+    if target_window is not None:
+        body["target_window"] = target_window
     return client.post("/api/record", json=body)
 
 
@@ -337,6 +350,81 @@ def test_an_unknown_domain_is_accepted_rather_than_rejected(client):
     response = _start(client, "SYS_Arch", domain="blockchain-archaeology")
     assert response.status_code == 200
     assert client.calls[0]["kwargs"]["domain"] == "blockchain-archaeology"
+
+
+def test_capture_mode_defaults_to_fullscreen_on_both_sides(client):
+    """An omitted ``capture_mode`` captures the whole primary monitor.
+
+    The schema default and the pipeline kwarg must agree; otherwise an
+    untouched form would mean full screen while the pipeline guessed something
+    else, and a lecturer's slides could go missing with no error either way.
+    """
+    response = client.post("/api/record", json={"course_code": "CRM_1106"})
+    assert response.status_code == 200
+    assert server.RecordRequest(course_code="CRM_1106").capture_mode == "fullscreen"
+    assert server.RecordRequest(course_code="CRM_1106").target_window is None
+    assert client.calls[0]["kwargs"]["capture_mode"] == "fullscreen"
+    assert client.calls[0]["kwargs"]["target_window"] is None
+
+
+def test_a_target_window_capture_reaches_the_pipeline_verbatim(client):
+    """``capture_mode`` and ``target_window`` must survive the background task.
+
+    A value dropped there is invisible until the notes come back without the
+    slide the operator selected -- the same failure mode the domain flag's own
+    test exists for.
+    """
+    _start(
+        client,
+        "SYS_Arch",
+        capture_mode="window",
+        target_window="Lecture Slides - Chrome",
+    )
+    assert client.calls[0]["kwargs"]["capture_mode"] == "window"
+    assert client.calls[0]["kwargs"]["target_window"] == "Lecture Slides - Chrome"
+
+
+def test_the_capture_mode_is_normalised_and_the_window_stripped(client):
+    """Hand-rolled clients get the same lenience here as for domain/language.
+
+    ``"WINDOW"`` must match the pipeline's ``capture_mode == "window"`` check,
+    and whitespace around a pasted window title must not change what is
+    matched against ``pygetwindow``.
+    """
+    _start(client, "SYS_Arch", capture_mode="WINDOW", target_window="  Slides  ")
+    assert client.calls[0]["kwargs"]["capture_mode"] == "window"
+    assert client.calls[0]["kwargs"]["target_window"] == "Slides"
+
+
+def test_get_windows_lists_the_active_capture_targets(client, monkeypatch):
+    """The picker endpoint passes the enumeration through as ``{"windows": ...}``."""
+    monkeypatch.setattr(
+        server, "get_active_windows", lambda: ["Slides - Chrome", "Lecture Deck"]
+    )
+
+    response = client.get("/api/windows")
+
+    assert response.status_code == 200
+    assert response.json() == {"windows": ["Slides - Chrome", "Lecture Deck"]}
+
+
+def test_get_windows_degrades_to_an_empty_picker_on_failure(client, monkeypatch):
+    """A window server that cannot be reached hides the picker, not the app.
+
+    ``get_active_windows`` already swallows enumeration errors internally; this
+    pins the endpoint's own guard for the unexpected kind of failure, so a 500
+    can never arrive just because the desktop refuses to enumerate.
+    """
+
+    def _explode():
+        raise RuntimeError("no window server")
+
+    monkeypatch.setattr(server, "get_active_windows", _explode)
+
+    response = client.get("/api/windows")
+
+    assert response.status_code == 200
+    assert response.json() == {"windows": []}
 
 
 def test_empty_course_code_is_rejected(client):
@@ -938,7 +1026,7 @@ def test_api_routes_are_registered_before_the_root_static_mount(client):
     api = {
         r.path for r in routes[:mount_index] if getattr(r, "path", "").startswith("/api")
     }
-    assert api == {"/api/record", "/api/stream", "/api/stop"}
+    assert api == {"/api/record", "/api/stream", "/api/stop", "/api/windows"}
 
     # And the two routes that *can* complete a response still answer normally.
     assert client.get("/healthz").status_code == 200

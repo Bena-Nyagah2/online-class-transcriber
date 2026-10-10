@@ -22,6 +22,13 @@ from the start of the capture session, in ``slides/slide_times.json``. Stage 3
 of the summarizer needs that offset to line a slide up against the audio
 transcript: the transcript's turn headers and the manifest's slide headers must
 be expressed on the same clock before a model can cross-reference them.
+
+By default the **primary monitor** is captured. When a ``window_title`` is
+passed instead the catcher tracks that window, re-reading its bounding box
+every poll so a moved or resized window stays framed; a window that is
+minimised or closed mid-lecture degrades to full-screen capture rather than
+silently producing no slides. :func:`get_active_windows` enumerates the on-screen
+windows for the dashboard's capture picker.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from typing import Any
 
 import imagehash
 import mss
+import pygetwindow as gw
 from PIL import Image
 
 SLIDE_TIMES_FILENAME = "slide_times.json"
@@ -44,6 +52,70 @@ Raw seconds are stored rather than a preformatted string so the summarizer can
 render them with the *same* clock helper the transcript uses. Preformatting here
 would let the two clocks drift apart and break the comparison.
 """
+
+_PRIMARY_MONITOR_INDEX = 1
+"""Index of the primary monitor in an ``mss`` monitor list.
+
+``monitors[0]`` is the virtual bounding box spanning every display; ``[1]`` is
+the primary one, and has been the capture target since Phase 5.
+"""
+
+_SYSTEM_WINDOW_TITLES = frozenset({"Program Manager"})
+"""Shell windows that are visible and titled but never a lecture surface.
+
+The Windows desktop shell reports itself as an ordinary visible window named
+"Program Manager"; without this it would sit in the dashboard's picker next to
+the actual slides. Kept tiny and explicit on purpose -- a broad denylist would
+eventually hide a real lecture window.
+"""
+
+
+def _is_captureable_window(window: Any) -> bool:
+    """Whether ``window`` is visible, upright, and not the shell.
+
+    Every attribute read is guarded: a window can be torn down between the
+    enumeration that yielded it and this call, and a dying handle raises rather
+    than returning a sentinel. A window that cannot be inspected is treated as
+    uncaptureable, never as an error.
+    """
+    try:
+        return bool(window.visible) and not window.isMinimized
+    except Exception:  # noqa: BLE001 - a dead handle must not kill the picker
+        return False
+
+
+def get_active_windows() -> list[str]:
+    """Enumerate on-screen window titles for the dashboard's capture picker.
+
+    Returns the deduplicated titles of every top-level window that is currently
+    visible and not minimised, in enumeration order, with empty titles and the
+    desktop shell filtered out. Only titles cross this boundary -- window
+    handles are not stable across a session and process ids mean nothing to the
+    operator choosing a target.
+
+    Enumeration is best-effort: a platform where ``pygetwindow`` cannot reach a
+    window server yields an empty list rather than raising, so the endpoint
+    degrades to "nothing to pick" instead of a 500.
+    """
+    try:
+        windows = gw.getAllWindows()
+    except Exception:  # noqa: BLE001 - no display / no window-server access
+        return []
+
+    titles: list[str] = []
+    seen: set[str] = set()
+    for window in windows:
+        try:
+            title = (window.title or "").strip()
+        except Exception:  # noqa: BLE001 - a dying window cannot be titled
+            continue
+        if not title or title in _SYSTEM_WINDOW_TITLES:
+            continue
+        if title in seen or not _is_captureable_window(window):
+            continue
+        seen.add(title)
+        titles.append(title)
+    return titles
 
 
 class SlideCatcher:
@@ -56,6 +128,7 @@ class SlideCatcher:
         settle_delay: float = 3.0,
         hash_threshold: int = 5,
         forced_capture_timeout: float = 15.0,
+        window_title: str | None = None,
     ) -> None:
         """Configure the catcher and prepare the ``slides`` subdirectory.
 
@@ -69,6 +142,10 @@ class SlideCatcher:
             forced_capture_timeout: Seconds of unbroken motion after which a
                 frame is captured anyway, even though the screen never settled.
                 Set to ``0`` to disable the safety valve entirely.
+            window_title: Title of the window whose bounding box is captured.
+                ``None`` (the default) captures the primary monitor. When the
+                window is minimised or closed mid-lecture, capture falls back
+                to the primary monitor until the window is usable again.
         """
         self.output_dir = Path(output_dir)
         self.slides_dir = self.output_dir / "slides"
@@ -79,12 +156,20 @@ class SlideCatcher:
         self.settle_delay = settle_delay
         self.hash_threshold = hash_threshold
         self.forced_capture_timeout = forced_capture_timeout
+        self.window_title = window_title
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Origin for every elapsed offset below. Set in start() so the clock
         # begins when capture does, not at construction.
         self.start_time: float = 0.0
+
+        # True while a tracked window is minimised/closed and capture has
+        # fallen back to the primary monitor; a latch so the transition is
+        # announced once rather than once per poll.
+        self._window_missing = False
+        # Same latch for a run of failed grabs (see _announce_grab_failed).
+        self._grab_failed = False
 
         # pHash of the most recent frame (drives the motion check).
         self.last_frame_hash: imagehash.ImageHash | None = None
@@ -116,6 +201,8 @@ class SlideCatcher:
         an origin to within the thread-spawn delay.
         """
         self.start_time = time.time()
+        if self.window_title:
+            self._announce(f"Tracking window {self.window_title!r}")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -124,13 +211,28 @@ class SlideCatcher:
 
         ``mss`` is instantiated inside the thread because COM/thread
         affinity on Windows breaks if it is created elsewhere.
+
+        The grab box is re-resolved every poll: when tracking a ``window_title``
+        the window's current rect is looked up fresh, so the box follows a moved
+        or resized window, while a window that is minimised or closed falls back
+        to the primary monitor -- announced once per outage -- so an alt-tabbed
+        presenter still produces slides instead of a silent gap. A grab that
+        fails outright (window teardown racing our rect read, monitor unplug,
+        resolution switch) skips that frame and retries next poll.
         """
         with mss.mss() as sct:
-            # monitors[0] is the virtual bounding box; [1] is the primary.
-            monitor = sct.monitors[1]
-
             while not self._stop_event.is_set():
-                raw_frame = sct.grab(monitor)
+                box = self._resolve_grab_box(sct)
+                try:
+                    raw_frame = sct.grab(box)
+                except Exception:  # noqa: BLE001 - see _announce_grab_failed
+                    # Dropping one frame costs nothing; letting the exception
+                    # kill the daemon thread costs the rest of the lecture.
+                    self._announce_grab_failed()
+                    self._stop_event.wait(timeout=self.poll_interval)
+                    continue
+
+                self._grab_failed = False
                 img = Image.frombytes(
                     "RGB", raw_frame.size, raw_frame.bgra, "raw", "BGRX"
                 )
@@ -191,6 +293,88 @@ class SlideCatcher:
 
                 # Poll wait; the event wakes it immediately on stop().
                 self._stop_event.wait(timeout=self.poll_interval)
+
+    def _resolve_grab_box(self, sct: Any) -> dict[str, int]:
+        """Return the ``mss.grab`` rectangle for the next frame.
+
+        Without a ``window_title`` this is the primary monitor, exactly as
+        before. With one, the target's *current* bounding box is looked up
+        fresh every poll, so following a window while it is dragged or resized
+        is free of any cached rect to invalidate. If the window is minimised,
+        closed, or otherwise unavailable, the primary monitor is captured
+        instead (announced once per outage) rather than letting the slide
+        stream go silent.
+        """
+        if self.window_title is None:
+            return sct.monitors[_PRIMARY_MONITOR_INDEX]
+
+        window = self._find_tracked_window()
+        if window is not None:
+            if self._window_missing:
+                self._window_missing = False
+                self._announce(f"Resumed tracking window {self.window_title!r}")
+            return {
+                "left": window.left,
+                "top": window.top,
+                "width": window.width,
+                "height": window.height,
+            }
+
+        if not self._window_missing:
+            self._window_missing = True
+            self._announce(
+                f"Target window {self.window_title!r} unavailable "
+                "(minimised or closed); captured the primary monitor instead"
+            )
+        return sct.monitors[_PRIMARY_MONITOR_INDEX]
+
+    def _find_tracked_window(self) -> Any | None:
+        """Return the live window matching :attr:`window_title`, or ``None``.
+
+        ``pygetwindow`` matches titles case-insensitively as substrings, and
+        the picker hands back exact titles from :func:`get_active_windows`, so
+        in practice this is a 1:1 match. Each candidate is re-checked here
+        rather than trusted from enumeration: a handle that was valid a moment
+        ago can be gone by the time its rect is read.
+        """
+        if self.window_title is None:
+            return None
+        try:
+            candidates = gw.getWindowsWithTitle(self.window_title)
+        except Exception:  # noqa: BLE001 - enumeration is best-effort
+            return None
+
+        for window in candidates:
+            try:
+                if not window.title:
+                    continue
+                if not _is_captureable_window(window):
+                    continue
+                if window.width <= 0 or window.height <= 0:
+                    continue
+                if window.left is None or window.top is None:
+                    continue
+                return window
+            except Exception:  # noqa: BLE001 - skip a window mid-teardown
+                continue
+        return None
+
+    def _announce(self, message: str) -> None:
+        """Print a capture-lifecycle message, never fatally.
+
+        Shares :meth:`_save_frame`'s encoding guard: cp1252 stdout cannot
+        encode the camera emoji, and raising here would kill the capture thread.
+        """
+        try:
+            print(f"📸 Vision: {message}")
+        except UnicodeEncodeError:
+            print(f"Vision: {message}")
+
+    def _announce_grab_failed(self) -> None:
+        """Log a failed grab once per outage, not once per poll."""
+        if not self._grab_failed:
+            self._grab_failed = True
+            self._announce("Frame grab failed; skipping until the next poll")
 
     def _save_frame(
         self, img: Image.Image, current_hash: Any, now: float, forced: bool = False
