@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 import warnings
 import importlib.util
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Boot-time environment validation
+# ---------------------------------------------------------------------------
+# ``config.Settings()`` runs at import time and raises ``ValidationError`` if
+# ``NVIDIA_API_KEY`` or ``HF_TOKEN`` are missing. Several test modules import
+# ``server`` (which imports ``config``) or ``summarizer``/``transcriber``
+# directly, so those variables must exist *before* the first import happens.
+# We set them here -- the earliest hook pytest offers -- using ``setdefault``
+# so a developer's real shell exports still win. The values are dummy; no test
+# makes a real API call.
+os.environ.setdefault("NVIDIA_API_KEY", "test-nvidia-key")
+os.environ.setdefault("HF_TOKEN", "test-hf-token")
 
 
 def _stub_whisperx_if_absent() -> None:

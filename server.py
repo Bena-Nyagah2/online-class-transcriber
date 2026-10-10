@@ -75,6 +75,8 @@ internally consistent.
 
 from __future__ import annotations
 
+from config import settings
+
 import asyncio
 import json
 import shutil

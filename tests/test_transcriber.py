@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 import numpy as np
 
+import config
 import transcriber
 from transcriber import (
     ALIGNMENT_CHECKPOINT,
@@ -88,6 +89,9 @@ def _make_whisperx(mocker, segments, language="en", speakers=None):
 def _hf_token(monkeypatch):
     """Every test gets a token so construction never hits the real env."""
     monkeypatch.setenv(HF_TOKEN_ENV, "hf_dummy_token")
+    # config.settings is a singleton loaded at import; patch its attribute
+    # so resolve_hf_token() sees the dummy token too.
+    monkeypatch.setattr(config.settings, "HF_TOKEN", "hf_dummy_token")
 
 
 def _write_wav(tmp_path):
@@ -101,13 +105,14 @@ def _write_wav(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_hf_token_reads_environment(monkeypatch) -> None:
-    monkeypatch.setenv(HF_TOKEN_ENV, "hf_abc123")
+def test_resolve_hf_token_reads_settings(monkeypatch) -> None:
+    monkeypatch.setattr(config.settings, "HF_TOKEN", "hf_abc123")
     assert resolve_hf_token() == "hf_abc123"
 
 
 def test_missing_hf_token_raises_actionable_error(monkeypatch) -> None:
     monkeypatch.delenv(HF_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(config.settings, "HF_TOKEN", "")
 
     with pytest.raises(ValueError) as excinfo:
         resolve_hf_token()
@@ -119,6 +124,7 @@ def test_missing_hf_token_raises_actionable_error(monkeypatch) -> None:
 
 def test_transcriber_constructor_requires_token(monkeypatch) -> None:
     monkeypatch.delenv(HF_TOKEN_ENV, raising=False)
+    monkeypatch.setattr(config.settings, "HF_TOKEN", "")
     with pytest.raises(ValueError):
         LocalTranscriber()
 
@@ -498,6 +504,7 @@ def test_batch_size_routes_to_transcribe(mocker, tmp_path) -> None:
 
 def test_compute_type_defaults_when_env_unset(monkeypatch) -> None:
     monkeypatch.delenv(COMPUTE_TYPE_ENV, raising=False)
+    monkeypatch.setattr(config.settings, "WHISPER_COMPUTE_TYPE", "")
     assert resolve_compute_type() == COMPUTE_TYPE
 
 
@@ -508,12 +515,14 @@ def test_compute_type_reads_environment(monkeypatch) -> None:
 
 def test_blank_compute_type_env_falls_back_to_default(monkeypatch) -> None:
     monkeypatch.setenv(COMPUTE_TYPE_ENV, "   ")
+    monkeypatch.setattr(config.settings, "WHISPER_COMPUTE_TYPE", "   ")
     assert resolve_compute_type() == COMPUTE_TYPE
 
 
 def test_invalid_compute_type_is_rejected_with_guidance(monkeypatch) -> None:
     """Bad quantization must fail before the WAV is decoded, not inside CTranslate2."""
     monkeypatch.setenv(COMPUTE_TYPE_ENV, "int4")
+    monkeypatch.setattr(config.settings, "WHISPER_COMPUTE_TYPE", "int4")
     with pytest.raises(ValueError) as excinfo:
         resolve_compute_type()
     message = str(excinfo.value)
@@ -526,13 +535,13 @@ def test_batch_size_defaults_when_env_unset(monkeypatch) -> None:
     assert resolve_batch_size() == BATCH_SIZE
 
 
-def test_batch_size_reads_environment(monkeypatch) -> None:
-    monkeypatch.setenv(BATCH_SIZE_ENV, "32")
+def test_batch_size_reads_settings(monkeypatch) -> None:
+    monkeypatch.setattr(config.settings, "WHISPER_BATCH_SIZE", 32)
     assert resolve_batch_size() == 32
 
 
 def test_non_numeric_batch_size_is_rejected(monkeypatch) -> None:
-    monkeypatch.setenv(BATCH_SIZE_ENV, "lots")
+    monkeypatch.setattr(config.settings, "WHISPER_BATCH_SIZE", "lots")
     with pytest.raises(ValueError) as excinfo:
         resolve_batch_size()
     assert BATCH_SIZE_ENV in str(excinfo.value)
@@ -542,7 +551,7 @@ def test_non_numeric_batch_size_is_rejected(monkeypatch) -> None:
 def test_non_positive_batch_size_is_rejected(monkeypatch, bad) -> None:
     """0 and negatives are *accepted* by faster_whisper and fail deep in the
     decoder, so they are rejected up front with the value quoted."""
-    monkeypatch.setenv(BATCH_SIZE_ENV, bad)
+    monkeypatch.setattr(config.settings, "WHISPER_BATCH_SIZE", int(bad))
     with pytest.raises(ValueError) as excinfo:
         resolve_batch_size()
     assert ">= 1" in str(excinfo.value)
@@ -557,36 +566,39 @@ def test_constructor_argument_beats_environment(monkeypatch) -> None:
     assert transcriber.batch_size == 64
 
 
-def test_constructor_picks_up_env_by_default(monkeypatch) -> None:
-    monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8")
-    monkeypatch.setenv(BATCH_SIZE_ENV, "8")
+def test_constructor_picks_up_settings_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(config.settings, "WHISPER_COMPUTE_TYPE", "int8")
+    monkeypatch.setattr(config.settings, "WHISPER_BATCH_SIZE", 8)
     transcriber = LocalTranscriber()
     assert transcriber.compute_type == "int8"
     assert transcriber.batch_size == 8
 
 
-def test_module_loads_dotenv_at_import() -> None:
-    """``transcriber`` must read ``.env`` itself, not lean on ``summarizer``.
+def test_module_uses_validated_config() -> None:
+    """``transcriber`` reads settings from the validated config singleton.
 
-    The two tunables are documented as ``.env`` settings, so the module that
-    reads them has to load that file. It previously depended on ``summarizer``
-    loading it as an import side effect -- true under ``main.py``, false the
-    moment this module is imported alone, which silently fell back to the code
-    defaults (float16 rather than the configured int8).
+    The tunables are documented as ``.env`` settings, and pydantic-settings
+    loads and validates them at import of ``config``. The module must rely
+    on that singleton rather than calling ``load_dotenv()`` itself.
     """
     source = Path(transcriber.__file__).read_text(encoding="utf-8")
-    assert "load_dotenv()" in source, "transcriber never calls load_dotenv()"
+    assert "from config import settings" in source, (
+        "transcriber must import config.settings"
+    )
+    assert "load_dotenv()" not in source, (
+        "transcriber must not call load_dotenv() directly"
+    )
 
 
 def test_real_environment_beats_dotenv(monkeypatch) -> None:
     """An exported variable must win over the ``.env`` file.
 
-    ``load_dotenv(override=False)`` is the python-dotenv default, and this
-    pins it: without it, a re-load of ``.env`` would clobber a test's
-    ``monkeypatch.setenv`` and reintroduce the real NVIDIA_API_KEY leak that
-    ``test_summarizer.py`` already has to work around.
+    pydantic-settings gives explicit shell exports precedence over the file,
+    and tests patch the already-loaded ``config.settings`` singleton
+    directly since it is instantiated at import time.
     """
     monkeypatch.setenv(COMPUTE_TYPE_ENV, "int8_float16")
+    monkeypatch.setattr(config.settings, "WHISPER_COMPUTE_TYPE", "int8_float16")
     assert resolve_compute_type() == "int8_float16"
 
 

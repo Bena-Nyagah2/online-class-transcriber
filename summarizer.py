@@ -32,7 +32,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import re
 import sys
 import textwrap
@@ -40,7 +39,6 @@ from pathlib import Path
 from typing import Optional
 
 import openai
-from dotenv import load_dotenv
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from rich.console import Console
 from tenacity import (
@@ -50,15 +48,12 @@ from tenacity import (
     wait_random,
 )
 
+from config import settings
 from transcriber import TRANSCRIPT_FILENAME, format_timestamp
 
 # Read the slide timing sidecar written by vision.py. Reusing the constant
 # keeps the two modules from drifting on the filename.
 from vision import SLIDE_TIMES_FILENAME
-
-# Load NVIDIA_API_KEY from a local .env (if present) before any client reads
-# the environment. Explicit shell exports still take precedence.
-load_dotenv()
 
 # Warnings from the engine layers that cannot reach main.py's console. Rich
 # resolves ``file`` lazily on every write, so pytest's capture still works on
@@ -71,7 +66,7 @@ console = Console()
 # gdrive/ledger services use, so every warning points at its module.
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
+MODEL_NAME = settings.LLM_MODEL_NAME
 
 # Per-stage model overrides. Stage 1 (Map) reads one small image per call and
 # only needs OCR/description quality; Stage 3 (Reduce) is the reasoning-heavy
@@ -79,8 +74,8 @@ MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 # Keeping them separate lets either stage be retuned independently — e.g. a
 # vision-tuned 70B for the map, a cheap 8B for the reduce — without editing
 # call sites. ``MODEL_NAME`` remains the shared fallback for both.
-MAP_MODEL = os.environ.get("MAP_MODEL", MODEL_NAME)
-REDUCE_MODEL = os.environ.get("REDUCE_MODEL", MODEL_NAME)
+MAP_MODEL = settings.MAP_MODEL or settings.LLM_MODEL_NAME
+REDUCE_MODEL = settings.REDUCE_MODEL or settings.LLM_MODEL_NAME
 
 # Nemotron 3.x (the current REDUCE_MODEL) reasons by default and writes that
 # chain-of-thought into ``content`` ahead of the document, which starves the
@@ -91,9 +86,7 @@ REDUCE_MODEL = os.environ.get("REDUCE_MODEL", MODEL_NAME)
 #
 # Stage 1 is unaffected by design: ``MAP_MODEL`` is a Llama vision model with
 # no thinking mode, so sending the parameter there would be noise.
-REDUCE_REASONING_ENABLED = os.environ.get(
-    "REDUCE_REASONING_ENABLED", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
+REDUCE_REASONING_ENABLED = settings.REDUCE_REASONING_ENABLED
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_API_KEY_ENV = "NVIDIA_API_KEY"
@@ -419,10 +412,10 @@ class LectureSynthesizer:
                 An explicit argument makes the class constructible in tests
                 without touching the environment.
         """
-        self.api_key = api_key or os.environ.get(NVIDIA_API_KEY_ENV)
+        self.api_key = api_key or settings.NVIDIA_API_KEY
         if not self.api_key:
             raise ValueError(
-                f"{NVIDIA_API_KEY_ENV} is not set — pass api_key=... or "
+                "NVIDIA_API_KEY is not set — pass api_key=... or "
                 "export the variable."
             )
         self.client = openai.OpenAI(
