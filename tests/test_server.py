@@ -1033,6 +1033,7 @@ def test_api_routes_are_registered_before_the_root_static_mount(client):
         "/api/stop",
         "/api/windows",
         "/api/sessions/{session_id}",
+        "/api/sessions",
     }
 
     # And the two routes that *can* complete a response still answer normally.
@@ -2248,3 +2249,52 @@ def test_media_mount_serves_raw_artifacts_over_http(client):
         assert response.text == "media bytes"
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_sessions_list_returns_200_and_orders_newest_first(
+    client, session_db, monkeypatch
+):
+    """GET /api/sessions returns the lightweight list, newest first."""
+    monkeypatch.setattr(server, "MEDIA_ROOT", Path(tmp_path if False else server.MEDIA_ROOT) and server.MEDIA_ROOT)  # keep MEDIA_ROOT as-is for the fixture
+    # seed three sessions
+    factory = session_db
+    import models
+    import time as _t
+
+    root = server.MEDIA_ROOT
+    def seed(code, dom, d, ts=None):
+        sdir = root / f"{code}_{d}"
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "raw_audio.wav").write_bytes(b"w")
+        notes = sdir / f"{code}_{d}.md"
+        notes.write_text("x", encoding="utf-8")
+        sess = factory()
+        try:
+            from datetime import datetime, timezone
+            l = models.Lecture(course_code=code, domain=dom, session_date=d,
+                              audio_path=str(sdir/"raw_audio.wav"),
+                              md_path=str(notes),
+                              sync_status="SUCCESS",
+                              created_at=ts or datetime.now(timezone.utc))
+            sess.add(l)
+            sess.commit()
+            sess.refresh(l)
+            return l.id
+        finally:
+            sess.close()
+
+    from datetime import datetime, timedelta, timezone
+    seed("OLD", "general", "2026-10-01", ts=datetime.now(timezone.utc)-timedelta(hours=3))
+    seed("MID", "criminology", "2026-10-02", ts=datetime.now(timezone.utc)-timedelta(hours=1))
+    seed("NEW", "software", "2026-10-03", ts=datetime.now(timezone.utc))
+
+    res = client.get("/api/sessions")
+    assert res.status_code == 200
+    data = res.json()
+    assert isinstance(data, list)
+    assert len(data) >= 3
+    # find the 3 we just seeded
+    codes = [x["course_code"] for x in data if x["course_code"] in ("OLD","MID","NEW")]
+    assert codes[:3] == ["NEW","MID","OLD"]  # newest first
+    item = data[codes.index("NEW")] if "NEW" in codes else data[0]
+    assert set(item.keys()) >= {"id","course_code","domain","session_date","sync_status","created_at"}

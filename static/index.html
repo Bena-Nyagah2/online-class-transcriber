@@ -42,13 +42,62 @@
   <main class="mx-auto flex min-h-screen max-w-3xl flex-col justify-center px-6 py-12">
 
     <header class="mb-10 text-center">
-      <h1 class="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-        Academic Capture Engine
-      </h1>
-      <p class="mt-3 text-sm text-slate-400">
-        Record a lecture, transcribe it, and generate study notes.
-      </p>
+      <div class="flex flex-col items-center gap-2">
+        <h1 class="text-3xl font-bold tracking-tight text-white sm:text-4xl">
+          Academic Capture Engine
+        </h1>
+        <p class="mt-3 text-sm text-slate-400">
+          Record a lecture, transcribe it, and generate study notes.
+        </p>
+      </div>
+
+      <!-- Library button: opens the modal to browse past recordings -->
+      <button
+        id="open-library-btn"
+        type="button"
+        class="mt-6 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-300 hover:border-blue-500 hover:text-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+      >
+        Library
+      </button>
     </header>
+
+    <!--
+      Library modal. Hidden by default; shown when the Library button is pressed.
+    -->
+    <div
+      id="library-modal"
+      class="fixed inset-0 z-40 hidden items-center justify-center bg-black/60"
+      role="dialog"
+      aria-modal="true"
+    >
+      <div class="relative w-full max-w-3xl rounded-2xl border border-slate-800 bg-slate-900/90 p-6 shadow-2xl">
+        <div class="flex items-center justify-between gap-4">
+          <h2 class="text-xl font-semibold text-white">Past Recordings</h2>
+          <button
+            id="close-library-btn"
+            type="button"
+            class="rounded-full bg-slate-800 px-3 py-1 text-slate-300 hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+          >
+            ✕
+          </button>
+        </div>
+        <p id="library-empty" class="mt-4 hidden text-center text-slate-400">
+          No past recordings found.
+        </p>
+        <table id="library-table" class="mt-4 w-full border-collapse">
+          <thead>
+            <tr class="border-b border-slate-700">
+              <th class="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400">Code</th>
+              <th class="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400">Date</th>
+              <th class="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400">Domain</th>
+              <th class="px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400">Status</th>
+              <th class="px-3 py-2 text-right text-xs font-medium uppercase tracking-wide text-slate-400"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-700"></tbody>
+        </table>
+      </div>
+    </div>
 
     <!--
       Stage tracker. Every pill below is a function of the reported status and
@@ -1020,6 +1069,98 @@
     radio.addEventListener("change", syncCaptureTarget);
   });
   el.refreshWindows.addEventListener("click", fetchWindows);
+
+  // Library: modal open/close and session fetch
+  const libraryModal = document.getElementById("library-modal");
+  const libraryTable = document.getElementById("library-table");
+  const libraryEmpty = document.getElementById("library-empty");
+  el.openLibraryBtn = document.getElementById("open-library-btn");
+  el.closeLibraryBtn = document.getElementById("close-library-btn");
+
+  const API_SESSIONS_URL = "/api/sessions";
+
+  function openLibrary() {
+    libraryModal.classList.remove("hidden");
+    libraryTable.querySelector("tbody").innerHTML = "";
+    libraryEmpty.classList.add("hidden");
+    fetchSessions();
+  }
+
+  function closeLibrary() {
+    libraryModal.classList.add("hidden");
+  }
+
+  async function fetchSessions() {
+    try {
+      const res = await fetch(API_SESSIONS_URL);
+      if (!res.ok) {
+        libraryEmpty.textContent = "Could not load sessions.";
+        libraryEmpty.classList.remove("hidden");
+        return;
+      }
+      const sessions = await res.json();
+      renderSessions(sessions);
+    } catch (err) {
+      libraryEmpty.textContent = "Network error loading sessions.";
+      libraryEmpty.classList.remove("hidden");
+    }
+  }
+
+  function renderSessions(sessions) {
+    const tbody = libraryTable.querySelector("tbody");
+    tbody.innerHTML = "";
+    if (!sessions || sessions.length === 0) {
+      libraryEmpty.classList.remove("hidden");
+      return;
+    }
+    libraryEmpty.classList.add("hidden");
+
+    for (const s of sessions) {
+      const row = document.createElement("tr");
+      const statusBadge = get_status_badge(s.sync_status);
+
+      row.innerHTML = `
+        <td class="px-3 py-2 font-mono text-slate-300">${escape_html(s.course_code)}</td>
+        <td class="px-3 py-2">${escape_html(s.session_date)}</td>
+        <td class="px-3 py-2 text-slate-400">${escape_html(s.domain)}</td>
+        <td class="px-3 py-2">${statusBadge}</td>
+        <td class="px-3 py-2 text-right">
+          <a href="playback.html?id=${s.id}" class="rounded-md bg-slate-800 px-3 py-1 text-sm font-medium text-slate-200 transition hover:bg-slate-700">
+            View Notes
+          </a>
+        </td>
+      `;
+      tbody.appendChild(row);
+    }
+  }
+
+  function get_status_badge(status) {
+    const colors = {
+      SUCCESS: "bg-emerald-500/20 text-emerald-300",
+      PENDING: "bg-slate-500/20 text-slate-300",
+      FAILED: "bg-rose-500/20 text-rose-300",
+    };
+    const cls = colors[status] || colors.PENDING;
+    return `<span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium uppercase tracking-wide ${cls}">${escape_html(status)}</span>`;
+  }
+
+  function escape_html(str) {
+    return String(str).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[c]));
+  }
+
+  el.openLibraryBtn?.addEventListener("click", openLibrary);
+  el.closeLibraryBtn?.addEventListener("click", closeLibrary);
+
+  // Clicking outside the modal content closes it
+  libraryModal?.addEventListener("click", (e) => {
+    if (e.target === libraryModal) closeLibrary();
+  });
 
   renderConnection();
   syncCaptureTarget();

@@ -1065,6 +1065,35 @@ def get_session(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any
     }
 
 
+@app.get("/api/sessions")
+def list_sessions(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Return all recorded sessions, newest first.
+
+    Lightweight ledger view for the Library UI: only the fields needed to
+    render a list (identity, timing, domain, sync state) are returned. No
+    artifact bodies, no filesystem probes. Ordering is by ``created_at``
+    descending so the most recent recording appears at the top.
+    """
+    sessions = (
+        db.query(Lecture)
+        .order_by(Lecture.created_at.desc(), Lecture.id.desc())
+        .all()
+    )
+    return [
+        {
+            "id": session.id,
+            "course_code": session.course_code,
+            "domain": session.domain,
+            "session_date": session.session_date,
+            "sync_status": session.sync_status,
+            "created_at": session.created_at.isoformat()
+            if session.created_at is not None
+            else None,
+        }
+        for session in sessions
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Static dashboard
 # ---------------------------------------------------------------------------
