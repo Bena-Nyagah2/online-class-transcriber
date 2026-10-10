@@ -96,6 +96,86 @@
           </select>
         </div>
 
+        <!--
+          Capture target: which region the Phase 5 vision daemon records.
+          "Full Screen" is the original behaviour, so it ships checked and every
+          other choice is the operator's explicit one. "Specific Window" narrows
+          the grab to a single on-screen window chosen from GET /api/windows --
+          the list is fetched on load and refreshed on demand, because window
+          titles change as the desktop does and a stale list would offer a
+          target that no longer exists. The dropdown is disabled until a window
+          is chosen (see syncCaptureTarget()), so there is never a value that
+          looks selected but is silently ignored.
+        -->
+        <div>
+          <p class="mb-1.5 block text-sm font-medium text-slate-300">
+            Capture Target
+          </p>
+
+          <div class="flex items-center gap-5">
+            <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+              <input
+                type="radio"
+                name="captureMode"
+                value="fullscreen"
+                checked
+                class="h-4 w-4 shrink-0 cursor-pointer rounded-full border-slate-600
+                       bg-slate-900 accent-blue-600 focus:ring-2 focus:ring-blue-500/40
+                       disabled:cursor-not-allowed disabled:opacity-40"
+              />
+              Full Screen
+            </label>
+
+            <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+              <input
+                type="radio"
+                name="captureMode"
+                value="window"
+                class="h-4 w-4 shrink-0 cursor-pointer rounded-full border-slate-600
+                       bg-slate-900 accent-blue-600 focus:ring-2 focus:ring-blue-500/40
+                       disabled:cursor-not-allowed disabled:opacity-40"
+              />
+              Specific Window
+            </label>
+          </div>
+
+          <div class="mt-2 flex items-stretch gap-2">
+            <!--
+              Disabled in the markup as well as by script: "Full Screen" is
+              checked, so an enabled picker here would already contradict the
+              form's own state before a single line of JS ran.
+            -->
+            <select
+              id="targetWindowIn"
+              name="targetWindowIn"
+              disabled
+              class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-2.5
+                     text-slate-100 outline-none
+                     focus:border-blue-500 focus:ring-2 focus:ring-blue-500/40
+                     disabled:cursor-not-allowed disabled:bg-slate-900 disabled:text-slate-600"
+            >
+              <option value="">Select a window...</option>
+            </select>
+
+            <button
+              id="refresh-windows"
+              type="button"
+              title="Refresh window list"
+              aria-label="Refresh window list"
+              class="shrink-0 rounded-lg border border-slate-700 bg-slate-900 px-3
+                     text-sm text-slate-300 transition hover:border-blue-500 hover:text-blue-300
+                     focus:outline-none focus:ring-2 focus:ring-blue-500/40
+                     disabled:cursor-not-allowed disabled:bg-slate-900 disabled:text-slate-600"
+            >
+              &#8635;
+            </button>
+          </div>
+
+          <p id="windows-note" class="mt-1.5 hidden text-xs text-slate-500">
+            No windows are available to capture. Open the window first, then refresh.
+          </p>
+        </div>
+
         <div>
           <label for="course_code" class="mb-1.5 block text-sm font-medium text-slate-300">
             Course Code
@@ -325,6 +405,7 @@
   const RECORD_URL = "/api/record";
   const STOP_URL = "/api/stop";
   const STREAM_URL = "/api/stream";
+  const WINDOWS_URL = "/api/windows";
 
   // Backend status tokens -> what the operator sees. Kept as a lookup rather
   // than a chain of ifs so an unrecognised token falls through to a safe
@@ -395,6 +476,11 @@
     domainIn:       document.getElementById("domain"),
     langIn:         document.getElementById("language"),
     resumeIn:       document.getElementById("resume"),
+    // A radio group, so this is a NodeList of both buttons, not one element.
+    captureRadios:  document.querySelectorAll('input[name="captureMode"]'),
+    targetWindowIn: document.getElementById("targetWindowIn"),
+    refreshWindows: document.getElementById("refresh-windows"),
+    windowsNote:    document.getElementById("windows-note"),
     tracker:        document.getElementById("stage-tracker"),
     processing:     document.getElementById("processing-state"),
     processingText: document.getElementById("processing-text"),
@@ -615,6 +701,10 @@
     el.langIn.disabled = working;
     el.resumeIn.disabled = working;
 
+    // The capture target obeys the same lockdown; syncCaptureTarget also
+    // applies the "Full Screen means the picker is dead" rule on top.
+    syncCaptureTarget();
+
     if (el.button.disabled) {
       el.button.textContent = "Server unreachable";
     } else {
@@ -695,6 +785,93 @@
   }
 
   /**
+   * Which capture target the operator has chosen: "fullscreen" or "window".
+   *
+   * Total function: an unchecked radio group cannot happen (one option ships
+   * with ``checked``), but falling back to full screen is the safe read if the
+   * markup is ever changed -- it is the behaviour that existed before this
+   * control did.
+   */
+  function selectedCaptureMode() {
+    const checked = document.querySelector('input[name="captureMode"]:checked');
+    return checked ? checked.value : "fullscreen";
+  }
+
+  /**
+   * Reflect the current choice and the run's lockdown onto the window picker.
+   *
+   * The dropdown is dead while "Full Screen" is selected -- there is nothing to
+   * choose, and a control whose value is silently ignored is worse than one
+   * that plainly cannot be used. It is dead again for the whole run, like every
+   * other input, so a capture target cannot be swapped mid-lecture.
+   */
+  function syncCaptureTarget() {
+    const locked = ACTIVE.has(lastStatus);
+    const windowMode = selectedCaptureMode() === "window";
+    el.targetWindowIn.disabled = locked || !windowMode;
+    el.refreshWindows.disabled = locked;
+    el.captureRadios.forEach((radio) => {
+      radio.disabled = locked;
+    });
+  }
+
+  /**
+   * Fetch the on-screen windows and fill the picker.
+   *
+   * Populating and failing both leave the page usable: a failed enumeration
+   * shows the empty note rather than an error banner, because "the window list
+   * is unavailable" is a fact about the desktop, not a defect in the run the
+   * operator is trying to start. The previous selection is kept when it is
+   * still on the list, so a refresh mid-decision does not reset the choice.
+   */
+  async function fetchWindows() {
+    el.refreshWindows.disabled = true;
+    try {
+      const response = await fetch(WINDOWS_URL);
+      if (!response.ok) {
+        populateWindows([]);
+        return;
+      }
+      const body = await response.json();
+      populateWindows((body && body.windows) || []);
+    } catch (_) {
+      populateWindows([]);
+    } finally {
+      // Hand the button back to the lockdown logic rather than assuming it is
+      // free: a refresh that finishes mid-recording must not unlock anything.
+      syncCaptureTarget();
+    }
+  }
+
+  /** Fill the picker with the given titles, preserving a still-valid choice. */
+  function populateWindows(titles) {
+    const previous = el.targetWindowIn.value;
+    el.targetWindowIn.innerHTML = "";
+
+    if (titles.length === 0) {
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "No windows available";
+      el.targetWindowIn.appendChild(placeholder);
+    } else {
+      titles.forEach((title) => {
+        const option = document.createElement("option");
+        option.value = title;
+        option.textContent = title;
+        // A long lecture-window title would otherwise stretch the layout; the
+        // full text stays one hover away in the native tooltip.
+        option.title = title;
+        el.targetWindowIn.appendChild(option);
+      });
+      if (titles.includes(previous)) {
+        el.targetWindowIn.value = previous;
+      }
+    }
+
+    el.windowsNote.classList.toggle("hidden", titles.length > 0);
+  }
+
+  /**
    * Report a rejected request using the backend's own detail.
    *
    * The server explains 409 ("already in progress") and 400 ("no recording is
@@ -724,6 +901,17 @@
     clearError();
     el.button.disabled = true;
 
+    // A "Specific Window" run with no window chosen would otherwise post an
+    // empty target, which the server reads as full screen -- capturing the
+    // whole desktop while the operator believes one window is being recorded.
+    // Refusing here keeps the choice honest instead of silently widening it.
+    const captureMode = selectedCaptureMode();
+    if (captureMode === "window" && !el.targetWindowIn.value) {
+      showError("Select a window to capture, or choose Full Screen.");
+      syncDeck();
+      return;
+    }
+
     // Remember where the stream was before this request. A resumed run can
     // fast-forward to a later phase before the response even lands, and the
     // optimistic draw below must not clobber that newer frame.
@@ -738,6 +926,8 @@
           domain: el.domainIn.value,
           language: el.langIn.value.trim().toLowerCase(),
           resume: el.resumeIn.checked,
+          capture_mode: document.querySelector('input[name="captureMode"]:checked').value,
+          target_window: captureMode === "window" ? el.targetWindowIn.value : null,
         }),
       });
 
@@ -823,7 +1013,17 @@
   el.stopButton.addEventListener("click", requestStop);
   el.connRetry.addEventListener("click", connect);
 
+  // The capture-target controls are independent of the stream: a radio change
+  // re-evaluates the picker's enabled state right away, and the refresh button
+  // re-enumerates on demand (window titles change as the desktop does).
+  el.captureRadios.forEach((radio) => {
+    radio.addEventListener("change", syncCaptureTarget);
+  });
+  el.refreshWindows.addEventListener("click", fetchWindows);
+
   renderConnection();
+  syncCaptureTarget();
+  fetchWindows();
   connect();
 })();
 </script>
