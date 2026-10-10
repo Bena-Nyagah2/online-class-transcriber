@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import sys
@@ -63,6 +64,12 @@ load_dotenv()
 # resolves ``file`` lazily on every write, so pytest's capture still works on
 # this instance and tests can patch ``summarizer.console`` directly.
 console = Console()
+
+# The standard-library logger carries pipeline warnings that belong to the
+# process's logging stream rather than the operator-facing console -- the deck
+# downsampling circuit breaker in particular. Same namespacing convention the
+# gdrive/ledger services use, so every warning points at its module.
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "meta/llama-3.1-8b-instruct")
 
@@ -136,11 +143,48 @@ TEMPERATURE = 0.2
 
 MANIFEST_FILENAME = "slides_manifest.txt"
 
+# Circuit breaker on the deck: at most this many slides Stage 2 will extract.
+# A dense build-step deck or a long capture can yield hundreds of JPEGs, each
+# of which is a vision round-trip (OCR cost) and a chunk of the Stage 3 prompt
+# (context tokens). Past the cap the deck is uniformly downsampled to exactly
+# this many slides -- first and last always kept -- so runtime and token spend
+# stay bounded no matter how long the lecture ran.
+MAX_SLIDES = 60
+
 # Matches a manifest slide header, tolerating the optional ``[MM:SS] `` timing
 # prefix so manifests written before timestamps existed still resume correctly.
 _SLIDE_HEADER_RE = re.compile(r"^### Slide: (?:\[[^\]]*\]\s*)?(.+)$", re.MULTILINE)
 
 _RETRYABLE_ERRORS = (RateLimitError, APIConnectionError, APITimeoutError)
+
+
+def _uniform_slide_sample(slides: list[Path], limit: int = MAX_SLIDES) -> list[Path]:
+    """Return ``limit`` slides spread evenly from the first to the last.
+
+    The downsample is deterministic -- no randomness -- so the same deck always
+    selects the same set, which keeps the manifest's resume checkpoint exact
+    across re-runs and between a preview and its full run. The first and last
+    slides are always kept: the opening framing and the closing review are the
+    slides a student is most likely to need afterwards.
+
+    Args:
+        slides: Chronologically sorted slide paths.
+        limit: Target sample size. Defaults to :data:`MAX_SLIDES`.
+
+    Returns:
+        ``slides`` itself when it already fits within the limit; otherwise a
+        new list of exactly ``limit`` paths, order preserved, starting with
+        ``slides[0]`` and ending with ``slides[-1]``.
+    """
+    if len(slides) <= limit:
+        return slides
+    # Walk a fixed step across the index range instead of drawing random picks:
+    # pure Python, no dependencies, and exactly ``limit`` distinct slides
+    # because a step > 1 separates every neighbouring pair by more than one.
+    # (``round`` only ever lands on the ``len - 1`` last index at the final
+    # point of the walk; the ``min`` is a free guard against float fuzz.)
+    step = (len(slides) - 1) / (limit - 1)
+    return [slides[min(round(step * index), len(slides) - 1)] for index in range(limit)]
 
 _CRIMINOLOGY_SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -577,6 +621,22 @@ class LectureSynthesizer:
         manifest_path = session_dir / MANIFEST_FILENAME
 
         slide_paths = sorted(slides_dir.glob("*.jpg"))
+
+        # Circuit breaker: a deck past MAX_SLIDES is downsampled to exactly
+        # MAX_SLIDES here, before any OCR or LLM work, so the per-slide cost
+        # (a vision round-trip plus a manifest write) and the Stage 3 context
+        # stay bounded however long the capture ran. Sampling the *full* list --
+        # not just the not-yet-extracted remainder -- keeps the choice
+        # deterministic across re-runs, so a resume selects identically and the
+        # checkpoint never shifts under the operator.
+        if len(slide_paths) > MAX_SLIDES:
+            logger.warning(
+                "Slide count %d exceeds MAX_SLIDES. Downsampling to %d.",
+                len(slide_paths),
+                MAX_SLIDES,
+            )
+            slide_paths = _uniform_slide_sample(slide_paths, MAX_SLIDES)
+
         existing = ""
         if manifest_path.exists():
             existing = manifest_path.read_text(encoding="utf-8")
