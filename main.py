@@ -690,6 +690,8 @@ def run_pipeline(
     stop_event: threading.Event | None = None,
     resume: bool = False,
     domain: str = "criminology",
+    capture_mode: str = "fullscreen",
+    target_window: str | None = None,
 ) -> str:
     """Run record → transcribe → synthesize and return the study-notes path.
 
@@ -762,6 +764,18 @@ def run_pipeline(
             behaviour it had before profiles existed. Forwarded verbatim to
             ``generate_notes``; an unknown key degrades to the generic
             profile inside the synthesizer rather than failing the run.
+        capture_mode: Capture source for the vision daemon:
+            ``"fullscreen"`` records the primary monitor; ``"window"``
+            records the on-screen window named by ``target_window``. Any
+            other value is treated as ``"fullscreen"``. The default keeps the
+            CLI and callers that say nothing on the behaviour that existed
+            before window tracking.
+        target_window: Window title for the vision daemon, used only when
+            ``capture_mode == "window"``. Matching is a case-insensitive
+            substring (see :func:`vision.get_active_windows`), so a stable
+            prefix of the title works. A window that is minimised or closed
+            mid-lecture falls back to full-screen capture inside the catcher
+            rather than aborting the run.
 
     Returns:
         The path to the generated study notes, as a string.
@@ -854,7 +868,12 @@ def run_pipeline(
         )
 
         # Phase 5: visual capture runs alongside the audio recording loop.
-        slide_catcher = SlideCatcher(output_dir=output_dir)
+        # A "window" capture mode narrows the grab to one on-screen window; the
+        # catcher itself handles that window being minimised or closed mid-run.
+        window_title = target_window if capture_mode == "window" else None
+        slide_catcher = SlideCatcher(
+            output_dir=output_dir, window_title=window_title
+        )
         slide_catcher.start()
 
         # Why every clean exit funnels through one flush below: there are three

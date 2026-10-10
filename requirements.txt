@@ -10,6 +10,8 @@ pydub>=0.25.1
 tenacity>=8.2.3
 audioop-lts; python_version >= "3.13"   # pydub needs stdlib audioop, removed in 3.13
 mss>=9.0.1                  # Phase 5: primary-display screen grabbing
+pygetwindow>=0.0.9          # Phase 5: targeted window tracking & win enumeration
+pywin32>=305; platform_system == "Windows"   # pygetwindow's win32 backend
 Pillow>=10.0.0              # PIL frame conversion + JPEG slide encoding
 ImageHash>=4.3.1            # perceptual hash for slide deduplication
 whisperx>=3.1               # Phase 2: ASR + wav2vec2 alignment + pyannote diarization
