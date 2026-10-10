@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -1034,6 +1035,11 @@ def test_api_routes_are_registered_before_the_root_static_mount(client):
         "/api/windows",
         "/api/sessions/{session_id}",
         "/api/sessions",
+        "/api/sessions/{session_id}/sync",
+        "/api/sessions/{session_id}",
+        "/api/sessions/{session_id}/sync",
+        "/api/sessions/{session_id}/sync",
+        "/api/sessions/{session_id}/sync",
     }
 
     # And the two routes that *can* complete a response still answer normally.
@@ -2298,3 +2304,89 @@ def test_sessions_list_returns_200_and_orders_newest_first(
     assert codes[:3] == ["NEW","MID","OLD"]  # newest first
     item = data[codes.index("NEW")] if "NEW" in codes else data[0]
     assert set(item.keys()) >= {"id","course_code","domain","session_date","sync_status","created_at"}
+
+
+def test_delete_session_removes_db_and_files(client, session_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "MEDIA_ROOT", tmp_path)
+    from tests.test_server import _seed_session  # reuse helper if we want, but we defined above in same module scope
+    # simpler: re-seed
+    import models
+    root = tmp_path
+    def seed():
+        sdir = root / "CRM_DEL_2026-10-09"
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "raw_audio.wav").write_bytes(b"w")
+        (sdir / "slides").mkdir(exist_ok=True)
+        (sdir / "slides" / "slide_001.jpg").write_bytes(b"j")
+        notes = sdir / "CRM_DEL_2026-10-09.md"
+        notes.write_text("# x", encoding="utf-8")
+        sess = session_db()
+        try:
+            l = models.Lecture(course_code="CRM_DEL", domain="general", session_date="2026-10-09",
+                              audio_path=str(sdir/"raw_audio.wav"),
+                              md_path=str(notes),
+                              sync_status="PENDING")
+            sess.add(l); sess.commit(); sess.refresh(l); return l.id, sdir
+        finally:
+            sess.close()
+    sid, sdir = seed()
+    assert sdir.exists()
+    res = client.delete(f"/api/sessions/{sid}")
+    assert res.status_code == 200
+    assert res.json() == {"status": "deleted", "id": sid}
+    assert not sdir.exists()
+    # db row gone
+    sess = session_db()
+    try:
+        assert sess.get(models.Lecture, sid) is None
+    finally:
+        sess.close()
+
+
+def test_delete_session_404s_for_missing(client, session_db):
+    res = client.delete("/api/sessions/99999")
+    assert res.status_code == 404
+
+
+def test_retry_sync_success(client, session_db, tmp_path, monkeypatch, mocker):
+    monkeypatch.setattr(server, "MEDIA_ROOT", tmp_path)
+    import models
+    root = tmp_path
+    sdir = root / "CRM_SYNC_2026-10-09"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "raw_audio.wav").write_bytes(b"w")
+    notes = sdir / "CRM_SYNC_2026-10-09.md"
+    notes.write_text("# notes", encoding="utf-8")
+    sess = session_db()
+    try:
+        l = models.Lecture(course_code="CRM_SYNC", domain="general", session_date="2026-10-09",
+                          audio_path=str(sdir/"raw_audio.wav"),
+                          md_path=str(notes),
+                          sync_status="FAILED")
+        sess.add(l); sess.commit(); sess.refresh(l); sid = l.id
+    finally:
+        sess.close()
+    mocker.patch("services.gdrive.sync_markdown", return_value=True)
+    res = client.post(f"/api/sessions/{sid}/sync")
+    assert res.status_code == 200
+    assert res.json() == {"id": sid, "sync_status": "SUCCESS"}
+
+
+def test_retry_sync_missing_file(client, session_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "MEDIA_ROOT", tmp_path)
+    import models
+    root = tmp_path
+    sdir = root / "CRM_MISS_2026-10-09"
+    sdir.mkdir(parents=True, exist_ok=True)
+    notes = sdir / "CRM_MISS_2026-10-09.md"  # not created
+    sess = session_db()
+    try:
+        l = models.Lecture(course_code="CRM_MISS", domain="general", session_date="2026-10-09",
+                          audio_path=str(sdir/"raw_audio.wav"),
+                          md_path=str(notes),
+                          sync_status="FAILED")
+        sess.add(l); sess.commit(); sess.refresh(l); sid = l.id
+    finally:
+        sess.close()
+    res = client.post(f"/api/sessions/{sid}/sync")
+    assert res.status_code == 400

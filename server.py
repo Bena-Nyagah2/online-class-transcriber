@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -1092,6 +1093,90 @@ def list_sessions(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
         }
         for session in sessions
     ]
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Delete a recorded session: remove its on-disk artifacts and the ledger row.
+
+    The on-disk directory is derived from md_path or audio_path. If it exists,
+    it is recursively removed. The database row is deleted and committed.
+    Returns 404 if the session does not exist.
+    """
+    lecture = db.get(Lecture, session_id)
+    if lecture is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No recorded session with id {session_id}.",
+        )
+
+    if lecture.md_path:
+        anchor = Path(lecture.md_path)
+    elif lecture.audio_path:
+        anchor = Path(lecture.audio_path)
+    else:
+        anchor = None
+    session_dir = anchor.parent if anchor is not None else None
+
+    if session_dir is not None and session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    db.delete(lecture)
+    db.commit()
+    return {"status": "deleted", "id": session_id}
+
+
+@app.post("/api/sessions/{session_id}/sync")
+def retry_session_sync(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Retry uploading the session's markdown to Google Drive.
+
+    Returns 404 if the session does not exist. Returns 400 if md_path is missing
+    or unreadable. Attempts the upload via services.gdrive.sync_markdown and
+    updates sync_status to SUCCESS or FAILED accordingly.
+    """
+    lecture = db.get(Lecture, session_id)
+    if lecture is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No recorded session with id {session_id}.",
+        )
+
+    if not lecture.md_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot sync: md_path is missing.",
+        )
+
+    notes_file = Path(lecture.md_path)
+    if not notes_file.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot sync: markdown file does not exist on disk.",
+        )
+
+    try:
+        md_text = notes_file.read_text(encoding="utf-8")
+    except OSError:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot sync: markdown file could not be read.",
+        )
+
+    try:
+        from services.gdrive import sync_markdown
+    except Exception as exc:  # noqa: BLE001 - degrade to FAILED
+        lecture.sync_status = "FAILED"
+        db.commit()
+        return {"id": session_id, "sync_status": lecture.sync_status}
+
+    try:
+        synced = sync_markdown(lecture.course_code, lecture.session_date, md_text)
+    except Exception:  # noqa: BLE001
+        synced = False
+
+    lecture.sync_status = "SUCCESS" if synced else "FAILED"
+    db.commit()
+    return {"id": session_id, "sync_status": lecture.sync_status}
 
 
 # ---------------------------------------------------------------------------
