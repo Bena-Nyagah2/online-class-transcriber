@@ -39,6 +39,11 @@ import numpy as np
 import soundcard as sc
 import soundfile as sf
 
+try:
+    import pyaudiowpatch as pyaudio
+except Exception:  # pragma: no cover - optional on non-Windows or missing
+    pyaudio = None
+
 SAMPLE_RATE: int = 16_000
 """Output sample rate in Hz — the standard rate for ASR pipelines."""
 
@@ -315,11 +320,11 @@ class AudioRecorder:
     def get_loopback_devices(self) -> list[LoopbackDevice]:
         """Return the loopback (system-audio) capture devices.
 
-        On Windows, WASAPI exposes one virtual loopback device per speaker
-        via ``include_loopback=True``; regular microphones are filtered out
-        so every entry captures *system* audio. Other platforms expose no
-        loopback API in ``soundcard``, so all microphones are returned as a
-        best-effort fallback.
+        On Windows, WASAPI exposes loopback (system audio) devices. We prefer
+        the default output speaker's loopback device when available. Regular
+        microphones are filtered out so every entry captures *system* audio.
+        Other platforms expose no loopback API in ``soundcard``, so all
+        microphones are returned as a best-effort fallback.
 
         The result is cached: repeated calls return the same list so that
         index-based selection stays stable between listing and recording.
@@ -331,9 +336,23 @@ class AudioRecorder:
         if self._devices is None:
             if sys.platform == "win32":
                 found: list[Any] = list(sc.all_microphones(include_loopback=True))
-                self._devices = [
+                loopbacks = [
                     device for device in found if getattr(device, "isloopback", False)
                 ]
+                # Prefer the default speaker's loopback if present
+                try:
+                    default_spk = sc.default_speaker()
+                    ds_name = getattr(default_spk, "name", "")
+                    for d in loopbacks:
+                        dname = getattr(d, "name", "")
+                        if d is default_spk or ds_name and (ds_name == dname or ds_name in dname):
+                            # move to front
+                            loopbacks.remove(d)
+                            loopbacks.insert(0, d)
+                            break
+                except Exception:
+                    pass
+                self._devices = loopbacks
             else:
                 self._devices = list(sc.all_microphones())
         return list(self._devices)
@@ -345,7 +364,7 @@ class AudioRecorder:
         inline) so tests can inject a fake device without touching hardware.
 
         Returns:
-            The default ``soundcard`` microphone device.
+            The default microphone device (soundcard).
         """
         return sc.default_microphone()
 
@@ -461,11 +480,17 @@ class AudioRecorder:
             ) from self._open_error
 
         self._mic_active = self._mic_thread is not None and not self._mic_failed
-        print(
-            f"🎙️  Capturing: {devices[device_id].name} + "
-            f"{getattr(self._mic_device, 'name', 'microphone') if self._mic_active else 'no microphone'}",
-            flush=True,
-        )
+        try:
+            print(
+                f"Capturing: {devices[device_id].name} + "
+                f"{getattr(self._mic_device, 'name', 'microphone') if self._mic_active else 'no microphone'}",
+                flush=True,
+            )
+        except Exception:
+            print(
+                "Capturing audio (system + mic status unavailable)",
+                flush=True,
+            )
 
         # Started only once the streams are confirmed open, so the periodic
         # flush never races a failed handshake and writes an empty backup over
